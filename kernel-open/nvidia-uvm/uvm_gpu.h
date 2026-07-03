@@ -405,6 +405,42 @@ typedef struct
             NvU64 num_replays;
 
             NvU64 num_replays_ack_all;
+
+            // Cumulative servicing pipeline timing and batch counts. Only
+            // written from the replayable fault bottom half, which is
+            // serialized by the replayable fault service lock, so plain
+            // increments are safe. Exposed through the fault_stats procfs
+            // file; measurement scripts snapshot and diff around a run.
+            NvU64 num_batches;
+
+            NvU64 num_cached_faults;
+
+            NvU64 num_coalesced_faults;
+
+            // Total time spent in fetch_fault_buffer_entries
+            NvU64 ns_fetch;
+
+            // Total time spent in preprocess_fault_batch
+            NvU64 ns_preprocess;
+
+            // Total time spent in service_fault_batch
+            NvU64 ns_service;
+
+            // Total time spent issuing replays and flushing the fault buffer
+            NvU64 ns_replay;
+
+            // Total time spent waiting on trackers (GPU work completion)
+            // during batch servicing
+            NvU64 ns_tracker_wait;
+
+            // Total fetch-to-completion time of batches counted in
+            // num_batches. Phase timers above also accumulate on batches
+            // that end in an error, so their sum may exceed this value
+            NvU64 ns_batch_total;
+
+            // Total delay between the top half scheduling the replayable
+            // fault bottom half and the bottom half starting to execute
+            NvU64 ns_bh_queue_delay;
         } stats;
 
         // Number of uTLBs in the chip

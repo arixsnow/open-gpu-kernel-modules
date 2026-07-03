@@ -110,6 +110,8 @@ static unsigned schedule_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
     // Interrupts need to be disabled here to avoid an interrupt storm
     uvm_parent_gpu_replayable_faults_intr_disable(parent_gpu);
 
+    parent_gpu->isr.replayable_faults.stats.bh_schedule_timestamp = NV_GETTIME();
+
     // Schedule a bottom half, but do *not* release the GPU ISR lock. The bottom
     // half releases the GPU ISR lock as part of its cleanup.
     nv_kthread_q_schedule_q_item(&parent_gpu->isr.bottom_half_q,
@@ -611,6 +613,9 @@ static void replayable_faults_isr_bottom_half(void *args)
     cpumask_set_cpu(cpu, &parent_gpu->isr.replayable_faults.stats.cpus_used_mask);
     ++parent_gpu->isr.replayable_faults.stats.cpu_exec_count[cpu];
     put_cpu();
+
+    parent_gpu->fault_buffer.replayable.stats.ns_bh_queue_delay +=
+        NV_GETTIME() - parent_gpu->isr.replayable_faults.stats.bh_schedule_timestamp;
 
     uvm_parent_gpu_service_replayable_faults(parent_gpu);
 

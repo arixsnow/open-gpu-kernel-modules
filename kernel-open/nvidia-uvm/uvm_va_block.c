@@ -45,6 +45,7 @@
 #include "uvm_va_policy.h"
 #include "uvm_conf_computing.h"
 #include "uvm_migrate.h"
+#include "uvm_procfs.h"
 
 typedef enum
 {
@@ -60,6 +61,8 @@ static struct kmem_cache *g_uvm_va_block_gpu_state_cache __read_mostly;
 static struct kmem_cache *g_uvm_page_mask_cache __read_mostly;
 static struct kmem_cache *g_uvm_va_block_context_cache __read_mostly;
 static struct kmem_cache *g_uvm_va_block_cpu_node_state_cache __read_mostly;
+
+uvm_va_block_host_op_stats_t g_uvm_va_block_host_op_stats;
 
 static int uvm_fault_force_sysmem __read_mostly = 0;
 module_param(uvm_fault_force_sysmem, int, S_IRUGO|S_IWUSR);
@@ -885,6 +888,65 @@ static block_phys_page_t block_phys_page(uvm_processor_id_t processor, int nid, 
     return (block_phys_page_t){ processor, page_index, nid };
 }
 
+static struct proc_dir_entry *g_va_block_host_op_stats_file;
+
+static int nv_procfs_read_va_block_host_op_stats(struct seq_file *s, void *v)
+{
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
+        return -EAGAIN;
+
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_unmap                 %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.ns_unmap));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_unmap_calls          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_unmap_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_unmap_pages          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_unmap_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_dma_map               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.ns_dma_map));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_dma_map_chunks       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_dma_map_chunks));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_dma_map_pages        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_dma_map_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_first_touch_blocks   %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_first_touch_blocks));
+
+    uvm_up_read(&g_uvm_global.pm.lock);
+
+    return 0;
+}
+
+static int nv_procfs_read_va_block_host_op_stats_entry(struct seq_file *s, void *v)
+{
+    UVM_ENTRY_RET(nv_procfs_read_va_block_host_op_stats(s, v));
+}
+
+UVM_DEFINE_SINGLE_PROCFS_FILE(va_block_host_op_stats_entry);
+
+static NV_STATUS va_block_host_op_stats_procfs_init(void)
+{
+    struct proc_dir_entry *cpu_base_dir_entry = uvm_procfs_get_cpu_base_dir();
+
+    if (uvm_procfs_is_debug_enabled()) {
+        UVM_ASSERT(!g_va_block_host_op_stats_file);
+        g_va_block_host_op_stats_file = NV_CREATE_PROC_FILE("host_op_stats",
+                                                            cpu_base_dir_entry,
+                                                            va_block_host_op_stats_entry,
+                                                            &g_uvm_va_block_host_op_stats);
+        if (!g_va_block_host_op_stats_file)
+            return NV_ERR_OPERATING_SYSTEM;
+    }
+
+    return NV_OK;
+}
+
+static void va_block_host_op_stats_procfs_exit(void)
+{
+    if (g_va_block_host_op_stats_file) {
+        proc_remove(g_va_block_host_op_stats_file);
+        g_va_block_host_op_stats_file = NULL;
+    }
+}
+
 NV_STATUS uvm_va_block_init(void)
 {
     if (uvm_enable_builtin_tests)
@@ -912,11 +974,12 @@ NV_STATUS uvm_va_block_init(void)
     if (!g_uvm_va_block_cpu_node_state_cache)
         return NV_ERR_NO_MEMORY;
 
-    return NV_OK;
+    return va_block_host_op_stats_procfs_init();
 }
 
 void uvm_va_block_exit(void)
 {
+    va_block_host_op_stats_procfs_exit();
     kmem_cache_destroy_safe(&g_uvm_va_block_cpu_node_state_cache);
     kmem_cache_destroy_safe(&g_uvm_va_block_context_cache);
     kmem_cache_destroy_safe(&g_uvm_page_mask_cache);
@@ -1336,6 +1399,7 @@ static void cpu_chunk_remove_sysmem_gpu_mapping(uvm_cpu_chunk_t *chunk, uvm_gpu_
 static NV_STATUS cpu_chunk_add_sysmem_gpu_mapping(uvm_cpu_chunk_t *chunk, uvm_va_block_t *block, uvm_gpu_t *gpu)
 {
     NV_STATUS status;
+    NvU64 map_start_time;
 
     // When the Confidential Computing feature is enabled the transfers don't
     // use the DMA mapping of CPU chunks (since it's protected memory), but
@@ -1343,9 +1407,14 @@ static NV_STATUS cpu_chunk_add_sysmem_gpu_mapping(uvm_cpu_chunk_t *chunk, uvm_va
     if (g_uvm_global.conf_computing_enabled)
         return NV_OK;
 
+    map_start_time = NV_GETTIME();
     status = uvm_cpu_chunk_map_gpu(chunk, gpu);
     if (status != NV_OK)
         return status;
+
+    atomic64_add(NV_GETTIME() - map_start_time, &g_uvm_va_block_host_op_stats.ns_dma_map);
+    atomic64_inc(&g_uvm_va_block_host_op_stats.num_dma_map_chunks);
+    atomic64_add(uvm_cpu_chunk_num_pages(chunk), &g_uvm_va_block_host_op_stats.num_dma_map_pages);
 
     // If this GPU requires physical invalidations for new DMA mappings, tell
     // the next relevant operation to issue one before accessing the mapping.
@@ -1418,6 +1487,8 @@ uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get_alloc(uvm_va_block_t *block
     status = block_gpu_map_phys_all_cpu_pages(block, gpu);
     if (status != NV_OK)
         goto error;
+
+    atomic64_inc(&g_uvm_va_block_host_op_stats.num_first_touch_blocks);
 
     return gpu_state;
 
@@ -5793,10 +5864,17 @@ static void block_unmap_cpu(uvm_va_block_t *block,
         // We can't actually unmap HMM ranges from the CPU here. Unmapping
         // happens as part of migrate_vma_setup(), but we need to record the
         // updated CPU mapping information in the va_block.
-        if (!uvm_va_block_is_hmm(block))
+        if (!uvm_va_block_is_hmm(block)) {
+            NvU64 unmap_start_time = NV_GETTIME();
+
             unmap_mapping_range(va_space->mapping,
                                 uvm_va_block_region_start(block, subregion),
                                 uvm_va_block_region_size(subregion), 1);
+
+            atomic64_add(NV_GETTIME() - unmap_start_time, &g_uvm_va_block_host_op_stats.ns_unmap);
+            atomic64_inc(&g_uvm_va_block_host_op_stats.num_unmap_calls);
+            atomic64_add(uvm_va_block_region_num_pages(subregion), &g_uvm_va_block_host_op_stats.num_unmap_pages);
+        }
 
         for (pte_bit = 0; pte_bit < UVM_PTE_BITS_CPU_MAX; pte_bit++)
             uvm_page_mask_region_clear(&block->cpu.pte_bits[pte_bit], subregion);

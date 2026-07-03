@@ -741,6 +741,27 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
                          parent_gpu->fault_buffer.replayable.stats.num_replays);
     UVM_SEQ_OR_DBG_PRINT(s, "  start_ack_all        %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_replays_ack_all);
+    UVM_SEQ_OR_DBG_PRINT(s, "servicing_pipeline:\n");
+    UVM_SEQ_OR_DBG_PRINT(s, "  num_batches          %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_batches);
+    UVM_SEQ_OR_DBG_PRINT(s, "  num_cached_faults    %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_cached_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "  num_coalesced_faults %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_coalesced_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_fetch             %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_fetch);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_preprocess        %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_preprocess);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_service           %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_service);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_replay            %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_replay);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_tracker_wait      %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_tracker_wait);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_batch_total       %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_batch_total);
+    UVM_SEQ_OR_DBG_PRINT(s, "  ns_bh_queue_delay    %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.ns_bh_queue_delay);
     UVM_SEQ_OR_DBG_PRINT(s, "non_replayable_faults  %llu\n", parent_gpu->stats.num_non_replayable_faults);
     UVM_SEQ_OR_DBG_PRINT(s, "faults_by_access_type:\n");
     UVM_SEQ_OR_DBG_PRINT(s, "  read                 %llu\n",

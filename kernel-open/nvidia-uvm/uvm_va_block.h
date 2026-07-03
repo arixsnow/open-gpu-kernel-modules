@@ -603,6 +603,33 @@ struct uvm_va_block_retry_struct
     struct list_head used_chunks;
 };
 
+// Cumulative counters for the host OS operations performed on the migration
+// path: removing CPU mappings before pages migrate to a GPU, and creating the
+// sysmem DMA mappings a GPU needs in order to access CPU pages. These paths
+// run in many contexts (GPU fault bottom halves, CPU faults, explicit
+// migrations), some without a GPU at hand, so the counters are global rather
+// than per-GPU. Exposed via the cpu/host_op_stats procfs file.
+typedef struct
+{
+    // Time spent in and number of calls to unmap_mapping_range, plus pages
+    // covered by those calls
+    atomic64_t ns_unmap;
+    atomic64_t num_unmap_calls;
+    atomic64_t num_unmap_pages;
+
+    // Time spent creating sysmem GPU (DMA) mappings of CPU chunks, number of
+    // chunks mapped, and pages covered
+    atomic64_t ns_dma_map;
+    atomic64_t num_dma_map_chunks;
+    atomic64_t num_dma_map_pages;
+
+    // Number of (block, GPU) first-touch instances: GPU state allocations,
+    // each of which DMA-maps all populated CPU pages of the block
+    atomic64_t num_first_touch_blocks;
+} uvm_va_block_host_op_stats_t;
+
+extern uvm_va_block_host_op_stats_t g_uvm_va_block_host_op_stats;
+
 // Module load/exit
 NV_STATUS uvm_va_block_init(void);
 void uvm_va_block_exit(void);

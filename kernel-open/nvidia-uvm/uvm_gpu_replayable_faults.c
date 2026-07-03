@@ -2899,6 +2899,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     NvU32 num_replays = 0;
     NvU32 num_batches = 0;
     NvU32 num_throttled = 0;
+    NvU64 batch_start_time = 0;
+    NvU64 time_stamp;
     NV_STATUS status = NV_OK;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
@@ -2919,7 +2921,10 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         batch_context->fatal_gpu                   = NULL;
         batch_context->has_throttled_faults        = false;
 
+        batch_start_time = NV_GETTIME();
+
         status = fetch_fault_buffer_entries(parent_gpu, batch_context, FAULT_FETCH_MODE_BATCH_READY);
+        replayable_faults->stats.ns_fetch += NV_GETTIME() - batch_start_time;
         if (status != NV_OK)
             break;
 
@@ -2928,7 +2933,12 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         ++batch_context->batch_id;
 
+        replayable_faults->stats.num_cached_faults += batch_context->num_cached_faults;
+        replayable_faults->stats.num_coalesced_faults += batch_context->num_coalesced_faults;
+
+        time_stamp = NV_GETTIME();
         status = preprocess_fault_batch(parent_gpu, batch_context);
+        replayable_faults->stats.ns_preprocess += NV_GETTIME() - time_stamp;
 
         num_replays += batch_context->num_replays;
 
@@ -2937,7 +2947,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         else if (status != NV_OK)
             break;
 
+        time_stamp = NV_GETTIME();
         status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context);
+        replayable_faults->stats.ns_service += NV_GETTIME() - time_stamp;
 
         // We may have issued replays even if status != NV_OK if
         // UVM_PERF_FAULT_REPLAY_POLICY_BLOCK is being used or the fault buffer
@@ -2958,13 +2970,17 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         }
 
         if (batch_context->fatal_va_space) {
+            time_stamp = NV_GETTIME();
             status = uvm_tracker_wait(&batch_context->tracker);
+            replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
             if (status == NV_OK) {
                 status = cancel_faults_precise(batch_context);
                 if (status == NV_OK) {
                     // Cancel handling should've issued at least one replay
                     UVM_ASSERT(batch_context->num_replays > 0);
                     ++num_batches;
+                    ++replayable_faults->stats.num_batches;
+                    replayable_faults->stats.ns_batch_total += NV_GETTIME() - batch_start_time;
                     continue;
                 }
             }
@@ -2973,7 +2989,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         }
 
         if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
+            time_stamp = NV_GETTIME();
             status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+            replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
             ++num_replays;
@@ -2986,11 +3004,15 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT;
             }
 
+            time_stamp = NV_GETTIME();
             status = fault_buffer_flush_locked(parent_gpu, NULL, flush_mode, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+            replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
             ++num_replays;
+            time_stamp = NV_GETTIME();
             status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+            replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
         }
@@ -2999,6 +3021,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             ++num_throttled;
 
         ++num_batches;
+        ++replayable_faults->stats.num_batches;
+        replayable_faults->stats.ns_batch_total += NV_GETTIME() - batch_start_time;
     }
 
     if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
@@ -3007,8 +3031,11 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     // Make sure that we issue at least one replay if no replay has been
     // issued yet to avoid dropping faults that do not show up in the buffer
     if ((status == NV_OK && replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_ONCE) ||
-        num_replays == 0)
+        num_replays == 0) {
+        time_stamp = NV_GETTIME();
         status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+        replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
+    }
 
     uvm_tracker_deinit(&batch_context->tracker);
 

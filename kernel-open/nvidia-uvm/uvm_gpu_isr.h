@@ -84,6 +84,12 @@ typedef struct
         // An array (one per possible CPU), which holds the number of times the
         // bottom half has executed on that CPU.
         NvU64 *cpu_exec_count;
+
+        // Timestamp taken when the bottom half is scheduled, used to compute
+        // the scheduling-to-execution delay. Only used for replayable faults,
+        // where at most one bottom half can be in flight (the top half only
+        // schedules after taking service_lock), so a plain field is safe.
+        NvU64 bh_schedule_timestamp;
     } stats;
 
     // This is the number of times the function that disables this type of
