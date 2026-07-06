@@ -595,6 +595,7 @@ static void replayable_faults_isr_bottom_half(void *args)
 {
     uvm_parent_gpu_t *parent_gpu = (uvm_parent_gpu_t *)args;
     unsigned int cpu;
+    NvU64 bh_queue_delay;
 
     // Record the lock ownership
     // The service_lock semaphore is taken in the top half using a raw
@@ -614,8 +615,11 @@ static void replayable_faults_isr_bottom_half(void *args)
     ++parent_gpu->isr.replayable_faults.stats.cpu_exec_count[cpu];
     put_cpu();
 
-    parent_gpu->fault_buffer.replayable.stats.ns_bh_queue_delay +=
-        NV_GETTIME() - parent_gpu->isr.replayable_faults.stats.bh_schedule_timestamp;
+    bh_queue_delay = NV_GETTIME() - parent_gpu->isr.replayable_faults.stats.bh_schedule_timestamp;
+    parent_gpu->fault_buffer.replayable.stats.ns_bh_queue_delay += bh_queue_delay;
+
+    // Mirror into the module-lifetime global aggregate (cpu/fault_stats).
+    atomic64_add(bh_queue_delay, &g_uvm_fault_pipeline_stats.ns_bh_queue_delay);
 
     uvm_parent_gpu_service_replayable_faults(parent_gpu);
 

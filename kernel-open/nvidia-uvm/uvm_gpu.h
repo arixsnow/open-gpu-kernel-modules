@@ -58,6 +58,41 @@
 #define UVM_PARENT_GPU_UUID_STRING_LENGTH (sizeof(UVM_PARENT_GPU_UUID_PREFIX) - 1 + UVM_UUID_STRING_LENGTH)
 #define UVM_GPU_UUID_STRING_LENGTH (sizeof(UVM_GPU_UUID_PREFIX) - 1 + UVM_UUID_STRING_LENGTH)
 
+// Module-lifetime global aggregate of the replayable-fault servicing-pipeline
+// counters. The per-GPU equivalents live in
+// uvm_parent_gpu_t.fault_buffer.replayable.stats and are exposed at
+// gpus/GPU-<uuid>/fault_stats, but that node is created on GPU registration and
+// destroyed when the last process releases the GPU. This mirror is a single
+// file-scope object (BSS, zeroed at load, never freed), so it survives GPU
+// unregister and backs a persistent cpu/fault_stats node the external capture
+// can always diff. Summed across every GPU's bottom half, so fields are
+// atomic64_t. Cumulative since module load; consumers snapshot-and-diff (no
+// zero-on-read).
+typedef struct
+{
+    atomic64_t num_batches;
+    atomic64_t num_cached_faults;
+    atomic64_t num_coalesced_faults;
+    atomic64_t ns_fetch;
+    atomic64_t ns_preprocess;
+    atomic64_t ns_service;
+    atomic64_t ns_replay;
+    atomic64_t ns_tracker_wait;
+    atomic64_t ns_batch_total;
+    atomic64_t ns_bh_queue_delay;
+    atomic64_t replayable_faults;
+    atomic64_t duplicates;
+    atomic64_t num_pages_in;
+    atomic64_t num_pages_out;
+} uvm_fault_pipeline_global_stats_t;
+
+extern uvm_fault_pipeline_global_stats_t g_uvm_fault_pipeline_stats;
+
+// Persistent cpu/fault_stats procfs node backed by g_uvm_fault_pipeline_stats.
+// Created/destroyed with the module (hooked from uvm_va_block_init/exit).
+NV_STATUS uvm_fault_pipeline_stats_procfs_init(void);
+void uvm_fault_pipeline_stats_procfs_exit(void);
+
 #define UVM_GPU_MAGIC_VALUE 0xc001d00d12341993ULL
 
 typedef struct

@@ -2905,6 +2905,22 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
 
+    // Snapshot the per-GPU servicing-pipeline counters so we can fold this
+    // invocation's delta into the module-lifetime global (cpu/fault_stats) at
+    // the single function exit. The per-GPU node vanishes on GPU unregister;
+    // the global persists so the external capture can always diff it.
+    // (ns_bh_queue_delay is updated in the ISR before this call, so it is
+    // mirrored there, not here.)
+    NvU64 fold_start_num_batches          = replayable_faults->stats.num_batches;
+    NvU64 fold_start_num_cached_faults    = replayable_faults->stats.num_cached_faults;
+    NvU64 fold_start_num_coalesced_faults = replayable_faults->stats.num_coalesced_faults;
+    NvU64 fold_start_ns_fetch             = replayable_faults->stats.ns_fetch;
+    NvU64 fold_start_ns_preprocess        = replayable_faults->stats.ns_preprocess;
+    NvU64 fold_start_ns_service           = replayable_faults->stats.ns_service;
+    NvU64 fold_start_ns_replay            = replayable_faults->stats.ns_replay;
+    NvU64 fold_start_ns_tracker_wait      = replayable_faults->stats.ns_tracker_wait;
+    NvU64 fold_start_ns_batch_total       = replayable_faults->stats.ns_batch_total;
+
     uvm_tracker_init(&batch_context->tracker);
 
     // Process all faults in the buffer
@@ -3038,6 +3054,27 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     }
 
     uvm_tracker_deinit(&batch_context->tracker);
+
+    // Fold this invocation's per-GPU pipeline delta into the module-lifetime
+    // global aggregate (cpu/fault_stats), which persists across GPU unregister.
+    atomic64_add(replayable_faults->stats.num_batches          - fold_start_num_batches,
+                 &g_uvm_fault_pipeline_stats.num_batches);
+    atomic64_add(replayable_faults->stats.num_cached_faults    - fold_start_num_cached_faults,
+                 &g_uvm_fault_pipeline_stats.num_cached_faults);
+    atomic64_add(replayable_faults->stats.num_coalesced_faults - fold_start_num_coalesced_faults,
+                 &g_uvm_fault_pipeline_stats.num_coalesced_faults);
+    atomic64_add(replayable_faults->stats.ns_fetch             - fold_start_ns_fetch,
+                 &g_uvm_fault_pipeline_stats.ns_fetch);
+    atomic64_add(replayable_faults->stats.ns_preprocess        - fold_start_ns_preprocess,
+                 &g_uvm_fault_pipeline_stats.ns_preprocess);
+    atomic64_add(replayable_faults->stats.ns_service           - fold_start_ns_service,
+                 &g_uvm_fault_pipeline_stats.ns_service);
+    atomic64_add(replayable_faults->stats.ns_replay            - fold_start_ns_replay,
+                 &g_uvm_fault_pipeline_stats.ns_replay);
+    atomic64_add(replayable_faults->stats.ns_tracker_wait      - fold_start_ns_tracker_wait,
+                 &g_uvm_fault_pipeline_stats.ns_tracker_wait);
+    atomic64_add(replayable_faults->stats.ns_batch_total       - fold_start_ns_batch_total,
+                 &g_uvm_fault_pipeline_stats.ns_batch_total);
 
     if (status != NV_OK)
         UVM_DBG_PRINT("Error servicing replayable faults on GPU: %s\n", uvm_parent_gpu_name(parent_gpu));

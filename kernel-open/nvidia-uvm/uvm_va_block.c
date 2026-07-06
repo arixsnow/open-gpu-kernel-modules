@@ -949,6 +949,8 @@ static void va_block_host_op_stats_procfs_exit(void)
 
 NV_STATUS uvm_va_block_init(void)
 {
+    NV_STATUS status;
+
     if (uvm_enable_builtin_tests)
         g_uvm_va_block_cache = NV_KMEM_CACHE_CREATE("uvm_va_block_wrapper_t", uvm_va_block_wrapper_t);
     else
@@ -974,11 +976,16 @@ NV_STATUS uvm_va_block_init(void)
     if (!g_uvm_va_block_cpu_node_state_cache)
         return NV_ERR_NO_MEMORY;
 
-    return va_block_host_op_stats_procfs_init();
+    status = va_block_host_op_stats_procfs_init();
+    if (status != NV_OK)
+        return status;
+
+    return uvm_fault_pipeline_stats_procfs_init();
 }
 
 void uvm_va_block_exit(void)
 {
+    uvm_fault_pipeline_stats_procfs_exit();
     va_block_host_op_stats_procfs_exit();
     kmem_cache_destroy_safe(&g_uvm_va_block_cpu_node_state_cache);
     kmem_cache_destroy_safe(&g_uvm_va_block_context_cache);

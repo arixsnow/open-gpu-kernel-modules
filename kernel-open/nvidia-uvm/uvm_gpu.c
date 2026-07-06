@@ -59,6 +59,11 @@ MODULE_PARM_DESC(uvm_peer_copy, "Choose the addressing mode for peer copying, op
                                 UVM_PARAM_PEER_COPY_PHYSICAL " [default] or " UVM_PARAM_PEER_COPY_VIRTUAL ". "
                                 "Valid for Ampere+ GPUs.");
 
+// Module-lifetime aggregate of the fault servicing-pipeline counters, mirrored
+// from every parent GPU's replayable.stats. Persists across GPU unregister and
+// backs the cpu/fault_stats procfs node. See uvm_fault_pipeline_global_stats_t.
+uvm_fault_pipeline_global_stats_t g_uvm_fault_pipeline_stats;
+
 static uvm_user_channel_t *get_user_channel(uvm_rb_tree_node_t *node)
 {
     return container_of(node, uvm_user_channel_t, instance_ptr.node);
@@ -1016,6 +1021,85 @@ UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_info_entry);
 UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_fault_stats_entry);
 UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_access_counters_entry);
 
+// Persistent, module-lifetime mirror of the per-GPU fault_stats counters,
+// exposed at cpu/fault_stats. Unlike the per-GPU gpus/GPU-*/fault_stats node
+// (created/destroyed with GPU registration), this one lives for the whole
+// module lifetime, so an external before/after capture around a short-lived
+// workload can always read it. Keys match the per-GPU node's names so the
+// measurement scripts parse both identically.
+static struct proc_dir_entry *g_uvm_fault_pipeline_stats_file;
+
+static int nv_procfs_read_fault_pipeline_stats(struct seq_file *s, void *v)
+{
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
+        return -EAGAIN;
+
+    UVM_SEQ_OR_DBG_PRINT(s, "replayable_faults      %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.replayable_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "duplicates             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.duplicates));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_pages_in           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.num_pages_in));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_pages_out          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.num_pages_out));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_batches            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.num_batches));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_cached_faults      %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.num_cached_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_coalesced_faults   %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.num_coalesced_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_fetch               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_fetch));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_preprocess          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_preprocess));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_service             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_service));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_replay              %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_replay));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_tracker_wait        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_tracker_wait));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_batch_total         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_batch_total));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_bh_queue_delay      %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_fault_pipeline_stats.ns_bh_queue_delay));
+
+    uvm_up_read(&g_uvm_global.pm.lock);
+
+    return 0;
+}
+
+static int nv_procfs_read_fault_pipeline_stats_entry(struct seq_file *s, void *v)
+{
+    UVM_ENTRY_RET(nv_procfs_read_fault_pipeline_stats(s, v));
+}
+
+UVM_DEFINE_SINGLE_PROCFS_FILE(fault_pipeline_stats_entry);
+
+NV_STATUS uvm_fault_pipeline_stats_procfs_init(void)
+{
+    struct proc_dir_entry *cpu_base_dir_entry = uvm_procfs_get_cpu_base_dir();
+
+    if (uvm_procfs_is_debug_enabled()) {
+        UVM_ASSERT(!g_uvm_fault_pipeline_stats_file);
+        g_uvm_fault_pipeline_stats_file = NV_CREATE_PROC_FILE("fault_stats",
+                                                              cpu_base_dir_entry,
+                                                              fault_pipeline_stats_entry,
+                                                              &g_uvm_fault_pipeline_stats);
+        if (!g_uvm_fault_pipeline_stats_file)
+            return NV_ERR_OPERATING_SYSTEM;
+    }
+
+    return NV_OK;
+}
+
+void uvm_fault_pipeline_stats_procfs_exit(void)
+{
+    if (g_uvm_fault_pipeline_stats_file) {
+        proc_remove(g_uvm_fault_pipeline_stats_file);
+        g_uvm_fault_pipeline_stats_file = NULL;
+    }
+}
+
 static void uvm_parent_gpu_uuid_string(char *buffer, const NvProcessorUuid *uuid)
 {
     memcpy(buffer, UVM_PARENT_GPU_UUID_PREFIX, sizeof(UVM_PARENT_GPU_UUID_PREFIX) - 1);
@@ -1955,10 +2039,13 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
         default:
             break;
     }
-    if (is_duplicate || fault_entry->filtered)
+    if (is_duplicate || fault_entry->filtered) {
         ++parent_gpu->fault_buffer.replayable.stats.num_duplicate_faults;
+        atomic64_inc(&g_uvm_fault_pipeline_stats.duplicates);
+    }
 
     ++parent_gpu->stats.num_replayable_faults;
+    atomic64_inc(&g_uvm_fault_pipeline_stats.replayable_faults);
 }
 
 static void update_stats_fault_cb(uvm_va_space_t *va_space,
@@ -2026,6 +2113,7 @@ static void update_stats_migration_cb(uvm_va_space_t *va_space,
         atomic64_add(pages, &gpu_dst->parent->stats.num_pages_in);
         if (is_replayable_fault) {
             atomic64_add(pages, &gpu_dst->parent->fault_buffer.replayable.stats.num_pages_in);
+            atomic64_add(pages, &g_uvm_fault_pipeline_stats.num_pages_in);
         }
         else if (is_non_replayable_fault) {
             atomic64_add(pages, &gpu_dst->parent->fault_buffer.non_replayable.stats.num_pages_in);
@@ -2039,6 +2127,7 @@ static void update_stats_migration_cb(uvm_va_space_t *va_space,
         atomic64_add(pages, &gpu_src->parent->stats.num_pages_out);
         if (is_replayable_fault) {
             atomic64_add(pages, &gpu_src->parent->fault_buffer.replayable.stats.num_pages_out);
+            atomic64_add(pages, &g_uvm_fault_pipeline_stats.num_pages_out);
         }
         else if (is_non_replayable_fault) {
             atomic64_add(pages, &gpu_src->parent->fault_buffer.non_replayable.stats.num_pages_out);
