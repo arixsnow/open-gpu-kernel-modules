@@ -284,7 +284,7 @@ NV_STATUS uvm_isr_top_half_entry(const NvProcessorUuid *gpu_uuid)
     UVM_ENTRY_RET(uvm_isr_top_half(gpu_uuid));
 }
 
-static NV_STATUS init_queue_on_node(nv_kthread_q_t *queue, const char *name, int node)
+NV_STATUS uvm_isr_init_queue_on_node(nv_kthread_q_t *queue, const char *name, int node)
 {
 #if UVM_THREAD_AFFINITY_SUPPORTED()
     if (node != -1 && !cpumask_empty(cpumask_of_node(node))) {
@@ -382,7 +382,9 @@ NV_STATUS uvm_parent_gpu_init_isr(uvm_parent_gpu_t *parent_gpu)
     parent_gpu->isr.replayable_faults.handling = true;
 
     snprintf(kthread_name, sizeof(kthread_name), "UVM GPU%u BH", uvm_parent_id_value(parent_gpu->id));
-    status = init_queue_on_node(&parent_gpu->isr.bottom_half_q, kthread_name, parent_gpu->closest_cpu_numa_node);
+    status = uvm_isr_init_queue_on_node(&parent_gpu->isr.bottom_half_q,
+                                        kthread_name,
+                                        parent_gpu->closest_cpu_numa_node);
     if (status != NV_OK) {
         UVM_ERR_PRINT("Failed in nv_kthread_q_init for bottom_half_q: %s, GPU %s\n",
                       nvstatusToString(status),
@@ -409,7 +411,7 @@ NV_STATUS uvm_parent_gpu_init_isr(uvm_parent_gpu_t *parent_gpu)
     parent_gpu->isr.non_replayable_faults.handling = true;
 
     snprintf(kthread_name, sizeof(kthread_name), "UVM GPU%u KC", uvm_parent_id_value(parent_gpu->id));
-    status = init_queue_on_node(&parent_gpu->isr.kill_channel_q,
+    status = uvm_isr_init_queue_on_node(&parent_gpu->isr.kill_channel_q,
                                 kthread_name,
                                 parent_gpu->closest_cpu_numa_node);
     if (status != NV_OK) {
