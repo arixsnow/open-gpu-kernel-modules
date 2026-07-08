@@ -23,6 +23,7 @@
 
 #include "linux/sort.h"
 #include "nv_uvm_interface.h"
+#include "uvm_api.h"
 #include "uvm_common.h"
 #include "uvm_linux.h"
 #include "uvm_global.h"
@@ -37,6 +38,7 @@
 #include "uvm_procfs.h"
 #include "uvm_perf_thrashing.h"
 #include "uvm_gpu_non_replayable_faults.h"
+#include "uvm_gpu_isr.h"
 #include "uvm_ats_faults.h"
 #include "uvm_test.h"
 
@@ -82,6 +84,35 @@ module_param(uvm_perf_fault_batch_count, uint, S_IRUGO);
 // Policy that determines when to issue fault replays
 static uvm_perf_fault_replay_policy_t uvm_perf_fault_replay_policy = UVM_PERF_FAULT_REPLAY_POLICY_DEFAULT;
 module_param(uvm_perf_fault_replay_policy, uint, S_IRUGO);
+
+#define UVM_PERF_FAULT_SERVICE_MAX_WORKERS 15
+
+// Number of additional worker threads (beyond the bottom-half dispatcher,
+// which services its own share inline) used to service a replayable fault
+// batch in parallel across va_blocks. 0 (the default) disables the worker
+// pool entirely and keeps the stock serial servicing path.
+static unsigned uvm_perf_fault_service_num_workers = 0;
+module_param(uvm_perf_fault_service_num_workers, uint, S_IRUGO);
+
+#define UVM_PERF_FAULT_SERVICE_MIN_FAULTS_DEFAULT 32
+
+// Minimum number of coalesced faults in a batch for the worker pool to be
+// used. Smaller batches are serviced serially by the dispatcher, where the
+// dispatch/join overhead would dominate any parallelism win.
+static unsigned uvm_perf_fault_service_min_faults = UVM_PERF_FAULT_SERVICE_MIN_FAULTS_DEFAULT;
+module_param(uvm_perf_fault_service_min_faults, uint, S_IRUGO);
+
+// Pipelined batch servicing: under UVM_PERF_FAULT_REPLAY_POLICY_BATCH_FLUSH
+// (the default), do not synchronously wait for the flush's replay to complete
+// before fetching the next batch. The replay push already acquires the batch
+// tracker, so the GPU orders it after every migration of the batch with no
+// CPU involvement; the synchronous wait only paces the loop. When enabled,
+// the wait is deferred until the fault buffer turns up empty while a replay
+// is still pending (then we wait once and re-fetch, preserving the stock
+// behavior of servicing replayed faults within the same bottom-half pass).
+// 0 (the default) keeps the stock synchronous wait.
+static unsigned uvm_perf_fault_service_pipeline = 0;
+module_param(uvm_perf_fault_service_pipeline, uint, S_IRUGO);
 
 #define UVM_PERF_FAULT_REPLAY_UPDATE_PUT_RATIO_DEFAULT 50
 
@@ -135,6 +166,127 @@ static void fault_buffer_reinit_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         parent_gpu->arch_hal->disable_prefetch_faults(parent_gpu);
 }
 
+static void fault_service_worker_entry(void *args);
+
+// Allocate and initialize the worker pool for parallel fault-batch servicing.
+// With uvm_perf_fault_service_num_workers == 0 (the default) only the zero
+// worker count is recorded: nothing is allocated and fault servicing takes
+// the stock serial path.
+static NV_STATUS fault_service_pool_init(uvm_parent_gpu_t *parent_gpu)
+{
+    NV_STATUS status;
+    NvU32 i;
+    char kthread_name[32];
+    uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
+    NvU32 num_workers = min(uvm_perf_fault_service_num_workers, (unsigned)UVM_PERF_FAULT_SERVICE_MAX_WORKERS);
+
+    if (num_workers != uvm_perf_fault_service_num_workers) {
+        UVM_INFO_PRINT("Invalid uvm_perf_fault_service_num_workers value on GPU %s: %u. Valid range [0:%u] Using %u instead\n",
+                       uvm_parent_gpu_name(parent_gpu),
+                       uvm_perf_fault_service_num_workers,
+                       UVM_PERF_FAULT_SERVICE_MAX_WORKERS,
+                       num_workers);
+    }
+
+    replayable_faults->service_pool.num_workers = num_workers;
+    atomic_set(&replayable_faults->service_pool.outstanding, 0);
+    init_waitqueue_head(&replayable_faults->service_pool.done_wq);
+
+    if (num_workers == 0)
+        return NV_OK;
+
+    replayable_faults->service_pool.queues =
+        uvm_kvmalloc_zero(num_workers * sizeof(*replayable_faults->service_pool.queues));
+    if (!replayable_faults->service_pool.queues)
+        return NV_ERR_NO_MEMORY;
+
+    replayable_faults->service_pool.workers =
+        uvm_kvmalloc_zero((num_workers + 1) * sizeof(*replayable_faults->service_pool.workers));
+    if (!replayable_faults->service_pool.workers)
+        return NV_ERR_NO_MEMORY;
+
+    // Worst case every coalesced fault is its own span (random access
+    // patterns get close to this), so size the span scratch like the fault
+    // caches: one entry per possible fault
+    replayable_faults->service_pool.spans =
+        uvm_kvmalloc_zero(replayable_faults->max_faults * sizeof(*replayable_faults->service_pool.spans));
+    if (!replayable_faults->service_pool.spans)
+        return NV_ERR_NO_MEMORY;
+
+    // Slot 0 is the dispatcher's own worker state; it runs inline on the
+    // bottom-half thread and has no queue
+    for (i = 0; i < num_workers + 1; i++) {
+        uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[i];
+
+        worker->block_service_context.block_context = uvm_va_block_context_alloc(NULL);
+        if (!worker->block_service_context.block_context)
+            return NV_ERR_NO_MEMORY;
+
+        uvm_tracker_init(&worker->tracker);
+        worker->slot = i;
+        worker->parent_gpu = parent_gpu;
+        nv_kthread_q_item_init(&worker->q_item, fault_service_worker_entry, worker);
+    }
+
+    for (i = 0; i < num_workers; i++) {
+        snprintf(kthread_name, sizeof(kthread_name), "UVM GPU%u FSVC%u", uvm_parent_id_value(parent_gpu->id), i + 1);
+
+        status = uvm_isr_init_queue_on_node(&replayable_faults->service_pool.queues[i],
+                                            kthread_name,
+                                            parent_gpu->closest_cpu_numa_node);
+        if (status != NV_OK) {
+            UVM_ERR_PRINT("Failed in nv_kthread_q_init for fault service queue %u: %s, GPU %s\n",
+                          i,
+                          nvstatusToString(status),
+                          uvm_parent_gpu_name(parent_gpu));
+            return status;
+        }
+    }
+
+    return NV_OK;
+}
+
+// Tear down the worker pool. Safe on a partially-initialized pool: the caller
+// runs the deinit path on any init failure.
+static void fault_service_pool_deinit(uvm_parent_gpu_t *parent_gpu)
+{
+    NvU32 i;
+    uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
+    NvU32 num_workers = replayable_faults->service_pool.num_workers;
+
+    UVM_ASSERT(atomic_read(&replayable_faults->service_pool.outstanding) == 0);
+
+    if (replayable_faults->service_pool.queues) {
+        // Safe on zero-initialized (never-started) queues, same as the
+        // bottom-half queues in uvm_parent_gpu_deinit_isr()
+        for (i = 0; i < num_workers; i++)
+            nv_kthread_q_stop(&replayable_faults->service_pool.queues[i]);
+
+        uvm_kvfree(replayable_faults->service_pool.queues);
+        replayable_faults->service_pool.queues = NULL;
+    }
+
+    if (replayable_faults->service_pool.workers) {
+        for (i = 0; i < num_workers + 1; i++) {
+            uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[i];
+
+            // The tracker is initialized right after a successful
+            // block_context alloc, so that alloc doubles as the init marker
+            if (worker->block_service_context.block_context) {
+                uvm_tracker_deinit(&worker->tracker);
+                uvm_va_block_context_free(worker->block_service_context.block_context);
+            }
+        }
+
+        uvm_kvfree(replayable_faults->service_pool.workers);
+        replayable_faults->service_pool.workers = NULL;
+    }
+
+    uvm_kvfree(replayable_faults->service_pool.spans);
+    replayable_faults->service_pool.spans = NULL;
+    replayable_faults->service_pool.num_workers = 0;
+}
+
 // There is no error handling in this function. The caller is in charge of
 // calling fault_buffer_deinit_replayable_faults on failure.
 static NV_STATUS fault_buffer_init_replayable_faults(uvm_parent_gpu_t *parent_gpu)
@@ -185,6 +337,8 @@ static NV_STATUS fault_buffer_init_replayable_faults(uvm_parent_gpu_t *parent_gp
 
     batch_context->max_utlb_id = 0;
 
+    uvm_spin_lock_init(&batch_context->fatal_lock, UVM_LOCK_ORDER_LEAF);
+
     status = uvm_rm_locked_call(nvUvmInterfaceOwnPageFaultIntr(parent_gpu->rm_device, NV_TRUE));
     if (status != NV_OK) {
         UVM_ERR_PRINT("Failed to take page fault ownership from RM: %s, GPU %s\n",
@@ -212,6 +366,10 @@ static NV_STATUS fault_buffer_init_replayable_faults(uvm_parent_gpu_t *parent_gp
                        replayable_faults->replay_update_put_ratio);
     }
 
+    status = fault_service_pool_init(parent_gpu);
+    if (status != NV_OK)
+        return status;
+
     // Re-enable fault prefetching just in case it was disabled in a previous run
     parent_gpu->fault_buffer.prefetch_faults_enabled = true;
 
@@ -224,6 +382,9 @@ static void fault_buffer_deinit_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 {
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
+
+    // Stop the service-pool kthreads before any batch state is freed
+    fault_service_pool_deinit(parent_gpu);
 
     if (batch_context->fault_cache) {
         UVM_ASSERT(uvm_tracker_is_empty(&replayable_faults->replay_tracker));
@@ -1176,9 +1337,9 @@ static void update_batch_and_notify_fault(uvm_gpu_t *gpu,
                                           bool is_duplicate)
 {
     if (is_duplicate)
-        batch_context->num_duplicate_faults += current_entry->num_instances;
+        atomic_add(current_entry->num_instances, &batch_context->num_duplicate_faults);
     else
-        batch_context->num_duplicate_faults += current_entry->num_instances - 1;
+        atomic_add(current_entry->num_instances - 1, &batch_context->num_duplicate_faults);
 
     uvm_perf_event_notify_gpu_fault(&current_entry->va_space->perf_events,
                                     va_block,
@@ -1202,7 +1363,7 @@ static void mark_fault_invalid_prefetch(uvm_fault_service_batch_context_t *batch
     // invalid_prefetch counter doesn't affect functionality (other than
     // disabling prefetching if the counter indicates lots of invalid prefetch
     // faults), this is ok.
-    batch_context->num_invalid_prefetch_faults += fault_entry->num_instances;
+    atomic_add(fault_entry->num_instances, &batch_context->num_invalid_prefetch_faults);
 }
 
 static void mark_fault_throttled(uvm_fault_service_batch_context_t *batch_context,
@@ -1210,6 +1371,25 @@ static void mark_fault_throttled(uvm_fault_service_batch_context_t *batch_contex
 {
     fault_entry->is_throttled = true;
     batch_context->has_throttled_faults = true;
+}
+
+// First-wins publication of the fatal (va_space, gpu) pair. The spinlock
+// keeps the pair coherent when parallel servicing workers mark fatal faults
+// concurrently; the serial path takes it uncontended.
+static void fault_batch_publish_fatal_va_space(uvm_fault_service_batch_context_t *batch_context,
+                                               uvm_va_space_t *va_space,
+                                               uvm_gpu_t *gpu)
+{
+    UVM_ASSERT(va_space);
+
+    uvm_spin_lock(&batch_context->fatal_lock);
+
+    if (!batch_context->fatal_va_space) {
+        batch_context->fatal_va_space = va_space;
+        batch_context->fatal_gpu = gpu;
+    }
+
+    uvm_spin_unlock(&batch_context->fatal_lock);
 }
 
 static void mark_fault_fatal(uvm_fault_service_batch_context_t *batch_context,
@@ -1225,11 +1405,7 @@ static void mark_fault_fatal(uvm_fault_service_batch_context_t *batch_context,
 
     utlb->has_fatal_faults = true;
 
-    if (!batch_context->fatal_va_space) {
-        UVM_ASSERT(fault_entry->va_space);
-        batch_context->fatal_va_space = fault_entry->va_space;
-        batch_context->fatal_gpu = fault_entry->gpu;
-    }
+    fault_batch_publish_fatal_va_space(batch_context, fault_entry->va_space, fault_entry->gpu);
 }
 
 static void fault_entry_duplicate_flags(uvm_fault_service_batch_context_t *batch_context,
@@ -1351,6 +1527,7 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
                                                   uvm_va_block_t *va_block,
                                                   uvm_va_block_retry_t *va_block_retry,
                                                   uvm_fault_service_batch_context_t *batch_context,
+                                                  uvm_service_block_context_t *block_context,
                                                   NvU32 first_fault_index,
                                                   const bool hmm_migratable,
                                                   NvU32 *block_faults)
@@ -1361,10 +1538,8 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
     uvm_page_index_t last_page_index;
     NvU32 page_fault_count = 0;
     uvm_gpu_t *gpu = gpu_va_space->gpu;
-    uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
     uvm_fault_buffer_entry_t **ordered_fault_cache = batch_context->ordered_fault_cache;
     uvm_fault_buffer_entry_t *first_fault_entry = ordered_fault_cache[first_fault_index];
-    uvm_service_block_context_t *block_context = &replayable_faults->block_service_context;
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     const uvm_va_policy_t *policy;
     NvU64 end;
@@ -1594,6 +1769,8 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
 static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
                                            uvm_va_block_t *va_block,
                                            uvm_fault_service_batch_context_t *batch_context,
+                                           uvm_service_block_context_t *fault_block_context,
+                                           uvm_tracker_t *tracker,
                                            NvU32 first_fault_index,
                                            const bool hmm_migratable,
                                            NvU32 *block_faults)
@@ -1601,9 +1778,6 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     NV_STATUS status;
     uvm_va_block_retry_t va_block_retry;
     NV_STATUS tracker_status;
-    uvm_gpu_t *gpu = gpu_va_space->gpu;
-    uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
-    uvm_service_block_context_t *fault_block_context = &replayable_faults->block_service_context;
 
     fault_block_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
     fault_block_context->num_retries = 0;
@@ -1618,11 +1792,12 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
                                                                         va_block,
                                                                         &va_block_retry,
                                                                         batch_context,
+                                                                        fault_block_context,
                                                                         first_fault_index,
                                                                         hmm_migratable,
                                                                         block_faults));
 
-    tracker_status = uvm_tracker_add_tracker_safe(&batch_context->tracker, &va_block->tracker);
+    tracker_status = uvm_tracker_add_tracker_safe(tracker, &va_block->tracker);
 
     uvm_mutex_unlock(&va_block->lock);
 
@@ -1685,13 +1860,13 @@ static NV_STATUS service_fault_batch_ats_sub_vma(uvm_gpu_va_space_t *gpu_va_spac
                                                  struct vm_area_struct *vma,
                                                  NvU64 base,
                                                  uvm_fault_service_batch_context_t *batch_context,
+                                                 uvm_ats_fault_context_t *ats_context,
                                                  NvU32 fault_index_start,
                                                  NvU32 fault_index_end,
                                                  NvU32 *block_faults)
 {
     NvU32 i;
     NV_STATUS status = NV_OK;
-    uvm_ats_fault_context_t *ats_context = &batch_context->ats_context;
     const uvm_page_mask_t *read_fault_mask = &ats_context->faults.read_fault_mask;
     const uvm_page_mask_t *write_fault_mask = &ats_context->faults.write_fault_mask;
     const uvm_page_mask_t *reads_serviced_mask = &ats_context->faults.reads_serviced_mask;
@@ -1704,7 +1879,7 @@ static NV_STATUS service_fault_batch_ats_sub_vma(uvm_gpu_va_space_t *gpu_va_spac
 
     uvm_page_mask_or(accessed_mask, write_fault_mask, read_fault_mask);
 
-    status = uvm_ats_service_faults(gpu_va_space, vma, base, &batch_context->ats_context);
+    status = uvm_ats_service_faults(gpu_va_space, vma, base, ats_context);
 
     // Remove SW prefetched pages from the serviced mask since fault servicing
     // failures belonging to prefetch pages need to be ignored.
@@ -1777,6 +1952,7 @@ static void start_new_sub_batch(NvU64 *sub_batch_base,
 static NV_STATUS service_fault_batch_ats_sub(uvm_gpu_va_space_t *gpu_va_space,
                                              struct vm_area_struct *vma,
                                              uvm_fault_service_batch_context_t *batch_context,
+                                             uvm_ats_fault_context_t *ats_context,
                                              NvU32 fault_index,
                                              NvU64 outer,
                                              NvU32 *block_faults)
@@ -1787,7 +1963,6 @@ static NV_STATUS service_fault_batch_ats_sub(uvm_gpu_va_space_t *gpu_va_space,
     NvU64 sub_batch_base;
     uvm_fault_buffer_entry_t *previous_entry = NULL;
     uvm_fault_buffer_entry_t *current_entry = batch_context->ordered_fault_cache[i];
-    uvm_ats_fault_context_t *ats_context = &batch_context->ats_context;
     uvm_page_mask_t *read_fault_mask = &ats_context->faults.read_fault_mask;
     uvm_page_mask_t *write_fault_mask = &ats_context->faults.write_fault_mask;
     uvm_page_mask_t *prefetch_only_fault_mask = &ats_context->faults.prefetch_only_fault_mask;
@@ -1831,6 +2006,7 @@ static NV_STATUS service_fault_batch_ats_sub(uvm_gpu_va_space_t *gpu_va_space,
                                                      vma,
                                                      sub_batch_base,
                                                      batch_context,
+                                                     ats_context,
                                                      sub_batch_fault_index,
                                                      i - 1,
                                                      block_faults);
@@ -1872,6 +2048,7 @@ static NV_STATUS service_fault_batch_ats_sub(uvm_gpu_va_space_t *gpu_va_space,
                                                  vma,
                                                  sub_batch_base,
                                                  batch_context,
+                                                 ats_context,
                                                  sub_batch_fault_index,
                                                  i,
                                                  block_faults);
@@ -1883,6 +2060,7 @@ static NV_STATUS service_fault_batch_ats_sub(uvm_gpu_va_space_t *gpu_va_space,
 static NV_STATUS service_fault_batch_ats(uvm_gpu_va_space_t *gpu_va_space,
                                          struct mm_struct *mm,
                                          uvm_fault_service_batch_context_t *batch_context,
+                                         uvm_ats_fault_context_t *ats_context,
                                          NvU32 first_fault_index,
                                          NvU64 outer,
                                          NvU32 *block_faults)
@@ -1924,7 +2102,7 @@ static NV_STATUS service_fault_batch_ats(uvm_gpu_va_space_t *gpu_va_space,
             break;
         }
 
-        status = service_fault_batch_ats_sub(gpu_va_space, vma, batch_context, i, outer, block_faults);
+        status = service_fault_batch_ats_sub(gpu_va_space, vma, batch_context, ats_context, i, outer, block_faults);
         if (status != NV_OK)
             break;
 
@@ -1937,6 +2115,9 @@ static NV_STATUS service_fault_batch_ats(uvm_gpu_va_space_t *gpu_va_space,
 static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
                                               uvm_gpu_va_space_t *gpu_va_space,
                                               uvm_fault_service_batch_context_t *batch_context,
+                                              uvm_service_block_context_t *service_context,
+                                              uvm_ats_fault_context_t *ats_context,
+                                              uvm_tracker_t *tracker,
                                               NvU32 fault_index,
                                               NvU32 *block_faults,
                                               bool replay_per_va_block,
@@ -1947,8 +2128,7 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
     uvm_va_range_t *va_range_next = NULL;
     uvm_va_block_t *va_block;
     uvm_gpu_t *gpu = gpu_va_space->gpu;
-    uvm_va_block_context_t *va_block_context =
-        gpu->parent->fault_buffer.replayable.block_service_context.block_context;
+    uvm_va_block_context_t *va_block_context = service_context->block_context;
     uvm_fault_buffer_entry_t *current_entry = batch_context->ordered_fault_cache[fault_index];
     struct mm_struct *mm = va_block_context->mm;
     NvU64 fault_address = current_entry->fault_address;
@@ -1984,7 +2164,14 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
             status = NV_OK;
         }
         else {
-            status = service_fault_batch_block(gpu_va_space, va_block, batch_context, fault_index, hmm_migratable, block_faults);
+            status = service_fault_batch_block(gpu_va_space,
+                                               va_block,
+                                               batch_context,
+                                               service_context,
+                                               tracker,
+                                               fault_index,
+                                               hmm_migratable,
+                                               block_faults);
         }
     }
     else if ((status == NV_ERR_INVALID_ADDRESS) && uvm_ats_can_service_faults(gpu_va_space, mm)) {
@@ -2021,7 +2208,13 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
             status = NV_OK;
         }
         else {
-            status = service_fault_batch_ats(gpu_va_space, mm, batch_context, fault_index, outer, block_faults);
+            status = service_fault_batch_ats(gpu_va_space,
+                                             mm,
+                                             batch_context,
+                                             ats_context,
+                                             fault_index,
+                                             outer,
+                                             block_faults);
         }
     }
     else {
@@ -2106,8 +2299,8 @@ static NV_STATUS service_fault_batch_for_cancel(uvm_fault_service_batch_context_
         goto done;
 
     // Re-parse the new faults
-    batch_context->num_invalid_prefetch_faults = 0;
-    batch_context->num_duplicate_faults        = 0;
+    atomic_set(&batch_context->num_invalid_prefetch_faults, 0);
+    atomic_set(&batch_context->num_duplicate_faults, 0);
     batch_context->num_replays                 = 0;
     batch_context->fatal_va_space              = NULL;
     batch_context->fatal_gpu                   = NULL;
@@ -2169,7 +2362,16 @@ static NV_STATUS service_fault_batch_for_cancel(uvm_fault_service_batch_context_
             // Service all the faults that we can. We only really need to search
             // for fatal faults, but attempting to service all is the easiest
             // way to do that.
-            status = service_fault_batch_dispatch(va_space, gpu_va_space, batch_context, i, &block_faults, false, hmm_migratable);
+            status = service_fault_batch_dispatch(va_space,
+                                                  gpu_va_space,
+                                                  batch_context,
+                                                  service_context,
+                                                  &batch_context->ats_context,
+                                                  &batch_context->tracker,
+                                                  i,
+                                                  &block_faults,
+                                                  false,
+                                                  hmm_migratable);
             if (status != NV_OK) {
                 // TODO: Bug 3900733: clean up locking in service_fault_batch().
                 // We need to drop lock and retry. That means flushing and
@@ -2227,32 +2429,43 @@ done:
     return status;
 }
 
-// Scan the ordered view of faults and group them by different va_blocks
-// (managed faults) and service faults for each va_block, in batch.
-// Service non-managed faults one at a time as they are encountered during the
-// scan.
+// Service a contiguous range [first_index, outer_index) of the ordered fault
+// cache: scan it, group faults by va_block (managed) and service each block
+// in batch; service non-managed faults as they are encountered during the
+// scan. Fatal faults are marked for later processing by the caller.
 //
-// Fatal faults are marked for later processing by the caller.
-static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
-                                     fault_service_mode_t service_mode,
-                                     uvm_fault_service_batch_context_t *batch_context)
+// This is the loop the stock driver runs over the whole batch on the
+// bottom-half thread. Under parallel servicing every worker runs it over its
+// assigned spans with its own privatized scratch state (service_context,
+// ats_context, ats_invalidate, tracker), so invocations never share mutable
+// service state. Everything the loop takes - va_space/mmap read locks,
+// va_block locks, the retry protocol - is already safe under concurrent
+// invocation: two parent GPUs' bottom halves service faults of the same
+// va_space concurrently in the stock driver today. Ranges must never split a
+// va_block (see uvm_fault_service_span_t).
+static NV_STATUS service_fault_batch_range(uvm_parent_gpu_t *parent_gpu,
+                                           fault_service_mode_t service_mode,
+                                           uvm_fault_service_batch_context_t *batch_context,
+                                           uvm_service_block_context_t *service_context,
+                                           uvm_ats_fault_context_t *ats_context,
+                                           uvm_ats_fault_invalidate_t *ats_invalidate,
+                                           uvm_tracker_t *tracker,
+                                           NvU32 first_index,
+                                           NvU32 outer_index)
 {
     NV_STATUS status = NV_OK;
     NvU32 i;
     uvm_va_space_t *va_space = NULL;
     uvm_gpu_va_space_t *prev_gpu_va_space = NULL;
-    uvm_ats_fault_invalidate_t *ats_invalidate = &parent_gpu->fault_buffer.replayable.ats_invalidate;
     struct mm_struct *mm = NULL;
     const bool replay_per_va_block = service_mode != FAULT_SERVICE_MODE_CANCEL &&
                                      parent_gpu->fault_buffer.replayable.replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BLOCK;
-    uvm_service_block_context_t *service_context =
-        &parent_gpu->fault_buffer.replayable.block_service_context;
     uvm_va_block_context_t *va_block_context = service_context->block_context;
     bool hmm_migratable = true;
 
     ats_invalidate->tlb_batch_pending = false;
 
-    for (i = 0; i < batch_context->num_coalesced_faults;) {
+    for (i = first_index; i < outer_index;) {
         NvU32 block_faults;
         uvm_fault_buffer_entry_t *current_entry = batch_context->ordered_fault_cache[i];
         uvm_fault_utlb_info_t *utlb = &batch_context->utlbs[current_entry->fault_source.utlb_id];
@@ -2263,7 +2476,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         if (current_entry->va_space != va_space) {
             if (prev_gpu_va_space) {
                 // TLB entries are invalidated per GPU VA space
-                status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
+                status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, tracker);
                 if (status != NV_OK)
                     goto fail;
 
@@ -2295,10 +2508,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         // the UVM driver
         if (current_entry->is_fatal) {
             ++i;
-            if (!batch_context->fatal_va_space) {
-                batch_context->fatal_va_space = va_space;
-                batch_context->fatal_gpu = current_entry->gpu;
-            }
+            fault_batch_publish_fatal_va_space(batch_context, va_space, current_entry->gpu);
 
             utlb->has_fatal_faults = true;
             UVM_ASSERT(utlb->num_pending_faults > 0);
@@ -2308,7 +2518,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         gpu_va_space = uvm_gpu_va_space_get(va_space, current_entry->gpu);
 
         if (prev_gpu_va_space && prev_gpu_va_space != gpu_va_space) {
-            status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
+            status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, tracker);
             if (status != NV_OK)
                 goto fail;
         }
@@ -2327,6 +2537,9 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         status = service_fault_batch_dispatch(va_space,
                                               gpu_va_space,
                                               batch_context,
+                                              service_context,
+                                              ats_context,
+                                              tracker,
                                               i,
                                               &block_faults,
                                               replay_per_va_block,
@@ -2364,7 +2577,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     }
 
     if (prev_gpu_va_space) {
-        NV_STATUS invalidate_status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
+        NV_STATUS invalidate_status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, tracker);
         if (invalidate_status != NV_OK)
             status = invalidate_status;
     }
@@ -2373,6 +2586,229 @@ fail:
     if (va_space) {
         uvm_va_space_up_read(va_space);
         uvm_va_space_mm_release_unlock(va_space, mm);
+    }
+
+    return status;
+}
+
+// Build the span partition of ordered_fault_cache[0..num_coalesced_faults) in
+// service_pool.spans: one span per maximal run with equal
+// (va_space, gpu, UVM_VA_BLOCK_SIZE-aligned address) key. Returns the span
+// count. Runs on the dispatcher before workers are kicked.
+static NvU32 fault_service_build_spans(uvm_parent_gpu_t *parent_gpu,
+                                       uvm_fault_service_batch_context_t *batch_context)
+{
+    uvm_fault_service_span_t *spans = parent_gpu->fault_buffer.replayable.service_pool.spans;
+    NvU32 num_spans = 0;
+    NvU32 i;
+
+    for (i = 0; i < batch_context->num_coalesced_faults; i++) {
+        uvm_fault_buffer_entry_t *entry = batch_context->ordered_fault_cache[i];
+
+        if (num_spans > 0) {
+            uvm_fault_buffer_entry_t *prev = batch_context->ordered_fault_cache[i - 1];
+
+            if (entry->va_space == prev->va_space &&
+                entry->gpu == prev->gpu &&
+                UVM_VA_BLOCK_ALIGN_DOWN(entry->fault_address) == UVM_VA_BLOCK_ALIGN_DOWN(prev->fault_address)) {
+                spans[num_spans - 1].end = i + 1;
+                continue;
+            }
+        }
+
+        spans[num_spans].begin = i;
+        spans[num_spans].end = i + 1;
+        spans[num_spans].owner = 0;
+        num_spans++;
+    }
+
+    return num_spans;
+}
+
+// Sort comparator: spans by weight (fault count), heaviest first
+static int cmp_sort_span_by_weight_desc(const void *_a, const void *_b)
+{
+    const uvm_fault_service_span_t *a = (const uvm_fault_service_span_t *)_a;
+    const uvm_fault_service_span_t *b = (const uvm_fault_service_span_t *)_b;
+
+    return UVM_CMP_DEFAULT(b->end - b->begin, a->end - a->begin);
+}
+
+// LPT (longest processing time first) greedy assignment of spans to num_bins
+// worker slots: heaviest span goes to the least-loaded bin. Bounds the
+// makespan at 4/3 of optimal; span weights (fault counts) are exact.
+static void fault_service_assign_spans(uvm_fault_service_span_t *spans, NvU32 num_spans, NvU32 num_bins)
+{
+    NvU32 loads[UVM_PERF_FAULT_SERVICE_MAX_WORKERS + 1] = {0};
+    NvU32 i;
+
+    UVM_ASSERT(num_bins <= ARRAY_SIZE(loads));
+
+    sort(spans, num_spans, sizeof(*spans), cmp_sort_span_by_weight_desc, NULL);
+
+    for (i = 0; i < num_spans; i++) {
+        NvU32 bin;
+        NvU32 min_bin = 0;
+
+        for (bin = 1; bin < num_bins; bin++) {
+            if (loads[bin] < loads[min_bin])
+                min_bin = bin;
+        }
+
+        spans[i].owner = (NvU8)min_bin;
+        loads[min_bin] += spans[i].end - spans[i].begin;
+    }
+}
+
+// Service every span owned by this worker. Runs inline on the bottom-half
+// thread for slot 0 and on a service_pool queue for the other slots. An error
+// stops this worker's remaining spans but not the other workers; the first
+// error wins at join.
+static void fault_service_worker_run(uvm_fault_service_worker_t *worker)
+{
+    uvm_parent_gpu_t *parent_gpu = worker->parent_gpu;
+    uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
+    NvU32 s;
+
+    for (s = 0; s < replayable_faults->service_pool.num_spans; s++) {
+        uvm_fault_service_span_t *span = &replayable_faults->service_pool.spans[s];
+        NV_STATUS status;
+
+        if (span->owner != worker->slot)
+            continue;
+
+        status = service_fault_batch_range(parent_gpu,
+                                           FAULT_SERVICE_MODE_REGULAR,
+                                           worker->batch_context,
+                                           &worker->block_service_context,
+                                           &worker->ats_context,
+                                           &worker->ats_invalidate,
+                                           &worker->tracker,
+                                           span->begin,
+                                           span->end);
+        if (status != NV_OK) {
+            worker->status = status;
+            break;
+        }
+    }
+}
+
+static void fault_service_worker_entry_internal(void *args)
+{
+    uvm_fault_service_worker_t *worker = (uvm_fault_service_worker_t *)args;
+    uvm_replayable_fault_buffer_t *replayable_faults = &worker->parent_gpu->fault_buffer.replayable;
+
+    UVM_ASSERT(worker->slot != 0);
+
+    fault_service_worker_run(worker);
+
+    if (atomic_dec_and_test(&replayable_faults->service_pool.outstanding))
+        wake_up(&replayable_faults->service_pool.done_wq);
+}
+
+static void fault_service_worker_entry(void *args)
+{
+    UVM_ENTRY_VOID(fault_service_worker_entry_internal(args));
+}
+
+// Scan the ordered view of faults and group them by different va_blocks
+// (managed faults) and service faults for each va_block, in batch.
+// Service non-managed faults one at a time as they are encountered during the
+// scan.
+//
+// Fatal faults are marked for later processing by the caller.
+//
+// When the worker pool is enabled the batch is partitioned into va_block
+// spans, spread across the pool with LPT, and serviced concurrently: the
+// dispatcher services its own share inline, then joins the workers and merges
+// their trackers into the batch tracker BEFORE the caller acquires it for the
+// replay push. Otherwise this reduces to one service_fault_batch_range() call
+// over the whole batch with the same shared scratch state the stock driver
+// uses - the exact serial path.
+static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
+                                     fault_service_mode_t service_mode,
+                                     uvm_fault_service_batch_context_t *batch_context)
+{
+    NV_STATUS status;
+    NvU32 k;
+    NvU32 num_spans;
+    uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
+    NvU32 num_workers = replayable_faults->service_pool.num_workers;
+
+    // Serial fallbacks: pool disabled, cancel mode (rare, correctness-first),
+    // per-block replay policy (would need ordered replay pushes from the
+    // workers), confidential computing (CE encryption state is
+    // single-threaded), and batches too small to amortize the dispatch/join.
+    if (num_workers == 0 ||
+        service_mode == FAULT_SERVICE_MODE_CANCEL ||
+        replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BLOCK ||
+        g_uvm_global.conf_computing_enabled ||
+        batch_context->num_coalesced_faults < uvm_perf_fault_service_min_faults) {
+        return service_fault_batch_range(parent_gpu,
+                                         service_mode,
+                                         batch_context,
+                                         &replayable_faults->block_service_context,
+                                         &batch_context->ats_context,
+                                         &replayable_faults->ats_invalidate,
+                                         &batch_context->tracker,
+                                         0,
+                                         batch_context->num_coalesced_faults);
+    }
+
+    num_spans = fault_service_build_spans(parent_gpu, batch_context);
+
+    // A single span is one va_block and cannot be split; service it serially
+    if (num_spans < 2) {
+        return service_fault_batch_range(parent_gpu,
+                                         service_mode,
+                                         batch_context,
+                                         &replayable_faults->block_service_context,
+                                         &batch_context->ats_context,
+                                         &replayable_faults->ats_invalidate,
+                                         &batch_context->tracker,
+                                         0,
+                                         batch_context->num_coalesced_faults);
+    }
+
+    replayable_faults->service_pool.num_spans = num_spans;
+
+    fault_service_assign_spans(replayable_faults->service_pool.spans, num_spans, num_workers + 1);
+
+    for (k = 0; k < num_workers + 1; k++) {
+        uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[k];
+
+        worker->status = NV_OK;
+        worker->batch_context = batch_context;
+        UVM_ASSERT(uvm_tracker_is_empty(&worker->tracker));
+    }
+
+    atomic_set(&replayable_faults->service_pool.outstanding, num_workers);
+
+    for (k = 1; k < num_workers + 1; k++) {
+        nv_kthread_q_schedule_q_item(&replayable_faults->service_pool.queues[k - 1],
+                                     &replayable_faults->service_pool.workers[k].q_item);
+    }
+
+    // The dispatcher is worker 0: service our own share while the pool runs
+    fault_service_worker_run(&replayable_faults->service_pool.workers[0]);
+
+    // Join BEFORE replay: the caller acquires the batch tracker for the
+    // replay push, so every worker's migrations must be merged in first. The
+    // dispatcher holds only the ISR-order service_lock here (no va_space or
+    // mmap locks), so workers can never be blocked waiting on us.
+    wait_event(replayable_faults->service_pool.done_wq,
+               atomic_read(&replayable_faults->service_pool.outstanding) == 0);
+
+    status = NV_OK;
+
+    for (k = 0; k < num_workers + 1; k++) {
+        uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[k];
+        NV_STATUS tracker_status = uvm_tracker_add_tracker_safe(&batch_context->tracker, &worker->tracker);
+
+        uvm_tracker_clear(&worker->tracker);
+
+        if (status == NV_OK)
+            status = worker->status == NV_OK ? tracker_status : worker->status;
     }
 
     return status;
@@ -2780,7 +3216,7 @@ static NV_STATUS cancel_faults_precise_tlb(uvm_gpu_t *gpu, uvm_fault_service_bat
         if (status != NV_OK)
             break;
 
-        batch_context->num_invalid_prefetch_faults = 0;
+        atomic_set(&batch_context->num_invalid_prefetch_faults, 0);
         batch_context->num_replays                 = 0;
         batch_context->fatal_va_space              = NULL;
         batch_context->fatal_gpu                   = NULL;
@@ -2879,10 +3315,11 @@ static void enable_disable_prefetch_faults(uvm_parent_gpu_t *parent_gpu,
     // fault reporting. If the logic changes, the tests will have to be changed.
     if (parent_gpu->fault_buffer.prefetch_faults_enabled &&
         uvm_perf_reenable_prefetch_faults_lapse_msec > 0 &&
-        ((batch_context->num_invalid_prefetch_faults * 3 > parent_gpu->fault_buffer.max_batch_size * 2) ||
+        (((NvU32)atomic_read(&batch_context->num_invalid_prefetch_faults) * 3 >
+          parent_gpu->fault_buffer.max_batch_size * 2) ||
          (uvm_enable_builtin_tests &&
           parent_gpu->rm_info.isSimulated &&
-          batch_context->num_invalid_prefetch_faults > 5))) {
+          atomic_read(&batch_context->num_invalid_prefetch_faults) > 5))) {
         uvm_parent_gpu_disable_prefetch_faults(parent_gpu);
     }
     else if (!parent_gpu->fault_buffer.prefetch_faults_enabled) {
@@ -2902,6 +3339,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     NvU64 batch_start_time = 0;
     NvU64 time_stamp;
     NV_STATUS status = NV_OK;
+    bool replay_pending = false;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
 
@@ -2930,8 +3368,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             break;
         }
 
-        batch_context->num_invalid_prefetch_faults = 0;
-        batch_context->num_duplicate_faults        = 0;
+        atomic_set(&batch_context->num_invalid_prefetch_faults, 0);
+        atomic_set(&batch_context->num_duplicate_faults, 0);
         batch_context->num_replays                 = 0;
         batch_context->fatal_va_space              = NULL;
         batch_context->fatal_gpu                   = NULL;
@@ -2944,8 +3382,25 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         if (status != NV_OK)
             break;
 
-        if (batch_context->num_cached_faults == 0)
+        if (batch_context->num_cached_faults == 0) {
+            // Pipelined servicing: the buffer may be empty only because a
+            // deferred replay hasn't executed yet and its faults haven't
+            // repopulated the buffer. Take the (deferred) wait now and fetch
+            // once more, preserving the stock behavior of servicing replayed
+            // faults within the same bottom-half pass.
+            if (replay_pending) {
+                replay_pending = false;
+                time_stamp = NV_GETTIME();
+                status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+                replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
+                if (status != NV_OK)
+                    break;
+
+                continue;
+            }
+
             break;
+        }
 
         ++batch_context->batch_id;
 
@@ -3015,7 +3470,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         else if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH_FLUSH) {
             uvm_gpu_buffer_flush_mode_t flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_CACHED_PUT;
 
-            if (batch_context->num_duplicate_faults * 100 >
+            if ((NvU32)atomic_read(&batch_context->num_duplicate_faults) * 100 >
                 batch_context->num_cached_faults * replayable_faults->replay_update_put_ratio) {
                 flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT;
             }
@@ -3026,11 +3481,23 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             if (status != NV_OK)
                 break;
             ++num_replays;
-            time_stamp = NV_GETTIME();
-            status = uvm_tracker_wait(&replayable_faults->replay_tracker);
-            replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
-            if (status != NV_OK)
-                break;
+
+            // The replay push acquired the batch tracker, so the GPU already
+            // orders it after every migration of this batch. Pipelined mode
+            // defers this CPU-side wait and overlaps the next batch's
+            // fetch/service with this batch's copies and replay; the wait
+            // moves to the empty-fetch path above. Serial mode keeps the
+            // stock synchronous wait.
+            if (uvm_perf_fault_service_pipeline != 0) {
+                replay_pending = true;
+            }
+            else {
+                time_stamp = NV_GETTIME();
+                status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+                replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
+                if (status != NV_OK)
+                    break;
+            }
         }
 
         if (batch_context->has_throttled_faults)

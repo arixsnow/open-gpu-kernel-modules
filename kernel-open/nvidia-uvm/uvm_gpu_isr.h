@@ -136,6 +136,10 @@ typedef struct
 // Entry point for interrupt handling. This is called from RM's top half
 NV_STATUS uvm_isr_top_half_entry(const NvProcessorUuid *gpu_uuid);
 
+// Initialize a nv_kthread_q, pinning its kthread to the given NUMA node when
+// thread affinity is supported (falls back to a regular init otherwise)
+NV_STATUS uvm_isr_init_queue_on_node(nv_kthread_q_t *queue, const char *name, int node);
+
 // Initialize ISR handling state
 NV_STATUS uvm_parent_gpu_init_isr(uvm_parent_gpu_t *parent_gpu);
 

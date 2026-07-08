@@ -352,11 +352,15 @@ struct uvm_fault_service_batch_context_struct
     // iterating over multiple GPU VA spaces and remove fatal_gpu.
     uvm_gpu_t *fatal_gpu;
 
+    // True-only during a batch; may be set concurrently by parallel servicing
+    // workers (benign: no false writes until the dispatcher resets it)
     bool has_throttled_faults;
 
-    NvU32 num_invalid_prefetch_faults;
+    // atomic_t rather than plain counters because parallel servicing workers
+    // update them concurrently. See uvm_perf_fault_service_num_workers.
+    atomic_t num_invalid_prefetch_faults;
 
-    NvU32 num_duplicate_faults;
+    atomic_t num_duplicate_faults;
 
     NvU32 num_replays;
 
@@ -374,6 +378,10 @@ struct uvm_fault_service_batch_context_struct
 
     // Last fetched fault. Used for fault filtering.
     uvm_fault_buffer_entry_t *last_fault;
+
+    // Serializes the first-wins publication of fatal_va_space/fatal_gpu when
+    // parallel servicing workers mark fatal faults concurrently. Leaf order.
+    uvm_spinlock_t fatal_lock;
 };
 
 struct uvm_ats_fault_invalidate_struct
@@ -381,6 +389,53 @@ struct uvm_ats_fault_invalidate_struct
     bool            tlb_batch_pending;
     uvm_tlb_batch_t tlb_batch;
 };
+
+// A span is a maximal run of ordered_fault_cache entries sharing the same
+// (va_space, gpu, UVM_VA_BLOCK_SIZE-aligned address) key: exactly the entries
+// one service_fault_batch_dispatch() call consumes. Partitioning by spans
+// guarantees a va_block (and every duplicate of a fault, since duplicates
+// share the address) is serviced by exactly one worker.
+typedef struct
+{
+    NvU32 begin;
+    NvU32 end;
+
+    // Worker slot this span is assigned to; 0 = the dispatcher
+    NvU8 owner;
+} uvm_fault_service_span_t;
+
+// Per-worker state for parallel servicing of a replayable fault batch. Slot 0
+// belongs to the dispatcher (the bottom-half thread), which services its own
+// share inline; slots 1..num_workers run on the service_pool queues. Each
+// worker privatizes the mutable scratch state that the serial path keeps in
+// the shared batch/buffer structs, so workers never race on service state.
+typedef struct uvm_fault_service_worker_struct
+{
+    // Privatized copy of replayable.block_service_context
+    uvm_service_block_context_t block_service_context;
+
+    // Privatized copy of batch_context->ats_context
+    uvm_ats_fault_context_t ats_context;
+
+    // Privatized copy of replayable.ats_invalidate
+    uvm_ats_fault_invalidate_t ats_invalidate;
+
+    // Per-worker tracker, merged into batch_context->tracker at join
+    uvm_tracker_t tracker;
+
+    // This worker's slot: 0 for the dispatcher, 1..num_workers for queued
+    // workers. Spans with owner == slot belong to this worker.
+    NvU32 slot;
+
+    // First failure observed by this worker; NV_OK otherwise
+    NV_STATUS status;
+
+    nv_kthread_q_item_t q_item;
+
+    uvm_fault_service_batch_context_t *batch_context;
+
+    uvm_parent_gpu_t *parent_gpu;
+} uvm_fault_service_worker_t;
 
 typedef struct
 {
@@ -489,6 +544,37 @@ typedef struct
 
         // Information required to invalidate stale ATS PTEs from the GPU TLBs
         uvm_ats_fault_invalidate_t ats_invalidate;
+
+        // Worker pool for parallel fault-batch servicing. Only allocated when
+        // uvm_perf_fault_service_num_workers > 0 at fault buffer init; with
+        // the default (0) every pointer stays NULL and the serial servicing
+        // path is untouched.
+        struct
+        {
+            // Number of extra worker threads beyond the dispatcher. Clamped
+            // snapshot of uvm_perf_fault_service_num_workers
+            NvU32 num_workers;
+
+            // [num_workers] NUMA-pinned queues, named "UVM GPU%u FSVC%u"
+            nv_kthread_q_t *queues;
+
+            // [num_workers + 1] worker states; slot 0 is the dispatcher
+            uvm_fault_service_worker_t *workers;
+
+            // [max_faults] span scratch for the current batch's partition.
+            // Written by the dispatcher before workers are kicked, read-only
+            // while they run
+            uvm_fault_service_span_t *spans;
+
+            // Number of valid entries in spans for the current batch
+            NvU32 num_spans;
+
+            // Worker items not yet finished in the current dispatch
+            atomic_t outstanding;
+
+            // Dispatcher joins here, waiting for outstanding == 0
+            wait_queue_head_t done_wq;
+        } service_pool;
     } replayable;
 
     struct uvm_non_replayable_fault_buffer_struct
