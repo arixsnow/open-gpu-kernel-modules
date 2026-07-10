@@ -2563,6 +2563,13 @@ static NV_STATUS service_fault_batch_range(uvm_parent_gpu_t *parent_gpu,
         hmm_migratable = true;
         i += block_faults;
 
+        // A dispatch call must never consume faults beyond the range it was
+        // given. Spans are cut on va_block boundaries and every dispatch path
+        // stops at the end of a va_block, so this holds for a span as it does
+        // for the whole batch. If it ever fires under the worker pool, two
+        // workers are servicing the same faults.
+        UVM_ASSERT(i <= outer_index);
+
         // Don't issue replays in cancel mode
         if (replay_per_va_block && !batch_context->fatal_va_space) {
             status = push_replay_on_gpu(gpu_va_space->gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
@@ -2732,17 +2739,29 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     NV_STATUS status;
     NvU32 k;
     NvU32 num_spans;
+    NvU32 not_queued = 0;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     NvU32 num_workers = replayable_faults->service_pool.num_workers;
+
+    // not_queued is a bitmask over worker slots
+    BUILD_BUG_ON(UVM_PERF_FAULT_SERVICE_MAX_WORKERS >= 8 * sizeof(not_queued));
 
     // Serial fallbacks: pool disabled, cancel mode (rare, correctness-first),
     // per-block replay policy (would need ordered replay pushes from the
     // workers), confidential computing (CE encryption state is
-    // single-threaded), and batches too small to amortize the dispatch/join.
+    // single-threaded), ATS (see below), and batches too small to amortize the
+    // dispatch/join.
+    //
+    // ATS: a span is one va_block, but service_fault_batch_ats_sub() consumes
+    // faults up to the next UVM_GMMU_ATS_GRANULARITY (512MB) or vma boundary,
+    // whichever comes first, so one dispatch call can reach past its span and
+    // into faults another worker owns. gpu_va_space->ats.enabled implies
+    // g_uvm_global.ats.enabled, so this covers every ATS-capable VA space.
     if (num_workers == 0 ||
         service_mode == FAULT_SERVICE_MODE_CANCEL ||
         replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BLOCK ||
         g_uvm_global.conf_computing_enabled ||
+        g_uvm_global.ats.enabled ||
         batch_context->num_coalesced_faults < uvm_perf_fault_service_min_faults) {
         return service_fault_batch_range(parent_gpu,
                                          service_mode,
@@ -2782,15 +2801,42 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         UVM_ASSERT(uvm_tracker_is_empty(&worker->tracker));
     }
 
+    // outstanding must account for every worker before the first one is
+    // queued: a worker can run to completion and decrement it while this loop
+    // is still handing out items.
     atomic_set(&replayable_faults->service_pool.outstanding, num_workers);
 
     for (k = 1; k < num_workers + 1; k++) {
-        nv_kthread_q_schedule_q_item(&replayable_faults->service_pool.queues[k - 1],
-                                     &replayable_faults->service_pool.workers[k].q_item);
+        uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[k];
+
+        // The item must be off its queue's list here or the refusal fallback
+        // below would be wrong: a still-queued item WILL eventually run, so
+        // re-running it inline would double-service its spans and decrement
+        // outstanding twice. The previous batch's join guarantees the node is
+        // empty: the queue thread removes the item from the list before
+        // invoking it, and outstanding reaches zero only after the run
+        // returns.
+        UVM_ASSERT(list_empty(&worker->q_item.q_list_node));
+
+        if (nv_kthread_q_schedule_q_item(&replayable_faults->service_pool.queues[k - 1], &worker->q_item))
+            continue;
+
+        // With the item known not to be queued, the only way the schedule can
+        // be refused is the queue being stopped, and then nothing will ever
+        // run the item or decrement outstanding on its behalf: without this
+        // the join below would sleep forever and this GPU would never service
+        // another fault. Take the slot's spans back and run them inline.
+        not_queued |= 1u << k;
+        atomic_dec(&replayable_faults->service_pool.outstanding);
     }
 
     // The dispatcher is worker 0: service our own share while the pool runs
     fault_service_worker_run(&replayable_faults->service_pool.workers[0]);
+
+    for (k = 1; not_queued != 0 && k < num_workers + 1; k++) {
+        if (not_queued & (1u << k))
+            fault_service_worker_run(&replayable_faults->service_pool.workers[k]);
+    }
 
     // Join BEFORE replay: the caller acquires the batch tracker for the
     // replay push, so every worker's migrations must be merged in first. The
@@ -2798,6 +2844,11 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     // mmap locks), so workers can never be blocked waiting on us.
     wait_event(replayable_faults->service_pool.done_wq,
                atomic_read(&replayable_faults->service_pool.outstanding) == 0);
+
+    // Pairs with the atomic_dec_and_test() each worker performs after writing
+    // its tracker and status. wait_event()'s fast path reads the counter
+    // without a barrier, so order that read against the reads below.
+    smp_rmb();
 
     status = NV_OK;
 
