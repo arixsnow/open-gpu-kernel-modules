@@ -68,6 +68,26 @@ static int uvm_fault_force_sysmem __read_mostly = 0;
 module_param(uvm_fault_force_sysmem, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(uvm_fault_force_sysmem, "Force (1) using sysmem storage for pages that faulted. Default: 0.");
 
+// B1 (batched pre-unmap). Replayable-fault servicing revokes CPU mappings
+// with one unmap_mapping_range call per contiguous page run of the unmap
+// mask, and each call pays an i_mmap walk plus a TLB shootdown. Measured on
+// the stage-2 campaigns this is 33-45% of fault-service CPU time (see
+// uvm_va_block.c:block_unmap_cpu and the TODO for bug 1766424). When
+// enabled, block_unmap_cpu merges those calls into a single call spanning
+// the whole unmap set.
+//   0  off (stock behaviour, the default)
+//   1  merge only when every CPU-mapped page inside the span is being
+//      unmapped anyway, so PTE and va_block state are identical to the
+//      per-run path in every case
+//   2  merge always; CPU-mapped pages that sit between the requested runs
+//      are unmapped too, with their va_block state updated consistently
+//      under the block lock, and simply refault on the next CPU touch
+static unsigned uvm_perf_fault_batch_unmap __read_mostly = 0;
+module_param(uvm_perf_fault_batch_unmap, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_fault_batch_unmap,
+                 "Batch the CPU unmap calls of replayable-fault servicing. "
+                 "0 (default): off, 1: merge when state-preserving, 2: merge always.");
+
 static int uvm_perf_map_remote_on_eviction __read_mostly = 1;
 module_param(uvm_perf_map_remote_on_eviction, int, S_IRUGO);
 
@@ -5849,6 +5869,8 @@ static void block_unmap_cpu(uvm_va_block_t *block,
     bool unmapped_something = false;
     uvm_va_block_region_t subregion;
     NvU32 num_mapped_processors;
+    const uvm_page_mask_t *effective_unmap_pages = unmap_pages;
+    bool batched_unmap = false;
 
     // Early-out if nothing in the region is mapped or being unmapped.
     if (!block_has_valid_mapping_cpu(block, region) ||
@@ -5864,14 +5886,74 @@ static void block_unmap_cpu(uvm_va_block_t *block,
         uvm_page_mask_region_test(unmap_pages, region, block->cpu.fault_authorized.page_index))
         block->cpu.fault_authorized.first_fault_stamp = 0;
 
-    for_each_va_block_subregion_in_mask(subregion, unmap_pages, region) {
+    // B1 (batched pre-unmap): merge the per-run unmap_mapping_range calls
+    // below into one call spanning the whole unmap set, saving the per-call
+    // i_mmap walk and TLB shootdown (bug 1766424 asks for exactly this).
+    // Everything happens under the block lock, so pte_bits and the real
+    // PTEs never diverge for a concurrent CPU fault. Gated to replayable
+    // fault servicing through make_resident.cause: only the GPU
+    // fault-buffer service contexts carry that cause. Mode 1 merges only
+    // when every CPU-mapped page inside the span is in the unmap set, which
+    // makes it state-identical to the per-run path. Mode 2 merges always
+    // and widens the bookkeeping below to the extra spanned pages, which
+    // stay consistent and simply refault on the next CPU touch.
+    if (uvm_perf_fault_batch_unmap != 0 &&
+        !uvm_va_block_is_hmm(block) &&
+        block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT) {
+        uvm_page_mask_t *zap_mask = &block_context->mapping.batch_unmap_scratch;
+        const uvm_page_mask_t *cpu_mapped = &block->cpu.pte_bits[UVM_PTE_BITS_CPU_READ];
+
+        if (unmap_pages)
+            uvm_page_mask_and(zap_mask, unmap_pages, cpu_mapped);
+        else
+            uvm_page_mask_copy(zap_mask, cpu_mapped);
+        uvm_page_mask_region_clear_outside(zap_mask, region);
+
+        if (!uvm_page_mask_empty(zap_mask)) {
+            uvm_va_block_region_t span = uvm_va_block_region_from_mask(block, zap_mask);
+            NvU32 mapped_in_span = uvm_page_mask_region_weight(cpu_mapped, span);
+            bool span_clean = (mapped_in_span == uvm_page_mask_weight(zap_mask));
+
+            if (span_clean || uvm_perf_fault_batch_unmap >= 2) {
+                NvU64 unmap_start_time = NV_GETTIME();
+
+                unmap_mapping_range(va_space->mapping,
+                                    uvm_va_block_region_start(block, span),
+                                    uvm_va_block_region_size(span), 1);
+
+                atomic64_add(NV_GETTIME() - unmap_start_time, &g_uvm_va_block_host_op_stats.ns_unmap);
+                atomic64_inc(&g_uvm_va_block_host_op_stats.num_unmap_calls);
+                atomic64_add(mapped_in_span, &g_uvm_va_block_host_op_stats.num_unmap_pages);
+
+                batched_unmap = true;
+
+                // Mode 2 zapped the CPU-mapped pages between the requested
+                // runs as well. Widen the bookkeeping mask so their
+                // pte_bits (and the fault_authorized stamp) are updated to
+                // match the PTEs.
+                if (!span_clean) {
+                    uvm_page_mask_init_from_region(zap_mask, span, cpu_mapped);
+
+                    if (block->cpu.fault_authorized.first_fault_stamp &&
+                        uvm_page_mask_region_test(zap_mask, region, block->cpu.fault_authorized.page_index))
+                        block->cpu.fault_authorized.first_fault_stamp = 0;
+                }
+
+                effective_unmap_pages = zap_mask;
+            }
+        }
+    }
+
+    for_each_va_block_subregion_in_mask(subregion, effective_unmap_pages, region) {
         if (!block_has_valid_mapping_cpu(block, subregion))
             continue;
 
         // We can't actually unmap HMM ranges from the CPU here. Unmapping
         // happens as part of migrate_vma_setup(), but we need to record the
         // updated CPU mapping information in the va_block.
-        if (!uvm_va_block_is_hmm(block)) {
+        // A batched pre-unmap above has already zapped every PTE this loop
+        // would touch, so only the va_block bookkeeping remains.
+        if (!uvm_va_block_is_hmm(block) && !batched_unmap) {
             NvU64 unmap_start_time = NV_GETTIME();
 
             unmap_mapping_range(va_space->mapping,

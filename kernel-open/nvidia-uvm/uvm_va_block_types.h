@@ -263,6 +263,11 @@ typedef struct
         uvm_page_mask_t filtered_page_mask;
         uvm_page_mask_t migratable_mask;
 
+        // Used only by block_unmap_cpu when batched pre-unmap
+        // (uvm_perf_fault_batch_unmap) merges its unmap_mapping_range
+        // calls. Never aliases the caller's unmap mask.
+        uvm_page_mask_t batch_unmap_scratch;
+
         uvm_va_block_new_pte_state_t new_pte_state;
 
         uvm_pte_batch_t pte_batch;
