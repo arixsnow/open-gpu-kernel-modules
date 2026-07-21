@@ -2262,14 +2262,28 @@ NV_STATUS uvm_va_block_populate_pages_gpu(uvm_va_block_t *block,
 // that the block's lock has been unlocked and relocked whenever the function
 // call returns NV_ERR_MORE_PROCESSING_REQUIRED and this makes it clear that the
 // block's state is not locked across these calls.
-#define UVM_VA_BLOCK_LOCK_RETRY(va_block, block_retry, call) ({     \
+//
+// The body lives in UVM_VA_BLOCK_LOCK_RETRY_PROBED below, which additionally
+// times the lock acquisition. UVM_VA_BLOCK_LOCK_RETRY is that macro with the
+// probe disabled, so the two can never drift apart.
+
+// Times the block lock acquisition into the given counters. Only the acquire is
+// measured, deliberately: the macro holds the lock across the whole call, so
+// bracketing it from outside would measure servicing time rather than wait
+// time. Pass ns = NULL to disable the probe entirely.
+#define UVM_VA_BLOCK_LOCK_RETRY_PROBED(va_block, block_retry, ns, acqs, call) ({ \
     NV_STATUS __status;                                             \
     uvm_va_block_t *__block = (va_block);                           \
     uvm_va_block_retry_t *__retry = (block_retry);                  \
+    NvU64 __lock_wait_start;                                        \
                                                                     \
     uvm_va_block_retry_init(__retry);                               \
                                                                     \
+    __lock_wait_start = (ns) ? uvm_lock_probe_begin() : 0;          \
+                                                                    \
     uvm_mutex_lock(&__block->lock);                                 \
+                                                                    \
+    uvm_lock_probe_end(__lock_wait_start, (ns), (acqs));            \
                                                                     \
     do {                                                            \
         __status = (call);                                          \
@@ -2281,6 +2295,9 @@ NV_STATUS uvm_va_block_populate_pages_gpu(uvm_va_block_t *block,
                                                                     \
     __status;                                                       \
 })
+
+#define UVM_VA_BLOCK_LOCK_RETRY(va_block, block_retry, call) \
+    UVM_VA_BLOCK_LOCK_RETRY_PROBED(va_block, block_retry, NULL, NULL, call)
 
 // A helper macro for handling allocation-retry
 //

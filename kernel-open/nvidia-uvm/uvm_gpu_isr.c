@@ -97,8 +97,16 @@ static unsigned schedule_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
 
     // Use raw call instead of UVM helper. Ownership will be recorded in the
     // bottom half. See comment replayable_faults_isr_bottom_half().
-    if (down_trylock(&parent_gpu->isr.replayable_faults.service_lock.sem) != 0)
+    if (down_trylock(&parent_gpu->isr.replayable_faults.service_lock.sem) != 0) {
+        // A bottom half is already servicing this GPU, so the interrupt is
+        // backlog rather than new work. Counted, not timed: this runs in hard
+        // IRQ context with interrupts_lock held and fires on every contended
+        // interrupt, and a failed trylock has no wait to measure anyway.
+        if (uvm_lock_probes_enabled())
+            atomic64_inc(&g_uvm_lock_contention_stats.n_top_half_trylock_fail);
+
         return 0;
+    }
 
     if (!uvm_parent_gpu_replayable_faults_pending(parent_gpu)) {
         up(&parent_gpu->isr.replayable_faults.service_lock.sem);

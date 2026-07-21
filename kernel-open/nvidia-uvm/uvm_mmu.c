@@ -169,6 +169,24 @@ static NvU64 mmu_biggest_page_size(uvm_page_tree_t *tree, uvm_aperture_t apertur
     return 1ULL << __fls(tree->hal->page_sizes());
 }
 
+// Every GPU PTE write in the driver funnels through this one mutex per GPU, so
+// it is the first place worker-thread fault servicing can stop scaling. Wrapped
+// so all acquisitions are timed from a single place; the probe compiles to a
+// predictable branch and costs nothing below stats level 2. Acquisitions inside
+// the retry loop in uvm_page_tree_get_ptes_async are counted individually on
+// purpose, since a re-acquire after an allocation stall is exactly the wait
+// worth seeing.
+static void page_tree_lock(uvm_page_tree_t *tree)
+{
+    NvU64 t0 = uvm_lock_probe_begin();
+
+    uvm_mutex_lock(&tree->lock);
+
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_page_tree_lock_wait,
+                       &g_uvm_lock_contention_stats.n_page_tree_lock_acqs);
+}
+
 static NV_STATUS phys_mem_allocate_vidmem(uvm_page_tree_t *tree,
                                           NvLength size,
                                           uvm_pmm_alloc_flags_t pmm_flags,
@@ -183,7 +201,7 @@ static NV_STATUS phys_mem_allocate_vidmem(uvm_page_tree_t *tree,
         return status;
 
     if (!uvm_tracker_is_empty(&local_tracker)) {
-        uvm_mutex_lock(&tree->lock);
+        page_tree_lock(tree);
         status = uvm_tracker_add_tracker_safe(&tree->tracker, &local_tracker);
         uvm_mutex_unlock(&tree->lock);
     }
@@ -1204,7 +1222,7 @@ void uvm_page_tree_deinit(uvm_page_tree_t *tree)
 
     // Take the tree lock only to avoid assertions. It is not required for
     // thread safety during deinit.
-    uvm_mutex_lock(&tree->lock);
+    page_tree_lock(tree);
 
     // Invalidate the entire PDB before destroying it. This is only required for
     // ATS-enabled PDBs, because we have already invalidated all GMMU entries
@@ -1260,7 +1278,7 @@ void uvm_page_tree_put_ptes_async(uvm_page_tree_t *tree, uvm_page_table_range_t 
 
     UVM_ASSERT(tree->hal->page_table_depth(range->page_size) <= MAX_OPERATION_DEPTH);
 
-    uvm_mutex_lock(&tree->lock);
+    page_tree_lock(tree);
 
     // release the range
     UVM_ASSERT(dir->ref_count >= range->entry_count);
@@ -1384,7 +1402,7 @@ NV_STATUS uvm_page_tree_wait(uvm_page_tree_t *tree)
 {
     NV_STATUS status;
 
-    uvm_mutex_lock(&tree->lock);
+    page_tree_lock(tree);
 
     status = uvm_tracker_wait(&tree->tracker);
 
@@ -1558,7 +1576,7 @@ NV_STATUS uvm_page_tree_get_ptes_async(uvm_page_tree_t *tree,
     uvm_page_directory_t *dir_cache[MAX_OPERATION_DEPTH];
     memset(dir_cache, 0, sizeof(dir_cache));
 
-    uvm_mutex_lock(&tree->lock);
+    page_tree_lock(tree);
     while ((status = try_get_ptes(tree,
                                   page_size,
                                   start,
@@ -1574,13 +1592,13 @@ NV_STATUS uvm_page_tree_get_ptes_async(uvm_page_tree_t *tree,
         //       retrying for every level.
         dir_cache[cur_depth] = allocate_directory(tree, page_size, cur_depth + 1, pmm_flags);
         if (dir_cache[cur_depth] == NULL) {
-            uvm_mutex_lock(&tree->lock);
+            page_tree_lock(tree);
             free_unused_directories(tree, 0, NULL, dir_cache);
             uvm_mutex_unlock(&tree->lock);
             return NV_ERR_NO_MEMORY;
         }
 
-        uvm_mutex_lock(&tree->lock);
+        page_tree_lock(tree);
     }
 
     if ((status == NV_OK) && tree->gpu->parent->map_remap_larger_page_promotion)
@@ -1616,7 +1634,7 @@ void uvm_page_table_range_get_upper(uvm_page_tree_t *tree,
     UVM_ASSERT(num_upper_pages);
     UVM_ASSERT(num_upper_pages <= existing->entry_count);
 
-    uvm_mutex_lock(&tree->lock);
+    page_tree_lock(tree);
     page_table_range_init(upper, existing->page_size, existing->table, upper_start_index, upper_end_index);
     uvm_mutex_unlock(&tree->lock);
 }
@@ -1628,7 +1646,7 @@ void uvm_page_table_range_shrink(uvm_page_tree_t *tree, uvm_page_table_range_t *
     if (new_page_count > 0) {
         // Take a ref count on the smaller portion of the PTEs, then drop the
         // entire old range.
-        uvm_mutex_lock(&tree->lock);
+        page_tree_lock(tree);
 
         UVM_ASSERT(range->table->ref_count >= range->entry_count);
         range->table->ref_count -= (range->entry_count - new_page_count);
@@ -1728,7 +1746,7 @@ NV_STATUS uvm_page_tree_alloc_table(uvm_page_tree_t *tree,
     if (dir == NULL)
         return NV_ERR_NO_MEMORY;
 
-    uvm_mutex_lock(&tree->lock);
+    page_tree_lock(tree);
 
     // The caller is responsible for initializing this table, so enforce that on
     // debug builds.

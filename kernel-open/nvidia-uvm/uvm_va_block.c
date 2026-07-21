@@ -1000,11 +1000,16 @@ NV_STATUS uvm_va_block_init(void)
     if (status != NV_OK)
         return status;
 
-    return uvm_fault_pipeline_stats_procfs_init();
+    status = uvm_fault_pipeline_stats_procfs_init();
+    if (status != NV_OK)
+        return status;
+
+    return uvm_lock_stats_procfs_init();
 }
 
 void uvm_va_block_exit(void)
 {
+    uvm_lock_stats_procfs_exit();
     uvm_fault_pipeline_stats_procfs_exit();
     va_block_host_op_stats_procfs_exit();
     kmem_cache_destroy_safe(&g_uvm_va_block_cpu_node_state_cache);
@@ -12617,13 +12622,21 @@ NV_STATUS uvm_va_block_cpu_fault(uvm_va_block_t *va_block,
     // That is, there must be a reference held on the vma's vm_mm, and
     // vm_mm->mmap_lock is held in at least read mode. Note that current->mm
     // might not be vma->vm_mm.
-    status = UVM_VA_BLOCK_LOCK_RETRY(va_block,
-                                     &va_block_retry,
-                                     block_cpu_fault_locked(va_block,
-                                                            &va_block_retry,
-                                                            fault_addr,
-                                                            fault_access_type,
-                                                            service_context));
+    // How long CPU faults stall behind GPU servicing of the same block. The
+    // probed variant times the acquisition inside the macro; the macro holds
+    // the block lock for the whole of block_cpu_fault_locked, so timing it from
+    // out here would measure servicing rather than waiting. The other callers
+    // of UVM_VA_BLOCK_LOCK_RETRY (block discard among them) pass no counters,
+    // so their waits stay out of this number.
+    status = UVM_VA_BLOCK_LOCK_RETRY_PROBED(va_block,
+                                            &va_block_retry,
+                                            &g_uvm_lock_contention_stats.ns_block_lock_wait_cpu,
+                                            &g_uvm_lock_contention_stats.n_cpu_faults,
+                                            block_cpu_fault_locked(va_block,
+                                                                   &va_block_retry,
+                                                                   fault_addr,
+                                                                   fault_access_type,
+                                                                   service_context));
     return status;
 }
 

@@ -1778,6 +1778,7 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     NV_STATUS status;
     uvm_va_block_retry_t va_block_retry;
     NV_STATUS tracker_status;
+    NvU64 block_lock_wait_start;
 
     fault_block_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
     fault_block_context->num_retries = 0;
@@ -1785,7 +1786,18 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     if (uvm_va_block_is_hmm(va_block))
         uvm_hmm_migrate_begin_wait(va_block);
 
+    // The dispatcher and every worker thread converge on this one acquisition,
+    // so it is the single place the pool can serialize against itself or
+    // against a CPU fault holding the same block. The timestamp is taken after
+    // uvm_hmm_migrate_begin_wait above, which can block for reasons that have
+    // nothing to do with this lock.
+    block_lock_wait_start = uvm_lock_probe_begin();
+
     uvm_mutex_lock(&va_block->lock);
+
+    uvm_lock_probe_end(block_lock_wait_start,
+                       &g_uvm_lock_contention_stats.ns_block_lock_wait_gpu,
+                       &g_uvm_lock_contention_stats.n_block_lock_acqs_gpu);
 
     status = UVM_VA_BLOCK_RETRY_LOCKED(va_block, &va_block_retry,
                                        service_fault_batch_block_locked(gpu_va_space,
@@ -2462,6 +2474,7 @@ static NV_STATUS service_fault_batch_range(uvm_parent_gpu_t *parent_gpu,
                                      parent_gpu->fault_buffer.replayable.replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BLOCK;
     uvm_va_block_context_t *va_block_context = service_context->block_context;
     bool hmm_migratable = true;
+    NvU64 va_space_lock_wait_start;
 
     ats_invalidate->tlb_batch_pending = false;
 
@@ -2501,7 +2514,17 @@ static NV_STATUS service_fault_batch_range(uvm_parent_gpu_t *parent_gpu,
             mm = uvm_va_space_mm_retain_lock(va_space);
             uvm_va_block_context_init(va_block_context, mm);
 
+            // Brackets the VA space lock only. uvm_va_space_mm_retain_lock
+            // above takes mmap_lock, whose wait is often the larger of the
+            // two, so this counter under-reports the total stall at a va_space
+            // transition rather than over-reporting it.
+            va_space_lock_wait_start = uvm_lock_probe_begin();
+
             uvm_va_space_down_read(va_space);
+
+            uvm_lock_probe_end(va_space_lock_wait_start,
+                               &g_uvm_lock_contention_stats.ns_va_space_lock_wait,
+                               &g_uvm_lock_contention_stats.n_va_space_lock_acqs);
         }
 
         // Some faults could be already fatal if they cannot be handled by

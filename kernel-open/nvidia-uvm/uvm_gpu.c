@@ -64,6 +64,18 @@ MODULE_PARM_DESC(uvm_peer_copy, "Choose the addressing mode for peer copying, op
 // backs the cpu/fault_stats procfs node. See uvm_fault_pipeline_global_stats_t.
 uvm_fault_pipeline_global_stats_t g_uvm_fault_pipeline_stats;
 
+// Module-lifetime aggregate of the lock contention probes, backing the
+// cpu/lock_stats procfs node. See uvm_lock_contention_stats_t.
+uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
+
+unsigned uvm_perf_fault_stats_level = 0;
+module_param(uvm_perf_fault_stats_level, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_fault_stats_level,
+                 "Fault instrumentation verbosity: 0 = pipeline timers only [default], "
+                 "1 = reserved for histograms, 2 = also the lock contention probes at "
+                 "cpu/lock_stats. Levels above 0 add two timestamp reads and an atomic "
+                 "add per probed lock acquisition.");
+
 static uvm_user_channel_t *get_user_channel(uvm_rb_tree_node_t *node)
 {
     return container_of(node, uvm_user_channel_t, instance_ptr.node);
@@ -1097,6 +1109,88 @@ void uvm_fault_pipeline_stats_procfs_exit(void)
     if (g_uvm_fault_pipeline_stats_file) {
         proc_remove(g_uvm_fault_pipeline_stats_file);
         g_uvm_fault_pipeline_stats_file = NULL;
+    }
+}
+
+// Lock contention probes, exposed at cpu/lock_stats. Created unconditionally
+// alongside cpu/fault_stats so the node's absence always means an old module
+// rather than a low stats level; below level 2 every counter simply stays at
+// zero. The capture scripts key on the first token of each line, so these
+// names must stay unique and match uvm_lock_contention_stats_t.
+static struct proc_dir_entry *g_uvm_lock_stats_file;
+
+static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
+{
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
+        return -EAGAIN;
+
+    UVM_SEQ_OR_DBG_PRINT(s, "stats_level               %u\n",
+                         uvm_perf_fault_stats_level);
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_page_tree_lock_wait    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_page_tree_lock_wait));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_page_tree_lock_acqs     %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_page_tree_lock_acqs));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_pmm_lock_wait          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_pmm_lock_wait));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_pmm_lock_acqs           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_pmm_lock_acqs));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_call             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_call));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_calls             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_pma_evict_cb           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_pma_evict_cb));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_pma_evict_cbs           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_pma_evict_cbs));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_block_lock_wait_gpu    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_block_lock_wait_gpu));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_block_lock_acqs_gpu     %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_block_lock_acqs_gpu));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_block_lock_wait_cpu    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_block_lock_wait_cpu));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_cpu_faults              %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_cpu_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_va_space_lock_wait     %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_va_space_lock_wait));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_va_space_lock_acqs      %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_va_space_lock_acqs));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_top_half_trylock_fail   %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_top_half_trylock_fail));
+
+    uvm_up_read(&g_uvm_global.pm.lock);
+
+    return 0;
+}
+
+static int nv_procfs_read_lock_stats_entry(struct seq_file *s, void *v)
+{
+    UVM_ENTRY_RET(nv_procfs_read_lock_stats(s, v));
+}
+
+UVM_DEFINE_SINGLE_PROCFS_FILE(lock_stats_entry);
+
+NV_STATUS uvm_lock_stats_procfs_init(void)
+{
+    struct proc_dir_entry *cpu_base_dir_entry = uvm_procfs_get_cpu_base_dir();
+
+    if (uvm_procfs_is_debug_enabled()) {
+        UVM_ASSERT(!g_uvm_lock_stats_file);
+        g_uvm_lock_stats_file = NV_CREATE_PROC_FILE("lock_stats",
+                                                    cpu_base_dir_entry,
+                                                    lock_stats_entry,
+                                                    &g_uvm_lock_contention_stats);
+        if (!g_uvm_lock_stats_file)
+            return NV_ERR_OPERATING_SYSTEM;
+    }
+
+    return NV_OK;
+}
+
+void uvm_lock_stats_procfs_exit(void)
+{
+    if (g_uvm_lock_stats_file) {
+        proc_remove(g_uvm_lock_stats_file);
+        g_uvm_lock_stats_file = NULL;
     }
 }
 

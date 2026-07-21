@@ -1277,4 +1277,105 @@ static void __uvm_bit_unlock(uvm_bit_locks_t *bit_locks, unsigned long bit)
     uvm_record_unlock(_bit_locks, UVM_LOCK_FLAGS_MODE_EXCLUSIVE); \
 })
 
+// ----------------------------------------------------------------------------
+// Lock contention instrumentation
+// ----------------------------------------------------------------------------
+//
+// Verbosity of the fault instrumentation:
+//   0 = the always-on fault pipeline timers only (stock behaviour)
+//   1 = reserved for the log2 histograms
+//   2 = the lock contention probes below
+//
+// Levels above 0 cost two timestamp reads and an atomic add per probed lock
+// acquisition, so the default keeps every baseline comparable with the
+// campaigns measured before the probes existed.
+extern unsigned uvm_perf_fault_stats_level;
+
+// Wait time on the driver-internal locks that GPU fault servicing funnels
+// through. These answer where servicing serializes once several worker threads
+// are active: every GPU PTE write goes through one page tree mutex per GPU,
+// every allocation and free through one PMM mutex, and each va_block through
+// its own lock. Global rather than per-GPU for the same reason the host-op
+// counters are, several of these paths run without a GPU at hand. Cumulative
+// since module load; consumers snapshot-and-diff. Exposed at cpu/lock_stats.
+//
+// The ns_* fields measure *wait*, the time between asking for a lock and
+// holding it, except for ns_evict_call and ns_pma_evict_cb which measure how
+// long the eviction paths run. Those two nest: ns_pma_evict_cb contains
+// ns_evict_call which contains ns_pmm_lock_wait, so the three must never be
+// summed or presented as disjoint shares of anything.
+//
+// ns_pma_evict_cb is the notable asymmetry: RM takes its own API lock and then
+// calls down into UVM, so UVM never waits on that lock and cannot observe
+// anyone who does. That counter therefore bounds how much serialization the RM
+// API lock could be causing, and cannot attribute any particular stall to it.
+typedef struct
+{
+    // uvm_mutex_lock(&tree->lock) in uvm_mmu.c, via page_tree_lock()
+    atomic64_t ns_page_tree_lock_wait;
+    atomic64_t n_page_tree_lock_acqs;
+
+    // uvm_mutex_lock(&pmm->lock) in uvm_pmm_gpu.c, via pmm_lock()
+    atomic64_t ns_pmm_lock_wait;
+    atomic64_t n_pmm_lock_acqs;
+
+    // pick_and_evict_root_chunk_retry: allocation-side eviction on the fault
+    // path. One sample per logical eviction, retries included.
+    atomic64_t ns_evict_call;
+    atomic64_t n_evict_calls;
+
+    // The two PMA eviction callbacks RM invokes with its API lock held. Hold
+    // time, not wait time. See the note above.
+    atomic64_t ns_pma_evict_cb;
+    atomic64_t n_pma_evict_cbs;
+
+    // va_block->lock in service_fault_batch_block, the GPU fault path shared
+    // by the dispatcher and every worker
+    atomic64_t ns_block_lock_wait_gpu;
+    atomic64_t n_block_lock_acqs_gpu;
+
+    // va_block->lock in uvm_va_block_cpu_fault: how long CPU faults stall
+    // behind GPU servicing. Strictly the acquisition, not the servicing that
+    // follows it, which is why the CPU fault path uses the probed variant of
+    // UVM_VA_BLOCK_LOCK_RETRY rather than bracketing the macro.
+    atomic64_t ns_block_lock_wait_cpu;
+    atomic64_t n_cpu_faults;
+
+    // uvm_va_space_down_read in service_fault_batch_range
+    atomic64_t ns_va_space_lock_wait;
+    atomic64_t n_va_space_lock_acqs;
+
+    // Top-half trylock failures: interrupts arriving while a bottom half is
+    // already servicing. A count only, the failed trylock has no duration.
+    atomic64_t n_top_half_trylock_fail;
+} uvm_lock_contention_stats_t;
+
+extern uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
+
+static inline bool uvm_lock_probes_enabled(void)
+{
+    return uvm_perf_fault_stats_level >= 2;
+}
+
+static inline NvU64 uvm_lock_probe_begin(void)
+{
+    return uvm_lock_probes_enabled() ? NV_GETTIME() : 0;
+}
+
+// ns == NULL disables the probe entirely, which is how the unprobed users of
+// UVM_VA_BLOCK_LOCK_RETRY opt out. acqs == NULL accumulates time without
+// counting acquisitions. The enable test is repeated here rather than checking
+// t0, so that flipping the level between the two halves of a probe drops the
+// sample instead of recording an interval measured from zero.
+static inline void uvm_lock_probe_end(NvU64 t0, atomic64_t *ns, atomic64_t *acqs)
+{
+    if (!ns || !uvm_lock_probes_enabled())
+        return;
+
+    atomic64_add(NV_GETTIME() - t0, ns);
+
+    if (acqs)
+        atomic64_inc(acqs);
+}
+
 #endif // __UVM_LOCK_H__

@@ -1019,6 +1019,23 @@ static void uvm_pmm_gpu_merge_chunk_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
                chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 }
 
+// One mutex per GPU guards every chunk allocation, free, split and merge, so
+// it serializes the allocation half of fault servicing the way the page tree
+// lock serializes the mapping half. Wrapped so all acquisitions are timed from
+// one place. Note that the acquisition in evict_root_chunk_from_va_block is a
+// re-acquire after deliberately dropping the lock to take a va_block lock, so
+// its wait is contention against other evictors rather than a cold acquire.
+static void pmm_lock(uvm_pmm_gpu_t *pmm)
+{
+    NvU64 t0 = uvm_lock_probe_begin();
+
+    uvm_mutex_lock(&pmm->lock);
+
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_pmm_lock_wait,
+                       &g_uvm_lock_contention_stats.n_pmm_lock_acqs);
+}
+
 NV_STATUS uvm_pmm_gpu_split_chunk(uvm_pmm_gpu_t *pmm,
                                   uvm_gpu_chunk_t *chunk,
                                   uvm_chunk_size_t subchunk_size,
@@ -1038,7 +1055,7 @@ NV_STATUS uvm_pmm_gpu_split_chunk(uvm_pmm_gpu_t *pmm,
     UVM_ASSERT(subchunk_size & pmm->chunk_sizes[chunk->type]);
     UVM_ASSERT(subchunk_size < uvm_gpu_chunk_get_size(chunk));
 
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
 
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED ||
                chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
@@ -1125,7 +1142,7 @@ size_t uvm_pmm_gpu_get_subchunks(uvm_pmm_gpu_t *pmm,
                parent->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED ||
                parent->state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT);
 
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
 
     // Either pre- or post-order would work. Pick post-order just because we
     // only care about leaf chunks and we may exit early, so we'd get slightly
@@ -1147,7 +1164,7 @@ static uvm_gpu_chunk_t *list_first_chunk(struct list_head *list)
 
 void uvm_pmm_gpu_merge_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
     uvm_pmm_gpu_merge_chunk_locked(pmm, chunk);
     uvm_mutex_unlock(&pmm->lock);
 }
@@ -1185,7 +1202,7 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
 
     uvm_tracker_deinit(&tracker);
 
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
 
     return status;
 }
@@ -1595,11 +1612,22 @@ static NV_STATUS pick_and_evict_root_chunk_retry(uvm_pmm_gpu_t *pmm,
 {
     NV_STATUS status;
 
+    // Timed here rather than in pick_and_evict_root_chunk so that one sample
+    // covers one logical eviction including its retries. The duration is not
+    // pure lock wait: the callee drops and retakes pmm->lock around a va_block
+    // lock acquisition, so this is the whole cost of evicting on the fault
+    // path, which is the quantity the oversubscribed regime cares about.
+    NvU64 t0 = uvm_lock_probe_begin();
+
     // Eviction can fail if the chunk gets selected for PMA eviction at
     // the same time. Keep retrying.
     do {
         status = pick_and_evict_root_chunk(pmm, type, pmm_context, out_chunk);
     } while (status == NV_ERR_IN_USE);
+
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_evict_call,
+                       &g_uvm_lock_contention_stats.n_evict_calls);
 
     return status;
 }
@@ -1720,7 +1748,7 @@ static NV_STATUS alloc_or_evict_root_chunk_unlocked(uvm_pmm_gpu_t *pmm,
     status = alloc_root_chunk(pmm, type, flags, &chunk);
     if (status != NV_OK) {
         if (flags & UVM_PMM_ALLOC_FLAGS_EVICT) {
-            uvm_mutex_lock(&pmm->lock);
+            pmm_lock(pmm);
             status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
             uvm_mutex_unlock(&pmm->lock);
         }
@@ -1851,7 +1879,7 @@ NV_STATUS alloc_chunk(uvm_pmm_gpu_t *pmm,
 
     // We didn't find a free chunk and we will require splits so acquire the
     // PMM lock.
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
 
     status = alloc_chunk_with_splits(pmm, type, chunk_size, flags, &chunk);
 
@@ -2414,7 +2442,7 @@ static void free_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     else {
         // Freeing a chunk can only fail if it requires merging. Take the PMM
         // lock and free it with merges supported.
-        uvm_mutex_lock(&pmm->lock);
+        pmm_lock(pmm);
         free_chunk_with_merges(pmm, chunk);
         uvm_mutex_unlock(&pmm->lock);
     }
@@ -2541,7 +2569,7 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_pages(void *void_pmm,
         uvm_page_index_t page_index;
         NvU64 pages_this_time = min(pages_per_chunk, num_pages_left_to_evict);
 
-        uvm_mutex_lock(&pmm->lock);
+        pmm_lock(pmm);
 
         if (uvm_pmm_should_inject_pma_eviction_error(pmm)) {
             status = NV_ERR_NO_MEMORY;
@@ -2627,11 +2655,23 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_pages_wrapper(void *void_pmm,
 {
     NV_STATUS status;
 
+    // Timed because RM holds its API lock for the whole callback. UVM never
+    // acquires that lock itself, so there is no acquisition to time and no way
+    // from in here to see anyone waiting on it. What this measures is how long
+    // UVM keeps it occupied, which bounds the serialization it can be causing
+    // without attributing any particular stall to it.
+    NvU64 t0 = uvm_lock_probe_begin();
+
     // RM invokes the eviction callbacks with its API lock held, but not its GPU
     // lock.
     uvm_record_lock_rm_api();
     status = uvm_pmm_gpu_pma_evict_pages(void_pmm, page_size, pages, num_pages_to_evict, phys_start, phys_end, mem_type);
     uvm_record_unlock_rm_api();
+
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_pma_evict_cb,
+                       &g_uvm_lock_contention_stats.n_pma_evict_cbs);
+
     return status;
 }
 
@@ -2727,7 +2767,7 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_range(void *void_pmm,
         if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED)
             continue;
 
-        uvm_mutex_lock(&pmm->lock);
+        pmm_lock(pmm);
 
         status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_PMA_EVICTION);
         should_inject_error = uvm_pmm_should_inject_pma_eviction_error(pmm);
@@ -2762,11 +2802,21 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_range_wrapper(void *void_pmm,
 {
     NV_STATUS status;
 
+    // Hold time, not wait time. See the note in the pages wrapper above. This
+    // path also ends with a pma_lock write acquire that blocks on all pending
+    // frees by design, so long tails here are not necessarily contention.
+    NvU64 t0 = uvm_lock_probe_begin();
+
     // RM invokes the eviction callbacks with its API lock held, but not its GPU
     // lock.
     uvm_record_lock_rm_api();
     status = uvm_pmm_gpu_pma_evict_range(void_pmm, phys_begin, phys_end, mem_type);
     uvm_record_unlock_rm_api();
+
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_pma_evict_cb,
+                       &g_uvm_lock_contention_stats.n_pma_evict_cbs);
+
     return status;
 }
 
@@ -3279,7 +3329,7 @@ NV_STATUS uvm_test_evict_chunk(UVM_TEST_EVICT_CHUNK_PARAMS *params, struct file 
         goto out;
     }
 
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
     uvm_mutex_unlock(&pmm->lock);
 
@@ -3447,7 +3497,7 @@ NV_STATUS uvm_test_pmm_inject_pma_evict_error(UVM_TEST_PMM_INJECT_PMA_EVICT_ERRO
 
     pmm = &gpu->pmm;
 
-    uvm_mutex_lock(&pmm->lock);
+    pmm_lock(pmm);
     pmm->inject_pma_evict_error_after_num_chunks = params->error_after_num_chunks;
     uvm_mutex_unlock(&pmm->lock);
 

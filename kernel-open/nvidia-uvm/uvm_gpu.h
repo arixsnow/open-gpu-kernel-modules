@@ -93,6 +93,13 @@ extern uvm_fault_pipeline_global_stats_t g_uvm_fault_pipeline_stats;
 NV_STATUS uvm_fault_pipeline_stats_procfs_init(void);
 void uvm_fault_pipeline_stats_procfs_exit(void);
 
+// Persistent cpu/lock_stats procfs node backed by g_uvm_lock_contention_stats.
+// The counters and probe helpers themselves live in uvm_lock.h, which every
+// file that takes a lock already includes.
+// Created/destroyed with the module alongside cpu/fault_stats.
+NV_STATUS uvm_lock_stats_procfs_init(void);
+void uvm_lock_stats_procfs_exit(void);
+
 #define UVM_GPU_MAGIC_VALUE 0xc001d00d12341993ULL
 
 typedef struct
