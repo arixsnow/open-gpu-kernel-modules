@@ -94,6 +94,59 @@ module_param(uvm_perf_fault_replay_policy, uint, S_IRUGO);
 static unsigned uvm_perf_fault_service_num_workers = 0;
 module_param(uvm_perf_fault_service_num_workers, uint, S_IRUGO);
 
+// Adaptive worker width. No single fixed width is right: the oversubscribed
+// cells reach 87% of their achievable win at eight workers while the in-memory
+// ones peak at one and lose about three points by fifteen. This is gain
+// scheduling in the sense of Hellerstein et al. s11.2, rules that distinguish
+// operating regimes using a scheduling variable read off the target system.
+// The scheduling variable is eviction attempts per batch, which separates the
+// regimes cleanly (0.0 in memory, 10.7-46.5 oversubscribed, campaign
+// 20260722_163533). Self-tuning regulators were rejected on the book's own
+// grounds (s11.3): they are "slow in adapting" to abrupt workload change and
+// perform worse than handcrafted gain scheduling.
+//
+// Off by default, like every other Stage-2 mechanism. Setting
+// uvm_perf_fault_service_num_workers explicitly still pins the width, so every
+// published measurement stays reproducible.
+#define UVM_PERF_FAULT_SERVICE_ADAPT_EPOCH_DEFAULT  64
+#define UVM_PERF_FAULT_SERVICE_ADAPT_LO_DEFAULT     1000   // milli-evictions/batch
+#define UVM_PERF_FAULT_SERVICE_ADAPT_HI_DEFAULT     4000
+#define UVM_PERF_FAULT_SERVICE_ADAPT_STEP_DEFAULT   2
+#define UVM_PERF_FAULT_SERVICE_ADAPT_NARROW_DEFAULT 4
+
+static unsigned uvm_perf_fault_service_adapt = 0;
+module_param(uvm_perf_fault_service_adapt, uint, S_IRUGO);
+
+// Batches per control decision. 64 batches is about 70 ms at the measured
+// batch period, which reaches full width in roughly 420 ms.
+static unsigned uvm_perf_fault_service_adapt_epoch = UVM_PERF_FAULT_SERVICE_ADAPT_EPOCH_DEFAULT;
+module_param(uvm_perf_fault_service_adapt_epoch, uint, S_IRUGO);
+
+// The hold band, in thousandths of an eviction per batch. Widen above hi,
+// narrow below lo, hold in between. The band is TCP Vegas: two thresholds with
+// "leave unchanged" between them, so a workload sitting near the boundary
+// cannot chatter. Sweeping lo/hi over a tenfold range in adapt_sim.py changes
+// no verdict, because the measured signal gap is doing the work.
+static unsigned uvm_perf_fault_service_adapt_lo = UVM_PERF_FAULT_SERVICE_ADAPT_LO_DEFAULT;
+module_param(uvm_perf_fault_service_adapt_lo, uint, S_IRUGO);
+
+static unsigned uvm_perf_fault_service_adapt_hi = UVM_PERF_FAULT_SERVICE_ADAPT_HI_DEFAULT;
+module_param(uvm_perf_fault_service_adapt_hi, uint, S_IRUGO);
+
+// Workers added per widening decision.
+static unsigned uvm_perf_fault_service_adapt_step = UVM_PERF_FAULT_SERVICE_ADAPT_STEP_DEFAULT;
+module_param(uvm_perf_fault_service_adapt_step, uint, S_IRUGO);
+
+// Narrow by one worker only every Nth epoch below the low threshold. The
+// asymmetry is not stylistic: running too narrow costs up to 1.64x on the
+// oversubscribed cells against about 3% for running too wide, so widening
+// eagerly is the cheap error. The floor of 4 is set by stability rather than
+// by that ratio. adapt_sim.py sweeps this against an alternating-regime input
+// and values below 4 slam the actuator across its full range, which is the
+// limit cycle of Hellerstein Fig 8.9; 4 and 8 pass every combination tried.
+static unsigned uvm_perf_fault_service_adapt_narrow_every = UVM_PERF_FAULT_SERVICE_ADAPT_NARROW_DEFAULT;
+module_param(uvm_perf_fault_service_adapt_narrow_every, uint, S_IRUGO);
+
 #define UVM_PERF_FAULT_SERVICE_MIN_FAULTS_DEFAULT 32
 
 // Minimum number of coalesced faults in a batch for the worker pool to be
@@ -189,6 +242,29 @@ static NV_STATUS fault_service_pool_init(uvm_parent_gpu_t *parent_gpu)
     }
 
     replayable_faults->service_pool.num_workers = num_workers;
+
+    // Cold start. With adaptation off this is the whole pool, which is the
+    // stock behaviour of the fixed-width parameter. With it on we start at one
+    // worker and widen into the pool, because the starting value is what a
+    // workload gets when it ends before the controller ever fires, and one
+    // worker is the conservative degradation: near-stock, and correct outright
+    // for any workload that fits in memory. Starting wide would be the worst
+    // configuration for exactly those workloads, and narrowing is deliberately
+    // slower than widening, so the mistake would persist.
+    replayable_faults->service_pool.active_workers =
+        (uvm_perf_fault_service_adapt && num_workers > 0) ? 1 : num_workers;
+    // Snapshot the counters rather than zeroing the baselines. n_evict_calls
+    // is a single module-global, cumulative since module load and never reset,
+    // so a zero baseline would make the first delta equal every eviction the
+    // module has ever seen. That spikes the rate and forces a spurious widen
+    // on the first epoch. Invisible in a campaign, where each config reloads
+    // the module, and wrong everywhere else.
+    replayable_faults->service_pool.adapt_last_evictions =
+        (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_calls);
+    replayable_faults->service_pool.adapt_last_batches = replayable_faults->stats.num_batches;
+    replayable_faults->service_pool.adapt_ewma_milli = 0;
+    replayable_faults->service_pool.adapt_narrow_ticks = 0;
+
     atomic_set(&replayable_faults->service_pool.outstanding, 0);
     init_waitqueue_head(&replayable_faults->service_pool.done_wq);
 
@@ -285,6 +361,7 @@ static void fault_service_pool_deinit(uvm_parent_gpu_t *parent_gpu)
     uvm_kvfree(replayable_faults->service_pool.spans);
     replayable_faults->service_pool.spans = NULL;
     replayable_faults->service_pool.num_workers = 0;
+    replayable_faults->service_pool.active_workers = 0;
 }
 
 // There is no error handling in this function. The caller is in charge of
@@ -2667,6 +2744,124 @@ static int cmp_sort_span_by_weight_desc(const void *_a, const void *_b)
 // LPT (longest processing time first) greedy assignment of spans to num_bins
 // worker slots: heaviest span goes to the least-loaded bin. Bounds the
 // makespan at 4/3 of optimal; span weights (fault counts) are exact.
+// One control decision. Called by the dispatcher at batch boundaries, which
+// the ISR service_lock serialises per GPU, so this needs no locking and
+// touches only dispatcher-private state plus one integer the dispatcher also
+// owns.
+//
+// Fixed-point throughout: milli-evictions per batch, so there is no floating
+// point in kernel context. The EWMA is the standard first-order filter
+// (Hellerstein s8.4.3, w(k+1) = c*w(k) + (1-c)*y(k)) with c = 0.8, which is
+// what adapt_sim.py settled on.
+static void fault_service_adapt_tick(uvm_replayable_fault_buffer_t *replayable_faults)
+{
+    NvU64 evictions, batches, d_evict, d_batch;
+    NvU32 rate_milli, lo, hi, width, step, narrow_every;
+
+    if (!uvm_perf_fault_service_adapt || replayable_faults->service_pool.num_workers == 0)
+        return;
+
+    batches = replayable_faults->stats.num_batches;
+    d_batch = batches - replayable_faults->service_pool.adapt_last_batches;
+
+    // max(epoch, 1): the parameter is writable by an operator and a zero epoch
+    // would both tick every batch and divide by zero below.
+    if (d_batch < max(uvm_perf_fault_service_adapt_epoch, 1u))
+        return;
+
+    // The signal. Module-global rather than per-GPU: this box has one GPU, and
+    // the multi-GPU case (one GPU's memory pressure widening every pool) is a
+    // stated scope limit rather than an oversight.
+    //
+    // It also counts evictions from the RM PMA callback path
+    // (uvm_pmm_gpu_pma_evict_pages, PMM_CONTEXT_PMA_EVICTION), not only the
+    // fault path. That is defensible, since RM asking UVM to free memory is
+    // genuine memory pressure and is exactly what should widen the pool, and it
+    // is moot in practice: the 07-22 campaign measured n_pma_evict_cbs = 0 on
+    // every cell. Worth knowing if that ever stops being true.
+    evictions = (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_calls);
+    d_evict = evictions - replayable_faults->service_pool.adapt_last_evictions;
+
+    replayable_faults->service_pool.adapt_last_batches = batches;
+    replayable_faults->service_pool.adapt_last_evictions = evictions;
+
+    // Fixed point, and do_div rather than a bare 64-bit divide: this driver
+    // has no general 64-bit division helper (only uvm_div_pow2_*, which needs
+    // a power-of-two divisor), and do_div is what nv-linux.h already provides.
+    {
+        NvU64 scaled = d_evict * 1000;
+        // do_div wants a 32-bit divisor. d_batch is the batch delta over one
+        // epoch, so it is bounded by the epoch plus one bottom half's worth of
+        // batches: thousands, never near 2^32.
+        NvU32 divisor = (d_batch > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (NvU32)d_batch;
+
+        do_div(scaled, divisor);
+
+        // Clamp before it reaches the filter. The EWMA below multiplies by 4,
+        // so an unbounded sample could overflow NvU32; 1e6 milli is a
+        // thousand evictions per batch, twenty times the heaviest rate any
+        // campaign has produced, so the clamp is a guard and not a limit.
+        rate_milli = (scaled > 1000000ULL) ? 1000000u : (NvU32)scaled;
+    }
+
+    // EWMA at c = 0.8: new = (4*old + 1*sample) / 5 (Hellerstein s8.4.3)
+    replayable_faults->service_pool.adapt_ewma_milli =
+        (replayable_faults->service_pool.adapt_ewma_milli * 4 + rate_milli) / 5;
+
+    // Clamp the operator-settable parameters here rather than trusting them.
+    // module_param does no range checking, and each of these has a value that
+    // misbehaves rather than merely performing badly:
+    //
+    //   step 0            never widens, so the pool is decorative
+    //   step near UINT_MAX  width + step wraps and min() picks the wrapped
+    //                     value, which can shrink the pool on a widen
+    //   narrow_every 0    "++ticks >= 0" is always true, so it narrows every
+    //                     epoch. That is exactly the configuration adapt_sim.py
+    //                     shows slamming the actuator across its full range,
+    //                     the limit cycle of Hellerstein Fig 8.9
+    //   lo > hi           both branches would qualify; widen wins by ordering,
+    //                     so it would only ever grow
+    //
+    // Values below narrow_every 4 are permitted but known unstable under an
+    // alternating-regime workload; they are left reachable so the failure can
+    // be reproduced deliberately.
+    // min/max rather than clamp: those two are already used in this file for
+    // exactly this kind of bound (see the num_workers clamp at pool init),
+    // clamp is not used anywhere in the driver.
+    step = min(max(uvm_perf_fault_service_adapt_step, 1u),
+               (unsigned)UVM_PERF_FAULT_SERVICE_MAX_WORKERS);
+    narrow_every = max(uvm_perf_fault_service_adapt_narrow_every, 1u);
+    hi = uvm_perf_fault_service_adapt_hi;
+    lo = min(uvm_perf_fault_service_adapt_lo, hi);
+    width = replayable_faults->service_pool.active_workers;
+
+    if (replayable_faults->service_pool.adapt_ewma_milli > hi) {
+        width = min(width + step, replayable_faults->service_pool.num_workers);
+        replayable_faults->service_pool.adapt_narrow_ticks = 0;
+    }
+    else if (replayable_faults->service_pool.adapt_ewma_milli < lo) {
+        if (++replayable_faults->service_pool.adapt_narrow_ticks >= narrow_every) {
+            if (width > 1)
+                width--;
+            replayable_faults->service_pool.adapt_narrow_ticks = 0;
+        }
+    }
+    // else: hold. The deadband, and the reason a boundary workload is quiet.
+
+    // Observability. Counted per decision including the holds, so
+    // sum/decisions is the mean width the workload actually ran at, and the
+    // widen/narrow counts show how much the controller moved to get there.
+    if (width > replayable_faults->service_pool.active_workers)
+        atomic64_inc(&g_uvm_lock_contention_stats.n_adapt_widen);
+    else if (width < replayable_faults->service_pool.active_workers)
+        atomic64_inc(&g_uvm_lock_contention_stats.n_adapt_narrow);
+
+    atomic64_inc(&g_uvm_lock_contention_stats.n_adapt_decisions);
+    atomic64_add(width, &g_uvm_lock_contention_stats.sum_adapt_width);
+
+    replayable_faults->service_pool.active_workers = width;
+}
+
 static void fault_service_assign_spans(uvm_fault_service_span_t *spans, NvU32 num_spans, NvU32 num_bins)
 {
     NvU32 loads[UVM_PERF_FAULT_SERVICE_MAX_WORKERS + 1] = {0};
@@ -2764,7 +2959,18 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     NvU32 num_spans;
     NvU32 not_queued = 0;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
-    NvU32 num_workers = replayable_faults->service_pool.num_workers;
+    NvU32 pool_workers = replayable_faults->service_pool.num_workers;
+    NvU32 num_workers;
+
+    // One control decision per epoch, before this batch is partitioned, so the
+    // width used below is the one the controller just chose.
+    fault_service_adapt_tick(replayable_faults);
+
+    // The width THIS batch may use. Equal to the allocated pool width unless
+    // the adaptive policy has narrowed it. Slots above it get no spans and are
+    // never scheduled, but they remain allocated and their state is still
+    // reset and merged below, so a later widening finds them clean.
+    num_workers = replayable_faults->service_pool.active_workers;
 
     // not_queued is a bitmask over worker slots
     BUILD_BUG_ON(UVM_PERF_FAULT_SERVICE_MAX_WORKERS >= 8 * sizeof(not_queued));
@@ -2816,7 +3022,11 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
     fault_service_assign_spans(replayable_faults->service_pool.spans, num_spans, num_workers + 1);
 
-    for (k = 0; k < num_workers + 1; k++) {
+    // Reset the WHOLE pool, not just the active part. A slot the controller
+    // has narrowed away gets no spans and is never scheduled, but resetting it
+    // anyway means a later widening finds it clean rather than carrying a
+    // status from whenever it last ran. The loop is a handful of stores.
+    for (k = 0; k < pool_workers + 1; k++) {
         uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[k];
 
         worker->status = NV_OK;
@@ -2875,7 +3085,11 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
     status = NV_OK;
 
-    for (k = 0; k < num_workers + 1; k++) {
+    // Merge across the WHOLE pool for the same reason the reset above spans it.
+    // An inactive slot contributes an empty tracker and NV_OK, so this is a
+    // no-op for it, and it guarantees nothing is left behind if the controller
+    // narrows between one batch and the next.
+    for (k = 0; k < pool_workers + 1; k++) {
         uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[k];
         NV_STATUS tracker_status = uvm_tracker_add_tracker_safe(&batch_context->tracker, &worker->tracker);
 

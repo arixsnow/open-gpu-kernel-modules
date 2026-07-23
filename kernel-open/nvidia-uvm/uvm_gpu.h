@@ -559,8 +559,38 @@ typedef struct
         struct
         {
             // Number of extra worker threads beyond the dispatcher. Clamped
-            // snapshot of uvm_perf_fault_service_num_workers
+            // snapshot of uvm_perf_fault_service_num_workers. Fixed for the
+            // lifetime of the pool: it sizes the queue and worker arrays below.
             NvU32 num_workers;
+
+            // How many of those workers the CURRENT batch may use, in
+            // [1, num_workers]. The adaptive policy writes this; with
+            // adaptation off it simply equals num_workers.
+            //
+            // Width is varied here rather than by resizing the pool because
+            // resizing means creating and destroying kernel threads on the
+            // fault path. Shenango measures Arachne at 29 us per core
+            // reallocation for exactly that reason and rejects per-request
+            // reallocation on those grounds. Moving one integer instead makes
+            // a control action free, which is also what defuses the standard
+            // warning that "excessive control actions increase overheads and
+            // hence can reduce throughputs" (Hellerstein et al. s11.1).
+            //
+            // Read once per batch by the dispatcher, written only by the
+            // dispatcher, which the ISR service_lock serialises per GPU. No
+            // additional locking needed.
+            NvU32 active_workers;
+
+            // Adaptive controller state, all dispatcher-private. The signal is
+            // eviction attempts per batch: measured 0.0 on every in-memory
+            // cell and 10.7 to 46.5 on the oversubscribed ones, so the two
+            // regimes are separated by an order of magnitude either side of
+            // the hold band. See benchmarks/adapt_sim.py, which settled these
+            // constants offline against the 20260722_163533 traces.
+            NvU64 adapt_last_evictions;
+            NvU64 adapt_last_batches;
+            NvU32 adapt_ewma_milli;     // smoothed evictions/batch, x1000
+            NvU32 adapt_narrow_ticks;   // epochs spent below the low threshold
 
             // [num_workers] NUMA-pinned queues, named "UVM GPU%u FSVC%u"
             nv_kthread_q_t *queues;

@@ -1138,6 +1138,20 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_call));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_calls             %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_pick             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_pick));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_block_lock       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_block_lock));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_block_lock_acqs   %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_block_lock_acqs));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_chunks           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_chunks));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_no_candidate      %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_no_candidate));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_in_flight         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_in_flight));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_success           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_success));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_pma_evict_cb           %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_pma_evict_cb));
     UVM_SEQ_OR_DBG_PRINT(s, "n_pma_evict_cbs           %llu\n",
@@ -1156,6 +1170,14 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_va_space_lock_acqs));
     UVM_SEQ_OR_DBG_PRINT(s, "n_top_half_trylock_fail   %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_top_half_trylock_fail));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_adapt_decisions         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_adapt_decisions));
+    UVM_SEQ_OR_DBG_PRINT(s, "sum_adapt_width           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.sum_adapt_width));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_adapt_widen             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_adapt_widen));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_adapt_narrow            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_adapt_narrow));
 
     uvm_up_read(&g_uvm_global.pm.lock);
 

@@ -1176,6 +1176,7 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
     uvm_tracker_t tracker = UVM_TRACKER_INIT();
+    NvU64 t0;
 
     UVM_ASSERT(va_block);
 
@@ -1183,9 +1184,23 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
     // have the PMM lock held. Unlock it first and re-lock it after.
     uvm_mutex_unlock(&pmm->lock);
 
+    // Probed separately from the servicing path's acquisition of the same lock
+    // (ns_block_lock_wait_gpu, in service_fault_batch_block). A worker pool
+    // has both happening at once, and until this campaign only the servicing
+    // side was measured.
+    t0 = uvm_lock_probe_begin();
+
     uvm_mutex_lock(&va_block->lock);
 
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_evict_block_lock,
+                       &g_uvm_lock_contention_stats.n_evict_block_lock_acqs);
+
+    t0 = uvm_lock_probe_begin();
+
     status = uvm_va_block_evict_chunks(va_block, gpu, &root_chunk->chunk, &tracker);
+
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_chunks, NULL);
 
     uvm_mutex_unlock(&va_block->lock);
 
@@ -1547,10 +1562,20 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
     NV_STATUS status;
     uvm_gpu_chunk_t *chunk;
     uvm_gpu_root_chunk_t *root_chunk;
+    NvU64 t0;
 
     uvm_assert_mutex_locked(&pmm->lock);
 
+    // The free-list walk, done with pmm->lock held. Timed on its own because a
+    // walk that lengthens under concurrency would show up here and nowhere
+    // else: it is work inside the critical section, not waiting to enter it,
+    // so ns_pmm_lock_wait cannot see it.
+    t0 = uvm_lock_probe_begin();
+
     root_chunk = pick_root_chunk_to_evict(pmm);
+
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_pick, NULL);
+
     if (!root_chunk) {
         if (pmm_context == PMM_CONTEXT_DEFAULT && type == UVM_PMM_GPU_MEMORY_TYPE_USER && \
             (READ_ONCE(pmm->root_chunks.pinned_count) > 0 || READ_ONCE(pmm->root_chunks.in_eviction_count) > 0)) {
@@ -1624,6 +1649,30 @@ static NV_STATUS pick_and_evict_root_chunk_retry(uvm_pmm_gpu_t *pmm,
     do {
         status = pick_and_evict_root_chunk(pmm, type, pmm_context, out_chunk);
     } while (status == NV_ERR_IN_USE);
+
+    // Classify how this attempt ended, once, on the status the retry loop
+    // settled on. One outcome per sample, so these three sum to n_evict_calls
+    // and the audit can assert that. A cheap no-candidate or in-flight exit is
+    // what makes a sub-microsecond mean possible on a path whose successful
+    // case moves a two-megabyte chunk.
+    switch (status) {
+        case NV_OK:
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_success);
+            break;
+        case NV_ERR_NO_MEMORY:
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_no_candidate);
+            break;
+        case NV_ERR_MORE_PROCESSING_REQUIRED:
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_in_flight);
+            break;
+        default:
+            // Any other error still consumed an attempt. Folded into the
+            // no-candidate bucket rather than dropped, so the three keep
+            // summing to n_evict_calls; these are rare enough that the
+            // conflation has not mattered in any campaign so far.
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_no_candidate);
+            break;
+    }
 
     uvm_lock_probe_end(t0,
                        &g_uvm_lock_contention_stats.ns_evict_call,

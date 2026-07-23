@@ -1324,6 +1324,66 @@ typedef struct
     atomic64_t ns_evict_call;
     atomic64_t n_evict_calls;
 
+    // Sub-phases of ns_evict_call. The 07-22 campaign measured ns_evict_call
+    // growing 5x across the worker ladder at fixed work, with the two locks
+    // the path touches accounting for only 3% of it, so the whole-call sample
+    // could not say where the time went. These three partition it:
+    //
+    //   ns_evict_pick        pick_root_chunk_to_evict, the free-list walk done
+    //                        with pmm->lock held
+    //   ns_evict_block_lock  the va_block->lock acquisition at the head of
+    //                        evict_root_chunk_from_va_block. NOT the same site
+    //                        as ns_block_lock_wait_gpu, which is the servicing
+    //                        path's acquisition in service_fault_batch_block;
+    //                        this one was unprobed, and with several workers
+    //                        both servicing and evicting it is the prime
+    //                        suspect for the unexplained growth
+    //   ns_evict_chunks      uvm_va_block_evict_chunks, the migration setup
+    //
+    // The pmm re-acquisition on the way out needs no counter here: pmm_lock()
+    // already records it into ns_pmm_lock_wait.
+    //
+    // These three plus ns_pmm_lock_wait's eviction share should account for
+    // ns_evict_call. They are contained BY it, so never add them to it.
+    //
+    // Note the counts are not 1:1 with n_evict_calls. evict_root_chunk walks
+    // the root chunk repeatedly, calling evict_root_chunk_from_va_block once
+    // per va_block it finds, so n_evict_block_lock_acqs counts va_blocks
+    // touched and can exceed n_evict_calls by a lot. Divide the block-lock
+    // time by its OWN count for a per-acquisition figure, and by n_evict_calls
+    // only when asking what one logical eviction costs.
+    //
+    // That ratio is itself a result, not just a caveat. It separates three
+    // explanations for the 5x growth in ns_evict_call that the whole-call
+    // probe could not tell apart:
+    //
+    //   blocks/evict rises, us/acq flat   each eviction is doing more work
+    //                                     because chunks span more va_blocks.
+    //                                     No lock is to blame and no lock fix
+    //                                     would help
+    //   blocks/evict flat, us/acq rises   genuine contention on va_block->lock
+    //                                     between servicing and eviction
+    //   both flat, ns_evict_chunks rises  the migration setup itself got
+    //                                     slower, which points at the pushbuf
+    //                                     or the tracker rather than at locks
+    //
+    // The capture script derives blocks_per_evict for exactly this reason.
+    atomic64_t ns_evict_pick;
+    atomic64_t ns_evict_block_lock;
+    atomic64_t n_evict_block_lock_acqs;
+    atomic64_t ns_evict_chunks;
+
+    // How each eviction attempt ended. pick_and_evict_root_chunk returns
+    // NV_ERR_NO_MEMORY when no candidate exists and
+    // NV_ERR_MORE_PROCESSING_REQUIRED when chunks are in flight elsewhere;
+    // both leave the retry loop while still counting as an attempt, which is
+    // how a 2.7 us mean is possible against a 2 MB chunk copy. If in_flight
+    // dominates, the growth is collision churn between workers and the answer
+    // is a backoff rather than a lock. These three sum to n_evict_calls.
+    atomic64_t n_evict_no_candidate;
+    atomic64_t n_evict_in_flight;
+    atomic64_t n_evict_success;
+
     // The two PMA eviction callbacks RM invokes with its API lock held. Hold
     // time, not wait time. See the note above.
     atomic64_t ns_pma_evict_cb;
@@ -1348,6 +1408,22 @@ typedef struct
     // Top-half trylock failures: interrupts arriving while a bottom half is
     // already servicing. A count only, the failed trylock has no duration.
     atomic64_t n_top_half_trylock_fail;
+
+    // Adaptive worker width, for observability. Without these an adaptive run
+    // reports only an end-to-end speedup, and a good number would be
+    // indistinguishable from the controller sitting still at a lucky width.
+    // sum/decisions gives the mean width actually used, and n_adapt_widen and
+    // n_adapt_narrow are the control-action count the stability argument is
+    // about (Hellerstein s11.1, "excessive control actions increase overheads").
+    //
+    // NOT gated on the probe level: this measures the mechanism rather than
+    // instrumenting a lock, it fires once per epoch (hundreds of times per
+    // run, against millions for the lock probes), and an adaptive run at
+    // level 0 still needs to be readable.
+    atomic64_t n_adapt_decisions;
+    atomic64_t sum_adapt_width;
+    atomic64_t n_adapt_widen;
+    atomic64_t n_adapt_narrow;
 } uvm_lock_contention_stats_t;
 
 extern uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
@@ -1376,6 +1452,15 @@ static inline void uvm_lock_probe_end(NvU64 t0, atomic64_t *ns, atomic64_t *acqs
 
     if (acqs)
         atomic64_inc(acqs);
+}
+
+// Count an event that has no duration, under the same level gate as the timed
+// probes. Used for the eviction outcome counters, where what matters is which
+// of three exits the attempt took rather than how long it took to get there.
+static inline void uvm_lock_probe_count(atomic64_t *n)
+{
+    if (uvm_lock_probes_enabled())
+        atomic64_inc(n);
 }
 
 #endif // __UVM_LOCK_H__
