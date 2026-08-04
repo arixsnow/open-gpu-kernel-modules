@@ -94,18 +94,26 @@ module_param(uvm_perf_fault_replay_policy, uint, S_IRUGO);
 static unsigned uvm_perf_fault_service_num_workers = 0;
 module_param(uvm_perf_fault_service_num_workers, uint, S_IRUGO);
 
-// Adaptive worker width. No single fixed width is right: the oversubscribed
-// cells reach 87% of their achievable win at eight workers while the in-memory
-// ones peak at one and lose about three points by fifteen. This is gain
-// scheduling in the sense of Hellerstein et al. s11.2, rules that distinguish
-// operating regimes using a scheduling variable read off the target system.
-// The scheduling variable is eviction attempts per batch, which separates the
-// regimes cleanly (0.0 in memory, 10.7-46.5 oversubscribed, campaign
-// 20260722_163533). Self-tuning regulators were rejected on the book's own
-// grounds (s11.3): they are "slow in adapting" to abrupt workload change and
-// perform worse than handcrafted gain scheduling.
+// Adaptive worker width. This is gain scheduling in the sense of Hellerstein
+// et al. s11.2, rules that distinguish operating conditions using a scheduling
+// variable read off the target system. The scheduling variable is eviction
+// attempts per batch, which separates the two kinds of workload cleanly: 0.00
+// per batch on every in-memory cell against 6.70-46.49 on the oversubscribed
+// ones (campaign 20260724_020443, fifteen workers). Self-tuning regulators
+// were rejected on the book's own grounds (s11.3): they are "slow in adapting"
+// to abrupt workload change and perform worse than handcrafted gain
+// scheduling.
 //
-// Off by default, like every other Stage-2 mechanism. Setting
+// Measured outcome, 20260724_020443: the controller sorts all nineteen cells
+// correctly and still wins no cell outright against a pinned pool of fifteen,
+// losing five. A wide pinned pool costs an in-memory workload too little here
+// for width scheduling to have anything to recover. Worth revisiting on
+// hardware where a wide pool actually hurts. Two known gaps: eviction rate
+// reads zero on a cell that faults heavily, never evicts and still wants
+// width, and on the two-client cell the cost of the pool does not depend on
+// its width at all.
+//
+// Off by default, like the other mechanisms here. Setting
 // uvm_perf_fault_service_num_workers explicitly still pins the width, so every
 // published measurement stays reproducible.
 #define UVM_PERF_FAULT_SERVICE_ADAPT_EPOCH_DEFAULT  64

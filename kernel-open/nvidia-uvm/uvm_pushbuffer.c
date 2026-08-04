@@ -308,6 +308,7 @@ NV_STATUS uvm_pushbuffer_begin_push(uvm_pushbuffer_t *pushbuffer, uvm_push_t *pu
 {
     uvm_pushbuffer_chunk_t *chunk;
     NV_STATUS status;
+    NvU64 t0;
 
     UVM_ASSERT(pushbuffer);
     UVM_ASSERT(push);
@@ -322,10 +323,30 @@ NV_STATUS uvm_pushbuffer_begin_push(uvm_pushbuffer_t *pushbuffer, uvm_push_t *pu
         return NV_OK;
     }
 
+    // Both probes sit below the WLC return above, which uses a static
+    // pushbuffer and never queues here. Timing this path answers a question
+    // wider than the eviction one it was added for: the semaphore admits
+    // UVM_PUSHBUFFER_CHUNKS pushes at once and the widest worker arm runs that
+    // many threads, so growth in ns_push_sema with worker count would make this
+    // a driver-wide ceiling on the pool rather than a property of any one
+    // caller. ns_push_claim separates the pushbuffer spinlock from the
+    // semaphore, since a brief lock every pusher takes and a slot limit nobody
+    // reaches produce very different curves.
+    t0 = uvm_lock_probe_begin();
+
     // Note that this semaphore is uvm_up()ed in end_push().
     uvm_down(&pushbuffer->concurrent_pushes_sema);
 
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_push_sema,
+                       &g_uvm_lock_contention_stats.n_push_acqs);
+
+    t0 = uvm_lock_probe_begin();
+
     status = claim_chunk(pushbuffer, push, &chunk);
+
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_push_claim, NULL);
+
     if (status != NV_OK) {
         uvm_up(&pushbuffer->concurrent_pushes_sema);
         return status;

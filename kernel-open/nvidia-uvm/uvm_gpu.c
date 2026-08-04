@@ -1146,6 +1146,42 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_block_lock_acqs));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_chunks           %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_chunks));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_ctx_alloc        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_ctx_alloc));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_ctx_alloc         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_ctx_alloc));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_scan             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_scan));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_resident         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_resident));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_resident          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_resident));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_push_reserve           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_push_reserve));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_push_reserve            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_push_reserve));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_push_sema              %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_push_sema));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_push_acqs               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_push_acqs));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_push_claim             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_push_claim));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_unmap            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_unmap));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_populate         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_populate));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_copy             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_copy));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_mkres             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_mkres));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_svc_unmap              %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_svc_unmap));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_svc_populate           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_svc_populate));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_svc_copy               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_svc_copy));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_mkres               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_svc_mkres));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_no_candidate      %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_no_candidate));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_in_flight         %llu\n",

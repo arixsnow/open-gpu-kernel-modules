@@ -252,6 +252,7 @@ NV_STATUS __uvm_push_begin_acquire_with_info(uvm_channel_manager_t *manager,
     va_list args;
     NV_STATUS status;
     uvm_channel_t *channel;
+    NvU64 t0;
 
     if (dst_gpu != NULL) {
         UVM_ASSERT(type == UVM_CHANNEL_TYPE_GPU_TO_GPU);
@@ -262,7 +263,20 @@ NV_STATUS __uvm_push_begin_acquire_with_info(uvm_channel_manager_t *manager,
     if (status != NV_OK)
         return status;
 
+    // The first of the three push-path probes and the one that was missing.
+    // uvm_channel_reserve spins in UVM_SPIN_LOOP until a GPFIFO entry frees,
+    // taking channel_pool_lock on each attempt, and all of that happens before
+    // uvm_pushbuffer_begin_push where the other two probes sit. Closed before
+    // the status check so a failed reservation still records the time it spent
+    // failing, which is the case where the spin ran longest.
+    t0 = uvm_lock_probe_begin();
+
     status = push_reserve_channel(manager, type, dst_gpu, &channel);
+
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_push_reserve,
+                       &g_uvm_lock_contention_stats.n_push_reserve);
+
     if (status != NV_OK)
         return status;
 

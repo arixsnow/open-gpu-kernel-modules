@@ -582,11 +582,13 @@ typedef struct
             NvU32 active_workers;
 
             // Adaptive controller state, all dispatcher-private. The signal is
-            // eviction attempts per batch: measured 0.0 on every in-memory
-            // cell and 10.7 to 46.5 on the oversubscribed ones, so the two
-            // regimes are separated by an order of magnitude either side of
-            // the hold band. See benchmarks/adapt_sim.py, which settled these
-            // constants offline against the 20260722_163533 traces.
+            // eviction attempts per batch: measured 0.00 on every in-memory
+            // cell and 6.70 to 46.49 on the oversubscribed ones (campaign
+            // 20260724_020443, fifteen workers), so the two kinds of workload
+            // sit an order of magnitude either side of the hold band. See
+            // benchmarks/adapt_sim.py, which settled these constants offline
+            // against the earlier 20260722_163533 traces; the separation held
+            // when it was re-measured on 20260724_020443.
             NvU64 adapt_last_evictions;
             NvU64 adapt_last_batches;
             NvU32 adapt_ewma_milli;     // smoothed evictions/batch, x1000
