@@ -1166,6 +1166,10 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_push_acqs));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_push_claim             %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_push_claim));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_push_reserve_slow       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_push_reserve_slow));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_push_reserve_spins     %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_push_reserve_spins));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_unmap            %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_evict_unmap));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_populate         %llu\n",

@@ -588,6 +588,12 @@ static NV_STATUS channel_reserve_in_pool(uvm_channel_pool_t *pool,
     uvm_channel_t *channel;
     uvm_spin_loop_t spin;
 
+    // Iterations of the spin loop below, tallied locally and handed to the
+    // counter once on exit. One atomic per iteration would make the probe part
+    // of the contention it is measuring. See uvm_lock.h for what the pair of
+    // counters separates.
+    NvU64 spins = 0;
+
     UVM_ASSERT(pool);
 
     if (g_uvm_global.conf_computing_enabled)
@@ -601,6 +607,11 @@ static NV_STATUS channel_reserve_in_pool(uvm_channel_pool_t *pool,
         }
     }
 
+    // Every return above this point took the fast sweep and executes nothing
+    // extra, not even the stats-level test. Only reservations that are about to
+    // spin are counted, which is the quantity in question.
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_push_reserve_slow);
+
     uvm_spin_loop_init(&spin);
     while (1) {
         uvm_for_each_channel_in_pool(channel, pool) {
@@ -611,16 +622,23 @@ static NV_STATUS channel_reserve_in_pool(uvm_channel_pool_t *pool,
             if (try_claim_channel(channel, 1, reserve_type)) {
                 *channel_out = channel;
 
+                uvm_lock_probe_add(&g_uvm_lock_contention_stats.ns_push_reserve_spins, spins);
+
                 return NV_OK;
             }
 
             status = uvm_channel_check_errors(channel);
-            if (status != NV_OK)
+            if (status != NV_OK) {
+                uvm_lock_probe_add(&g_uvm_lock_contention_stats.ns_push_reserve_spins, spins);
                 return status;
+            }
 
-            if (reserve_type == UVM_CHANNEL_RESERVE_WITH_P2P && channel->suspended_p2p)
+            if (reserve_type == UVM_CHANNEL_RESERVE_WITH_P2P && channel->suspended_p2p) {
+                uvm_lock_probe_add(&g_uvm_lock_contention_stats.ns_push_reserve_spins, spins);
                 return NV_ERR_BUSY_RETRY;
+            }
 
+            spins++;
             UVM_SPIN_LOOP(&spin);
         }
     }

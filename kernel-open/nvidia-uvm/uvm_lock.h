@@ -1450,6 +1450,66 @@ typedef struct
     atomic64_t n_push_acqs;
     atomic64_t ns_push_claim;
 
+    // Which of the two waits inside channel reservation is being paid for.
+    //
+    // Campaign 20260804_232730 answered the question ns_push_reserve was added
+    // for: it is the stage that grows, 0.043 -> 2.925 us across the worker
+    // ladder at a push count that moves 0.24%, and the eviction unmap phase
+    // picks up 2.77 to 3.13 reservations' worth of waiting. What it cannot say
+    // is WHY, because channel_reserve_in_pool has two ways to be slow and one
+    // timer around both:
+    //
+    //   1. every channel is out of GPFIFO entries, so the thread spins until
+    //      the device drains one. A hardware ceiling. Widening the pool buys
+    //      nothing and the copy engines are the gate.
+    //   2. an entry is free, but try_claim_channel takes channel_pool_lock on
+    //      every attempt and sixteen threads are queueing on it. A software
+    //      problem, and the fix is more channels or a finer lock.
+    //
+    // The two call for opposite conclusions, so the report cannot recommend
+    // anything until they are separated. channel_manager_num_channels gives the
+    // copy-engine pool two channels, a constant carrying NVIDIA's own TODO to
+    // tune it against real workloads, and whether that TODO is worth acting on
+    // is exactly what these decide.
+    //
+    //   n_push_reserve_slow   reservations where the fast sweep over the pool
+    //                         found nothing and the thread entered the spin
+    //                         loop. Against n_push_reserve this is the rate.
+    //                         Near zero means case 2, near one means case 1.
+    //   ns_push_reserve_spins spin-loop iterations, NOT nanoseconds despite the
+    //                         ns_ prefix the rest of this struct uses for time.
+    //                         Named for placement beside its sibling; the
+    //                         derived metric divides it by n_push_reserve_slow
+    //                         to give iterations per slow reservation, which
+    //                         separates "briefly full" from "badly backed up".
+    //                         The unit is one UVM_SPIN_LOOP per CHANNEL
+    //                         examined, not per sweep of the pool, so a pool of
+    //                         two channels contributes two per full sweep.
+    //                         Read it as backoffs, and halve it if you want
+    //                         sweeps. Nothing downstream divides it by 1000,
+    //                         which is the mistake the ns_ prefix invites.
+    //
+    // Cost: the increment sits AFTER the fast sweep has already failed, so a
+    // reservation that succeeds first time executes nothing extra, not even the
+    // stats-level branch. Iterations accumulate in a local and are added once on
+    // exit, so the loop itself takes no atomic however long it runs.
+    //
+    // Containment, which is not obvious and is worth not re-deriving.
+    // push_reserve_slow_pct divides n_push_reserve_slow by n_push_reserve, and
+    // the two are incremented at different levels: n_push_reserve wraps
+    // push_reserve_channel in uvm_push.c, while these live one level down in
+    // channel_reserve_in_pool. That function has a second caller,
+    // uvm_channel_reserve_type from channel_rotate_and_reserve_launch_channel,
+    // which is outside the wrapped scope and would put the ratio above 100% if
+    // it ever ran alongside. It cannot. That caller sits inside
+    // "if (g_uvm_global.conf_computing_enabled)" in uvm_channel_begin_push, and
+    // the code these counters sit in is reached only AFTER
+    // channel_reserve_in_pool's own early return for the same condition. The
+    // two paths are mutually exclusive by construction, so
+    // n_push_reserve_slow <= n_push_reserve holds on any configuration.
+    atomic64_t n_push_reserve_slow;
+    atomic64_t ns_push_reserve_spins;
+
     // Sub-phases of uvm_va_block_make_resident_copy, in TWO BANKS chosen by the
     // cause argument. That function is shared: eviction reaches it through
     // uvm_va_block_evict_chunks, and fault servicing reaches it through
@@ -1578,6 +1638,16 @@ static inline void uvm_lock_probe_count(atomic64_t *n)
 {
     if (uvm_lock_probes_enabled())
         atomic64_inc(n);
+}
+
+// Add a tally accumulated in a local, for loops where one atomic per iteration
+// would be the measurement rather than the thing measured. The caller keeps a
+// plain counter and hands it over once on exit. A zero tally is dropped so a
+// caller that never entered the loop adds nothing.
+static inline void uvm_lock_probe_add(atomic64_t *n, NvU64 count)
+{
+    if (count && uvm_lock_probes_enabled())
+        atomic64_add(count, n);
 }
 
 #endif // __UVM_LOCK_H__
