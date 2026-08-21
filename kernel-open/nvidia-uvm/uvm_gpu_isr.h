@@ -84,6 +84,12 @@ typedef struct
         // An array (one per possible CPU), which holds the number of times the
         // bottom half has executed on that CPU.
         NvU64 *cpu_exec_count;
+
+        // Timestamp taken when the bottom half is scheduled, used to compute
+        // the scheduling-to-execution delay. Only used for replayable faults,
+        // where at most one bottom half can be in flight (the top half only
+        // schedules after taking service_lock), so a plain field is safe.
+        NvU64 bh_schedule_timestamp;
     } stats;
 
     // This is the number of times the function that disables this type of
@@ -129,6 +135,10 @@ typedef struct
 
 // Entry point for interrupt handling. This is called from RM's top half
 NV_STATUS uvm_isr_top_half_entry(const NvProcessorUuid *gpu_uuid);
+
+// Initialize a nv_kthread_q, pinning its kthread to the given NUMA node when
+// thread affinity is supported (falls back to a regular init otherwise)
+NV_STATUS uvm_isr_init_queue_on_node(nv_kthread_q_t *queue, const char *name, int node);
 
 // Initialize ISR handling state
 NV_STATUS uvm_parent_gpu_init_isr(uvm_parent_gpu_t *parent_gpu);

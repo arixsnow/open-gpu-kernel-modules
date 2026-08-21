@@ -115,6 +115,73 @@ module_param(uvm_perf_fault_max_throttle_per_service, uint, S_IRUGO);
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
 
+// ----------------------------------------------------------------------------
+// ARIADNE (HPCA'26) parameters
+// ----------------------------------------------------------------------------
+
+// Base host-pin duration in milliseconds. The effective pin time is
+// 50 us per active block, floored at this value, and multiplied by five for a
+// block that has been pinned before. Note their arithmetic is NvU32 nanoseconds
+// and overflows past roughly 4.3 seconds; kept as they wrote it.
+static unsigned uvm_dynzero_pintime = 100;
+module_param(uvm_dynzero_pintime, uint, S_IRUGO);
+
+// Sleep between unpin sweeps, milliseconds.
+static unsigned uvm_dynzero_unpin_period = 40;
+module_param(uvm_dynzero_unpin_period, uint, S_IRUGO);
+
+// Extra blocks host-pinned per batch when the average Sharing Degree is below
+// uvm_dynzero_thr_avg_sd, i.e. when the workload looks sparse.
+static unsigned uvm_dynzero_aggradjust = 20;
+module_param(uvm_dynzero_aggradjust, uint, S_IRUGO);
+
+// Master switch for the Populate/Copy pipeline and the copy and eviction
+// kthreads. Their ablation reaches no-PL with this at 0, and no-PL-SD with
+// uvm_perf_SDaware at 0 as well.
+static unsigned uvm_perf_fhp = 1;
+module_param(uvm_perf_fhp, uint, S_IRUGO);
+
+// ARIADNE hangs all of its per-GPU state off uvm_gpu_t and reaches it from the
+// fault-service loop. On 535 that loop was per-GPU. On 610 it is per parent GPU
+// and there is no uvm_gpu_t in scope, because one parent's fault buffer can
+// serve several sub-GPUs under SMC.
+//
+// This resolves the sub-GPU that owns the ARIADNE state, following the same
+// idiom uvm_gpu_isr.c uses to pick a child GPU in a bottom half. Without SMC
+// there is exactly one, which is the configuration their artifact was built and
+// measured for, and which their own documentation says the prototype has not
+// been tested outside of. The assert makes that limit fail loudly instead of
+// silently servicing the wrong GPU's queues.
+//
+// Returns NULL when no child GPU is live, which callers must treat as "nothing
+// to do" rather than as an error.
+static uvm_gpu_t *ariadne_gpu(uvm_parent_gpu_t *parent_gpu)
+{
+    uvm_gpu_t *gpu;
+
+    UVM_ASSERT(parent_gpu);
+
+    if (parent_gpu->smc.enabled) {
+        NvU32 sub_processor_index;
+
+        // ARIADNE keeps one set of queues, one exclusion set and one logical
+        // clock per uvm_gpu_t. Under SMC several sub-GPUs would share the
+        // parent's fault buffer and silently share that state.
+        UVM_ASSERT_MSG(bitmap_weight(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS) <= 1,
+                       "ARIADNE is single-GPU only; %u sub-GPUs are live\n",
+                       bitmap_weight(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS));
+
+        sub_processor_index = find_first_bit(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS);
+        gpu = (sub_processor_index < UVM_PARENT_ID_MAX_SUB_PROCESSORS) ?
+              parent_gpu->gpus[sub_processor_index] : NULL;
+    }
+    else {
+        gpu = parent_gpu->gpus[0];
+    }
+
+    return gpu;
+}
+
 // This function is used for both the initial fault buffer initialization and
 // the power management resume path.
 static void fault_buffer_reinit_replayable_faults(uvm_parent_gpu_t *parent_gpu)
@@ -1604,6 +1671,14 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     uvm_gpu_t *gpu = gpu_va_space->gpu;
     uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
     uvm_service_block_context_t *fault_block_context = &replayable_faults->block_service_context;
+    NvU64 block_lock_wait_start;
+    NvU64 block_service_start;
+
+    // Whole-call cost of servicing this block, taken before the HMM wait so it
+    // covers everything the caller pays for one va_block. This function is stock,
+    // so every servicing mechanism passes through it once per block and the same
+    // number is comparable across them.
+    block_service_start = uvm_lock_probe_begin();
 
     fault_block_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
     fault_block_context->num_retries = 0;
@@ -1611,7 +1686,18 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     if (uvm_va_block_is_hmm(va_block))
         uvm_hmm_migrate_begin_wait(va_block);
 
+    // Every thread that services a fault converges on this one acquisition, so
+    // it is the single place fault servicing can serialize against itself or
+    // against a CPU fault holding the same block. The timestamp is taken after
+    // uvm_hmm_migrate_begin_wait above, which can block for reasons that have
+    // nothing to do with this lock.
+    block_lock_wait_start = uvm_lock_probe_begin();
+
     uvm_mutex_lock(&va_block->lock);
+
+    uvm_lock_probe_end(block_lock_wait_start,
+                       &g_uvm_lock_contention_stats.ns_block_lock_wait_gpu,
+                       &g_uvm_lock_contention_stats.n_block_lock_acqs_gpu);
 
     status = UVM_VA_BLOCK_RETRY_LOCKED(va_block, &va_block_retry,
                                        service_fault_batch_block_locked(gpu_va_space,
@@ -1628,6 +1714,10 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
 
     if (uvm_va_block_is_hmm(va_block))
         uvm_hmm_migrate_finish(va_block);
+
+    uvm_lock_probe_end(block_service_start,
+                       &g_uvm_lock_contention_stats.ns_va_block_service,
+                       &g_uvm_lock_contention_stats.n_va_block_service);
 
     return status == NV_OK? tracker_status: status;
 }
@@ -2249,6 +2339,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         &parent_gpu->fault_buffer.replayable.block_service_context;
     uvm_va_block_context_t *va_block_context = service_context->block_context;
     bool hmm_migratable = true;
+    NvU64 va_space_lock_wait_start;
 
     ats_invalidate->tlb_batch_pending = false;
 
@@ -2288,7 +2379,17 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             mm = uvm_va_space_mm_retain_lock(va_space);
             uvm_va_block_context_init(va_block_context, mm);
 
+            // Brackets the VA space lock only. uvm_va_space_mm_retain_lock
+            // above takes mmap_lock, whose wait is often the larger of the
+            // two, so this counter under-reports the total stall at a va_space
+            // transition rather than over-reporting it.
+            va_space_lock_wait_start = uvm_lock_probe_begin();
+
             uvm_va_space_down_read(va_space);
+
+            uvm_lock_probe_end(va_space_lock_wait_start,
+                               &g_uvm_lock_contention_stats.ns_va_space_lock_wait,
+                               &g_uvm_lock_contention_stats.n_va_space_lock_acqs);
         }
 
         // Some faults could be already fatal if they cannot be handled by
@@ -2899,9 +3000,27 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     NvU32 num_replays = 0;
     NvU32 num_batches = 0;
     NvU32 num_throttled = 0;
+    NvU64 batch_start_time = 0;
+    NvU64 time_stamp;
     NV_STATUS status = NV_OK;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
+
+    // Snapshot the per-GPU servicing-pipeline counters so we can fold this
+    // invocation's delta into the module-lifetime global (cpu/fault_stats) at
+    // the single function exit. The per-GPU node vanishes on GPU unregister;
+    // the global persists so the external capture can always diff it.
+    // (ns_bh_queue_delay is updated in the ISR before this call, so it is
+    // mirrored there, not here.)
+    NvU64 fold_start_num_batches          = replayable_faults->stats.num_batches;
+    NvU64 fold_start_num_cached_faults    = replayable_faults->stats.num_cached_faults;
+    NvU64 fold_start_num_coalesced_faults = replayable_faults->stats.num_coalesced_faults;
+    NvU64 fold_start_ns_fetch             = replayable_faults->stats.ns_fetch;
+    NvU64 fold_start_ns_preprocess        = replayable_faults->stats.ns_preprocess;
+    NvU64 fold_start_ns_service           = replayable_faults->stats.ns_service;
+    NvU64 fold_start_ns_replay            = replayable_faults->stats.ns_replay;
+    NvU64 fold_start_ns_tracker_wait      = replayable_faults->stats.ns_tracker_wait;
+    NvU64 fold_start_ns_batch_total       = replayable_faults->stats.ns_batch_total;
 
     uvm_tracker_init(&batch_context->tracker);
 
@@ -2919,7 +3038,10 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         batch_context->fatal_gpu                   = NULL;
         batch_context->has_throttled_faults        = false;
 
+        batch_start_time = NV_GETTIME();
+
         status = fetch_fault_buffer_entries(parent_gpu, batch_context, FAULT_FETCH_MODE_BATCH_READY);
+        replayable_faults->stats.ns_fetch += NV_GETTIME() - batch_start_time;
         if (status != NV_OK)
             break;
 
@@ -2928,7 +3050,12 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         ++batch_context->batch_id;
 
+        replayable_faults->stats.num_cached_faults += batch_context->num_cached_faults;
+        replayable_faults->stats.num_coalesced_faults += batch_context->num_coalesced_faults;
+
+        time_stamp = NV_GETTIME();
         status = preprocess_fault_batch(parent_gpu, batch_context);
+        replayable_faults->stats.ns_preprocess += NV_GETTIME() - time_stamp;
 
         num_replays += batch_context->num_replays;
 
@@ -2937,7 +3064,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         else if (status != NV_OK)
             break;
 
+        time_stamp = NV_GETTIME();
         status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context);
+        replayable_faults->stats.ns_service += NV_GETTIME() - time_stamp;
 
         // We may have issued replays even if status != NV_OK if
         // UVM_PERF_FAULT_REPLAY_POLICY_BLOCK is being used or the fault buffer
@@ -2958,13 +3087,17 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         }
 
         if (batch_context->fatal_va_space) {
+            time_stamp = NV_GETTIME();
             status = uvm_tracker_wait(&batch_context->tracker);
+            replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
             if (status == NV_OK) {
                 status = cancel_faults_precise(batch_context);
                 if (status == NV_OK) {
                     // Cancel handling should've issued at least one replay
                     UVM_ASSERT(batch_context->num_replays > 0);
                     ++num_batches;
+                    ++replayable_faults->stats.num_batches;
+                    replayable_faults->stats.ns_batch_total += NV_GETTIME() - batch_start_time;
                     continue;
                 }
             }
@@ -2973,7 +3106,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         }
 
         if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
+            time_stamp = NV_GETTIME();
             status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+            replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
             ++num_replays;
@@ -2986,11 +3121,16 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT;
             }
 
+            time_stamp = NV_GETTIME();
             status = fault_buffer_flush_locked(parent_gpu, NULL, flush_mode, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+            replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
             ++num_replays;
+
+            time_stamp = NV_GETTIME();
             status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+            replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
         }
@@ -2999,6 +3139,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             ++num_throttled;
 
         ++num_batches;
+        ++replayable_faults->stats.num_batches;
+        replayable_faults->stats.ns_batch_total += NV_GETTIME() - batch_start_time;
     }
 
     if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
@@ -3007,10 +3149,34 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     // Make sure that we issue at least one replay if no replay has been
     // issued yet to avoid dropping faults that do not show up in the buffer
     if ((status == NV_OK && replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_ONCE) ||
-        num_replays == 0)
+        num_replays == 0) {
+        time_stamp = NV_GETTIME();
         status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+        replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
+    }
 
     uvm_tracker_deinit(&batch_context->tracker);
+
+    // Fold this invocation's per-GPU pipeline delta into the module-lifetime
+    // global aggregate (cpu/fault_stats), which persists across GPU unregister.
+    atomic64_add(replayable_faults->stats.num_batches          - fold_start_num_batches,
+                 &g_uvm_fault_pipeline_stats.num_batches);
+    atomic64_add(replayable_faults->stats.num_cached_faults    - fold_start_num_cached_faults,
+                 &g_uvm_fault_pipeline_stats.num_cached_faults);
+    atomic64_add(replayable_faults->stats.num_coalesced_faults - fold_start_num_coalesced_faults,
+                 &g_uvm_fault_pipeline_stats.num_coalesced_faults);
+    atomic64_add(replayable_faults->stats.ns_fetch             - fold_start_ns_fetch,
+                 &g_uvm_fault_pipeline_stats.ns_fetch);
+    atomic64_add(replayable_faults->stats.ns_preprocess        - fold_start_ns_preprocess,
+                 &g_uvm_fault_pipeline_stats.ns_preprocess);
+    atomic64_add(replayable_faults->stats.ns_service           - fold_start_ns_service,
+                 &g_uvm_fault_pipeline_stats.ns_service);
+    atomic64_add(replayable_faults->stats.ns_replay            - fold_start_ns_replay,
+                 &g_uvm_fault_pipeline_stats.ns_replay);
+    atomic64_add(replayable_faults->stats.ns_tracker_wait      - fold_start_ns_tracker_wait,
+                 &g_uvm_fault_pipeline_stats.ns_tracker_wait);
+    atomic64_add(replayable_faults->stats.ns_batch_total       - fold_start_ns_batch_total,
+                 &g_uvm_fault_pipeline_stats.ns_batch_total);
 
     if (status != NV_OK)
         UVM_DBG_PRINT("Error servicing replayable faults on GPU: %s\n", uvm_parent_gpu_name(parent_gpu));

@@ -49,6 +49,13 @@ static bool g_ops_registered = false;
 unsigned uvm_force_conf_computing = 0;
 module_param(uvm_force_conf_computing, uint, S_IRUGO);
 
+// ARIADNE (HPCA'26). Master switch for the Sharing-Degree-aware eviction
+// policy. Non-static because uvm_pmm_gpu.c reads it from the victim scan.
+// Default on, matching their artifact; their ablation turns it off together
+// with uvm_perf_fhp to reach the no-PL-SD configuration.
+unsigned uvm_perf_SDaware = 1;
+module_param(uvm_perf_SDaware, uint, S_IRUGO);
+
 static NV_STATUS uvm_register_callbacks(void)
 {
     NV_STATUS status = NV_OK;

@@ -472,14 +472,24 @@ NV_STATUS uvm_va_block_set_accessed_by(uvm_va_block_t *va_block,
     uvm_va_block_region_t region = uvm_va_block_region_from_block(va_block);
     NV_STATUS status;
     uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
-    uvm_va_policy_t *policy = &va_block->managed_range->policy;
 
     UVM_ASSERT(!uvm_va_block_is_hmm(va_block));
 
-    // Read duplication takes precedence over SetAccessedBy. Do not add mappings
-    // if read duplication is enabled.
-    if (uvm_va_policy_is_read_duplicate(policy))
-        return NV_OK;
+    // ARIADNE (HPCA'26). Suppressed. This is the whole of their uvm_policy.c
+    // change that is actually live, and it is what makes Zero-copy work: the
+    // host-pin path calls this function to build a GPU-to-sysmem remote mapping
+    // for an evicted block, and a read-duplicated block would return early and
+    // never get one. Pairs with forcing may_read_duplicate false in
+    // block_select_residency, since a read-duplicated page has no single
+    // residency to pin.
+    //
+    // Their two new preferred-location entry points, and the de-static of
+    // accessed_by_set, belong to an earlier design whose every call site they
+    // commented out. Those are not carried forward, which is also why 610
+    // deleting uvm_range_group costs this port nothing.
+    //
+    // if (uvm_va_policy_is_read_duplicate(policy))
+    //     return NV_OK;
 
     status = UVM_VA_BLOCK_LOCK_RETRY(va_block,
                                      NULL,

@@ -1277,4 +1277,394 @@ static void __uvm_bit_unlock(uvm_bit_locks_t *bit_locks, unsigned long bit)
     uvm_record_unlock(_bit_locks, UVM_LOCK_FLAGS_MODE_EXCLUSIVE); \
 })
 
+// ----------------------------------------------------------------------------
+// Lock contention instrumentation
+// ----------------------------------------------------------------------------
+//
+// Verbosity of the fault instrumentation:
+//   0 = the always-on fault pipeline timers only (stock behaviour)
+//   1 = reserved for the log2 histograms
+//   2 = the lock contention probes below
+//
+// Levels above 0 cost two timestamp reads and an atomic add per probed lock
+// acquisition, so the default keeps every baseline comparable with the
+// campaigns measured before the probes existed.
+extern unsigned uvm_perf_fault_stats_level;
+
+// Wait time on the driver-internal locks that GPU fault servicing funnels
+// through. These answer where servicing serializes once several worker threads
+// are active: every GPU PTE write goes through one page tree mutex per GPU,
+// every allocation and free through one PMM mutex, and each va_block through
+// its own lock. Global rather than per-GPU for the same reason the host-op
+// counters are, several of these paths run without a GPU at hand. Cumulative
+// since module load; consumers snapshot-and-diff. Exposed at cpu/lock_stats.
+//
+// The ns_* fields measure *wait*, the time between asking for a lock and
+// holding it, except for ns_evict_call and ns_pma_evict_cb which measure how
+// long the eviction paths run. Those two nest: ns_pma_evict_cb contains
+// ns_evict_call which contains ns_pmm_lock_wait, so the three must never be
+// summed or presented as disjoint shares of anything.
+//
+// ns_pma_evict_cb is the notable asymmetry: RM takes its own API lock and then
+// calls down into UVM, so UVM never waits on that lock and cannot observe
+// anyone who does. That counter therefore bounds how much serialization the RM
+// API lock could be causing, and cannot attribute any particular stall to it.
+typedef struct
+{
+    // uvm_mutex_lock(&tree->lock) in uvm_mmu.c, via page_tree_lock()
+    atomic64_t ns_page_tree_lock_wait;
+    atomic64_t n_page_tree_lock_acqs;
+
+    // uvm_mutex_lock(&pmm->lock) in uvm_pmm_gpu.c, via pmm_lock()
+    atomic64_t ns_pmm_lock_wait;
+    atomic64_t n_pmm_lock_acqs;
+
+    // pick_and_evict_root_chunk_retry: allocation-side eviction on the fault
+    // path. One sample per logical eviction, retries included.
+    atomic64_t ns_evict_call;
+    atomic64_t n_evict_calls;
+
+    // Sub-phases of ns_evict_call. The 07-22 campaign measured ns_evict_call
+    // growing 5x across the worker ladder at fixed work, with the two locks
+    // the path touches accounting for only 3% of it, so the whole-call sample
+    // could not say where the time went. These three partition it:
+    //
+    //   ns_evict_pick        pick_root_chunk_to_evict, the free-list walk done
+    //                        with pmm->lock held
+    //   ns_evict_block_lock  the va_block->lock acquisition at the head of
+    //                        evict_root_chunk_from_va_block. NOT the same site
+    //                        as ns_block_lock_wait_gpu, which is the servicing
+    //                        path's acquisition in service_fault_batch_block;
+    //                        this one was unprobed, and with several workers
+    //                        both servicing and evicting it is the prime
+    //                        suspect for the unexplained growth
+    //   ns_evict_chunks      uvm_va_block_evict_chunks, the migration setup
+    //
+    // The pmm re-acquisition on the way out needs no counter here: pmm_lock()
+    // already records it into ns_pmm_lock_wait.
+    //
+    // These three plus ns_pmm_lock_wait's eviction share should account for
+    // ns_evict_call. They are contained BY it, so never add them to it.
+    //
+    // Note the counts are not 1:1 with n_evict_calls. evict_root_chunk walks
+    // the root chunk repeatedly, calling evict_root_chunk_from_va_block once
+    // per va_block it finds, so n_evict_block_lock_acqs counts va_blocks
+    // touched and can exceed n_evict_calls by a lot. Divide the block-lock
+    // time by its OWN count for a per-acquisition figure, and by n_evict_calls
+    // only when asking what one logical eviction costs.
+    //
+    // That ratio is itself a result, not just a caveat. It separates three
+    // explanations for the 5x growth in ns_evict_call that the whole-call
+    // probe could not tell apart:
+    //
+    //   blocks/evict rises, us/acq flat   each eviction is doing more work
+    //                                     because chunks span more va_blocks.
+    //                                     No lock is to blame and no lock fix
+    //                                     would help
+    //   blocks/evict flat, us/acq rises   genuine contention on va_block->lock
+    //                                     between servicing and eviction
+    //   both flat, ns_evict_chunks rises  the migration setup itself got
+    //                                     slower, which points at the pushbuf
+    //                                     or the tracker rather than at locks
+    //
+    // The capture script derives blocks_per_evict for exactly this reason.
+    atomic64_t ns_evict_pick;
+    atomic64_t ns_evict_block_lock;
+    atomic64_t n_evict_block_lock_acqs;
+    atomic64_t ns_evict_chunks;
+
+    // Sub-phases of ns_evict_chunks. The 07-24 campaign settled the three-way
+    // question posed above: blocks_per_evict was flat at 1.00 and the block
+    // lock stayed under 0.11 us at every width, while ns_evict_chunks rose
+    // 2.52 -> 13.22 us across the worker ladder at fixed attempt count. That is
+    // the third branch, "the migration setup itself got slower", and nothing
+    // below ns_evict_chunks was measured. These three partition it:
+    //
+    //   ns_evict_ctx_alloc   uvm_service_block_context_alloc. Note this runs
+    //                        BEFORE the walk that counts chunks_to_evict, so
+    //                        every call pays it whether or not there turns out
+    //                        to be anything to evict
+    //   ns_evict_scan        the chunk walk that decides what to evict
+    //   ns_evict_resident    the migration proper, both the HMM and the
+    //                        make_resident arm. One probe spans the if/else so
+    //                        the three still partition the call on either path
+    //
+    // Contained BY ns_evict_chunks. Never add them to it.
+    //
+    // They carry two counts of their own rather than sharing
+    // n_evict_block_lock_acqs, because the three phases do NOT all produce a
+    // sample on every call and dividing them by one number would compare three
+    // quantities against three different denominators:
+    //
+    //   - three early returns fire before the first probe (!va_space,
+    //     !gpu_state, and the inject_eviction_error test path). The block lock
+    //     was taken and counted, but no phase ran
+    //   - chunks_to_evict == 0 exits after the walk, giving a ctx_alloc and a
+    //     scan sample but no resident one
+    //
+    // So n_evict_ctx_alloc divides ctx_alloc and scan, n_evict_resident divides
+    // resident, and n_evict_ctx_alloc/n_evict_block_lock_acqs is itself the
+    // readout for how often the early returns fire. Without these the per-call
+    // figures are underestimates by an unknown and differing factor, and
+    // evict_chunks_accounted_pct would report the shortfall as unprobed work
+    // rather than as denominator skew.
+    atomic64_t ns_evict_ctx_alloc;
+    atomic64_t n_evict_ctx_alloc;
+    atomic64_t ns_evict_scan;
+    atomic64_t ns_evict_resident;
+    atomic64_t n_evict_resident;
+
+    // The push path, and NOT an eviction counter: uvm_pushbuffer_begin_push is
+    // on the path of every push in the driver, servicing migrations included.
+    // It is probed here because it is the leading suspect for the growth above,
+    // but what it answers is larger. The pushbuffer admits at most
+    // UVM_PUSHBUFFER_CHUNKS (16) concurrent pushes, and the widest arm runs 15
+    // workers plus the dispatcher, so if ns_push_sema grows with worker count
+    // then 16 is a driver-wide ceiling on how much parallelism the pool can
+    // ever have, whatever the fault path does.
+    //
+    //   ns_push_reserve push_reserve_channel, which spins in uvm_channel_reserve
+    //                   until a GPFIFO entry frees up and takes
+    //                   channel_pool_lock on every attempt. This one sits
+    //                   BEFORE the other two in the push sequence and was the
+    //                   original blind spot: a spin loop on a shared lock is
+    //                   exactly the shape being hunted, and without it a queue
+    //                   here would read as "both push counters flat", which the
+    //                   decision table would wrongly call "not a queue"
+    //   ns_push_sema    uvm_down on concurrent_pushes_sema, the 16-slot cap
+    //   ns_push_claim   claim_chunk, which takes the pushbuffer spinlock
+    //
+    // A semaphore with 16 slots should cost nothing below 16 threads, whereas a
+    // spinlock held briefly by every pusher grows smoothly from two. The
+    // measured ns_evict_chunks curve is smooth from two, so ns_push_claim is
+    // the better a-priori fit and ns_push_sema is the more interesting result.
+    // Both probes sit AFTER the WLC early return, which bypasses the semaphore
+    // entirely; counting those static-pushbuffer pushes would dilute the mean.
+    //
+    // These overlap ns_evict_resident on the eviction path and nothing else in
+    // this struct. Not contained by ns_evict_chunks, so never fold them into
+    // evict_chunks_accounted_pct.
+    atomic64_t ns_push_reserve;
+    atomic64_t n_push_reserve;
+    atomic64_t ns_push_sema;
+    atomic64_t n_push_acqs;
+    atomic64_t ns_push_claim;
+
+    // Which of the two waits inside channel reservation is being paid for.
+    //
+    // Campaign 20260804_232730 answered the question ns_push_reserve was added
+    // for: it is the stage that grows, 0.043 -> 2.925 us across the worker
+    // ladder at a push count that moves 0.24%, and the eviction unmap phase
+    // picks up 2.77 to 3.13 reservations' worth of waiting. What it cannot say
+    // is WHY, because channel_reserve_in_pool has two ways to be slow and one
+    // timer around both:
+    //
+    //   1. every channel is out of GPFIFO entries, so the thread spins until
+    //      the device drains one. A hardware ceiling. Widening the pool buys
+    //      nothing and the copy engines are the gate.
+    //   2. an entry is free, but try_claim_channel takes channel_pool_lock on
+    //      every attempt and sixteen threads are queueing on it. A software
+    //      problem, and the fix is more channels or a finer lock.
+    //
+    // The two call for opposite conclusions, so the report cannot recommend
+    // anything until they are separated. channel_manager_num_channels gives the
+    // copy-engine pool two channels, a constant carrying NVIDIA's own TODO to
+    // tune it against real workloads, and whether that TODO is worth acting on
+    // is exactly what these decide.
+    //
+    //   n_push_reserve_slow   reservations where the fast sweep over the pool
+    //                         found nothing and the thread entered the spin
+    //                         loop. Against n_push_reserve this is the rate.
+    //                         Near zero means case 2, near one means case 1.
+    //   ns_push_reserve_spins spin-loop iterations, NOT nanoseconds despite the
+    //                         ns_ prefix the rest of this struct uses for time.
+    //                         Named for placement beside its sibling; the
+    //                         derived metric divides it by n_push_reserve_slow
+    //                         to give iterations per slow reservation, which
+    //                         separates "briefly full" from "badly backed up".
+    //                         The unit is one UVM_SPIN_LOOP per CHANNEL
+    //                         examined, not per sweep of the pool, so a pool of
+    //                         two channels contributes two per full sweep.
+    //                         Read it as backoffs, and halve it if you want
+    //                         sweeps. Nothing downstream divides it by 1000,
+    //                         which is the mistake the ns_ prefix invites.
+    //
+    // Cost: the increment sits AFTER the fast sweep has already failed, so a
+    // reservation that succeeds first time executes nothing extra, not even the
+    // stats-level branch. Iterations accumulate in a local and are added once on
+    // exit, so the loop itself takes no atomic however long it runs.
+    //
+    // Containment, which is not obvious and is worth not re-deriving.
+    // push_reserve_slow_pct divides n_push_reserve_slow by n_push_reserve, and
+    // the two are incremented at different levels: n_push_reserve wraps
+    // push_reserve_channel in uvm_push.c, while these live one level down in
+    // channel_reserve_in_pool. That function has a second caller,
+    // uvm_channel_reserve_type from channel_rotate_and_reserve_launch_channel,
+    // which is outside the wrapped scope and would put the ratio above 100% if
+    // it ever ran alongside. It cannot. That caller sits inside
+    // "if (g_uvm_global.conf_computing_enabled)" in uvm_channel_begin_push, and
+    // the code these counters sit in is reached only AFTER
+    // channel_reserve_in_pool's own early return for the same condition. The
+    // two paths are mutually exclusive by construction, so
+    // n_push_reserve_slow <= n_push_reserve holds on any configuration.
+    atomic64_t n_push_reserve_slow;
+    atomic64_t ns_push_reserve_spins;
+
+    // Sub-phases of uvm_va_block_make_resident_copy, in TWO BANKS chosen by the
+    // cause argument. That function is shared: eviction reaches it through
+    // uvm_va_block_evict_chunks, and fault servicing reaches it through
+    // uvm_va_block_service_copy. Servicing migrations vastly outnumber
+    // evictions, so a single set of counters would let servicing swamp the
+    // eviction signal and would no longer sum inside ns_evict_resident.
+    //
+    //   *_unmap     both uvm_va_block_unmap_mask calls, accumulated into one
+    //               counter (two begin/end pairs, one destination)
+    //   *_populate  block_populate_pages. On the eviction path this allocates
+    //               the HOST destination and bottoms out in the Linux page
+    //               allocator (block_populate_pages_cpu ->
+    //               uvm_cpu_chunk_alloc_page -> alloc_pages). Sixteen threads
+    //               each moving 2 MB to host memory is per-zone lock pressure,
+    //               and it is NOT a push -- so without this counter an
+    //               allocator stall reads as "resident grows, pushes flat" and
+    //               gets misattributed to the tracker or the copy
+    //   *_copy      block_copy_resident_pages, which issues the push
+    //
+    // The evict bank is contained BY ns_evict_resident, so containment extends
+    // one level and evict_resident_accounted_pct is the check. The svc bank is
+    // contained by nothing in this struct -- never fold it into any eviction
+    // percentage. Each bank divides by its OWN count, never across banks.
+    //
+    // Deliberately NOT probed one level deeper: uvm_cpu_chunk_alloc_page runs
+    // inside a per-chunk loop and CPU chunks are 2 MB, 64 KB or 4 KB
+    // (uvm_pmm_sysmem.h), so a fragmented 2 MB eviction can make up to 512
+    // allocation calls. At roughly 60 ns of probe per call that is ~30 us added
+    // to a 13.85 us measurement, and even the 64 KB case adds ~14%. The probe
+    // would exceed the signal. If *_populate is what grows, drill in then, with
+    // the fragmentation known.
+    atomic64_t ns_evict_unmap;
+    atomic64_t ns_evict_populate;
+    atomic64_t ns_evict_copy;
+    atomic64_t n_evict_mkres;
+    atomic64_t ns_svc_unmap;
+    atomic64_t ns_svc_populate;
+    atomic64_t ns_svc_copy;
+    atomic64_t n_svc_mkres;
+
+    // How each eviction attempt ended. pick_and_evict_root_chunk returns
+    // NV_ERR_NO_MEMORY when no candidate exists and
+    // NV_ERR_MORE_PROCESSING_REQUIRED when chunks are in flight elsewhere;
+    // both leave the retry loop while still counting as an attempt, which is
+    // how a 2.7 us mean is possible against a 2 MB chunk copy. If in_flight
+    // dominates, the growth is collision churn between workers and the answer
+    // is a backoff rather than a lock. These three sum to n_evict_calls.
+    atomic64_t n_evict_no_candidate;
+    atomic64_t n_evict_in_flight;
+    atomic64_t n_evict_success;
+
+    // The two PMA eviction callbacks RM invokes with its API lock held. Hold
+    // time, not wait time. See the note above.
+    atomic64_t ns_pma_evict_cb;
+    atomic64_t n_pma_evict_cbs;
+
+    // va_block->lock in service_fault_batch_block, the GPU fault path shared
+    // by the dispatcher and every worker
+    atomic64_t ns_block_lock_wait_gpu;
+    atomic64_t n_block_lock_acqs_gpu;
+
+    // Whole-call cost of servicing one va_block's faults: service_fault_batch_block
+    // from entry to return, so it contains the block-lock wait above, the retry
+    // loop and the tracker merge. Divide by n_va_block_service for the mean cost
+    // of handling one block.
+    //
+    // This exists to make one number comparable across mechanisms that are
+    // otherwise structured differently. service_fault_batch_block is stock, so
+    // the serial path, a worker pool and a stage pipeline all pass through it
+    // once per block, and the same probe measures all three. Nothing else in
+    // this struct can be divided down to a per-block figure: ns_service is a
+    // whole-batch makespan, and the make-resident bank covers only the
+    // migration phase.
+    //
+    // Contains ns_block_lock_wait_gpu, so the two must never be summed.
+    atomic64_t ns_va_block_service;
+    atomic64_t n_va_block_service;
+
+    // va_block->lock in uvm_va_block_cpu_fault: how long CPU faults stall
+    // behind GPU servicing. Strictly the acquisition, not the servicing that
+    // follows it, which is why the CPU fault path uses the probed variant of
+    // UVM_VA_BLOCK_LOCK_RETRY rather than bracketing the macro.
+    atomic64_t ns_block_lock_wait_cpu;
+    atomic64_t n_cpu_faults;
+
+    // uvm_va_space_down_read in service_fault_batch_range
+    atomic64_t ns_va_space_lock_wait;
+    atomic64_t n_va_space_lock_acqs;
+
+    // Top-half trylock failures: interrupts arriving while a bottom half is
+    // already servicing. A count only, the failed trylock has no duration.
+    atomic64_t n_top_half_trylock_fail;
+
+    // Adaptive worker width, for observability. Without these an adaptive run
+    // reports only an end-to-end speedup, and a good number would be
+    // indistinguishable from the controller sitting still at a lucky width.
+    // sum/decisions gives the mean width actually used, and n_adapt_widen and
+    // n_adapt_narrow are the control-action count the stability argument is
+    // about (Hellerstein s11.1, "excessive control actions increase overheads").
+    //
+    // NOT gated on the probe level: this measures the mechanism rather than
+    // instrumenting a lock, it fires once per epoch (hundreds of times per
+    // run, against millions for the lock probes), and an adaptive run at
+    // level 0 still needs to be readable.
+    atomic64_t n_adapt_decisions;
+    atomic64_t sum_adapt_width;
+    atomic64_t n_adapt_widen;
+    atomic64_t n_adapt_narrow;
+} uvm_lock_contention_stats_t;
+
+extern uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
+
+static inline bool uvm_lock_probes_enabled(void)
+{
+    return uvm_perf_fault_stats_level >= 2;
+}
+
+static inline NvU64 uvm_lock_probe_begin(void)
+{
+    return uvm_lock_probes_enabled() ? NV_GETTIME() : 0;
+}
+
+// ns == NULL disables the probe entirely, which is how the unprobed users of
+// UVM_VA_BLOCK_LOCK_RETRY opt out. acqs == NULL accumulates time without
+// counting acquisitions. The enable test is repeated here rather than checking
+// t0, so that flipping the level between the two halves of a probe drops the
+// sample instead of recording an interval measured from zero.
+static inline void uvm_lock_probe_end(NvU64 t0, atomic64_t *ns, atomic64_t *acqs)
+{
+    if (!ns || !uvm_lock_probes_enabled())
+        return;
+
+    atomic64_add(NV_GETTIME() - t0, ns);
+
+    if (acqs)
+        atomic64_inc(acqs);
+}
+
+// Count an event that has no duration, under the same level gate as the timed
+// probes. Used for the eviction outcome counters, where what matters is which
+// of three exits the attempt took rather than how long it took to get there.
+static inline void uvm_lock_probe_count(atomic64_t *n)
+{
+    if (uvm_lock_probes_enabled())
+        atomic64_inc(n);
+}
+
+// Add a tally accumulated in a local, for loops where one atomic per iteration
+// would be the measurement rather than the thing measured. The caller keeps a
+// plain counter and hands it over once on exit. A zero tally is dropped so a
+// caller that never entered the loop adds nothing.
+static inline void uvm_lock_probe_add(atomic64_t *n, NvU64 count)
+{
+    if (count && uvm_lock_probes_enabled())
+        atomic64_add(count, n);
+}
+
 #endif // __UVM_LOCK_H__

@@ -71,6 +71,11 @@
 // Note that this means user space will get best allocation efficiency if it
 // allocates memory in 2^UVM_VA_BLOCK_BITS naturally-aligned chunks.
 
+// ARIADNE. Depth of the per-block source-uTLB ring whose distinct-ID count is
+// the Sharing Degree. Sixteen in their implementation, and the divisor in the
+// eviction priority key, so changing it changes the policy.
+#define UVM_PERF_PREFETCH_INFO_STORE_SIZE 16
+
 // enums used for indexing into the array of pte_bits bitmaps in the VA block
 // which hold the current state of each PTE. For a given {processor, PTE}, the
 // bits represented here must be enough to re-create the non-address portion of
@@ -490,7 +495,41 @@ struct uvm_va_block_struct
         uvm_processor_id_t last_migration_proc_id;
 
         NvU16 fault_migrations_to_last_proc;
+
+        // ARIADNE. last_migration_time is stamped from gpu->last_access_time
+        // on migration and eviction and drives both the WCSS retention window
+        // and the Zero-copy deadline. is_thrashed marks a block retained in
+        // the WCSS after eviction because the workload looks thrashing-prone,
+        // which is what makes it a Zero-copy candidate. used_entry is the
+        // back-pointer into gpu->used_blocks, NULL when the block is not
+        // counted. is_spled records that the block is currently host-pinned.
+        // thr_count counts how often it has been, and multiplies the pin time
+        // by five past the first.
+        NvU64 last_migration_time;
+        NvU8 is_thrashed;
+        uvm_used_entry *used_entry;
+        bool is_spled;
+        NvU8 thr_count;
     } prefetch_info;
+
+    // ARIADNE Sharing Degree. A ring of the source uTLB IDs of the most recent
+    // UVM_PERF_PREFETCH_INFO_STORE_SIZE non-prefetch faults on this block, with
+    // utlb_count maintained as the number of distinct IDs present, which is the
+    // Sharing Degree itself. diff_utlb_count tracks how volatile that count is,
+    // clamped to [0, 40] and initialised to 10.
+    //
+    // Two properties of the original worth knowing before reading any number
+    // off it. Every non-prefetch fault is pushed, not one entry per distinct
+    // uTLB per batch, so a warp storming one block from one uTLB fills the ring
+    // and yields a Sharing Degree of 1. And the ring is never cleared or aged,
+    // so a block that goes cold keeps its last Sharing Degree indefinitely.
+    struct
+    {
+        NvU8 recent_utlb_info[UVM_PERF_PREFETCH_INFO_STORE_SIZE];
+        NvU8 start;
+        NvU8 utlb_count;
+        NvU8 diff_utlb_count;
+    } utlb_info;
 
     struct
     {
@@ -602,6 +641,33 @@ struct uvm_va_block_retry_struct
     // when the operation is finished with uvm_va_block_retry_deinit().
     struct list_head used_chunks;
 };
+
+// Cumulative counters for the host OS operations performed on the migration
+// path: removing CPU mappings before pages migrate to a GPU, and creating the
+// sysmem DMA mappings a GPU needs in order to access CPU pages. These paths
+// run in many contexts (GPU fault bottom halves, CPU faults, explicit
+// migrations), some without a GPU at hand, so the counters are global rather
+// than per-GPU. Exposed via the cpu/host_op_stats procfs file.
+typedef struct
+{
+    // Time spent in and number of calls to unmap_mapping_range, plus pages
+    // covered by those calls
+    atomic64_t ns_unmap;
+    atomic64_t num_unmap_calls;
+    atomic64_t num_unmap_pages;
+
+    // Time spent creating sysmem GPU (DMA) mappings of CPU chunks, number of
+    // chunks mapped, and pages covered
+    atomic64_t ns_dma_map;
+    atomic64_t num_dma_map_chunks;
+    atomic64_t num_dma_map_pages;
+
+    // Number of (block, GPU) first-touch instances: GPU state allocations,
+    // each of which DMA-maps all populated CPU pages of the block
+    atomic64_t num_first_touch_blocks;
+} uvm_va_block_host_op_stats_t;
+
+extern uvm_va_block_host_op_stats_t g_uvm_va_block_host_op_stats;
 
 // Module load/exit
 NV_STATUS uvm_va_block_init(void);
@@ -2235,14 +2301,28 @@ NV_STATUS uvm_va_block_populate_pages_gpu(uvm_va_block_t *block,
 // that the block's lock has been unlocked and relocked whenever the function
 // call returns NV_ERR_MORE_PROCESSING_REQUIRED and this makes it clear that the
 // block's state is not locked across these calls.
-#define UVM_VA_BLOCK_LOCK_RETRY(va_block, block_retry, call) ({     \
+//
+// The body lives in UVM_VA_BLOCK_LOCK_RETRY_PROBED below, which additionally
+// times the lock acquisition. UVM_VA_BLOCK_LOCK_RETRY is that macro with the
+// probe disabled, so the two can never drift apart.
+
+// Times the block lock acquisition into the given counters. Only the acquire is
+// measured, deliberately: the macro holds the lock across the whole call, so
+// bracketing it from outside would measure servicing time rather than wait
+// time. Pass ns = NULL to disable the probe entirely.
+#define UVM_VA_BLOCK_LOCK_RETRY_PROBED(va_block, block_retry, ns, acqs, call) ({ \
     NV_STATUS __status;                                             \
     uvm_va_block_t *__block = (va_block);                           \
     uvm_va_block_retry_t *__retry = (block_retry);                  \
+    NvU64 __lock_wait_start;                                        \
                                                                     \
     uvm_va_block_retry_init(__retry);                               \
                                                                     \
+    __lock_wait_start = (ns) ? uvm_lock_probe_begin() : 0;          \
+                                                                    \
     uvm_mutex_lock(&__block->lock);                                 \
+                                                                    \
+    uvm_lock_probe_end(__lock_wait_start, (ns), (acqs));            \
                                                                     \
     do {                                                            \
         __status = (call);                                          \
@@ -2254,6 +2334,9 @@ NV_STATUS uvm_va_block_populate_pages_gpu(uvm_va_block_t *block,
                                                                     \
     __status;                                                       \
 })
+
+#define UVM_VA_BLOCK_LOCK_RETRY(va_block, block_retry, call) \
+    UVM_VA_BLOCK_LOCK_RETRY_PROBED(va_block, block_retry, NULL, NULL, call)
 
 // A helper macro for handling allocation-retry
 //

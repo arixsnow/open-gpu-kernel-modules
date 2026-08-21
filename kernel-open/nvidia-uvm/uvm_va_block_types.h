@@ -32,6 +32,42 @@
 #include <linux/migrate.h>
 #include <linux/nodemask.h>
 
+// ----------------------------------------------------------------------------
+// ARIADNE (HPCA'26) list-node types
+// ----------------------------------------------------------------------------
+//
+// These live here rather than in uvm_gpu.h because uvm_va_block_t needs a
+// uvm_used_entry back-pointer and uvm_gpu_t needs the list heads, so putting
+// them in uvm_gpu.h would force uvm_va_block.h to include it. This header is
+// already included by uvm_gpu.h, uvm_va_block.h and uvm_pmm_gpu.h alike, and
+// uvm_forward_decl.h above supplies both uvm_va_block_t and uvm_va_space_t.
+//
+// ARIADNE's own tree added #include "uvm_gpu.h" to uvm_va_block.h instead. On
+// 610 that header is far heavier than it was on 535, so the include is not
+// carried forward.
+
+// One VA block awaiting, or currently held in, the Zero-copy ("host-pinned")
+// state. Queued on uvm_gpu_t.spl_blocks while waiting and moved to
+// spled_blocks once pinned, with endtime giving the deadline at which the
+// unpin kthread revokes the GPU mapping.
+typedef struct
+{
+    NvU64 start;
+    uvm_va_space_t *va_space;
+    NvU64 endtime;
+    struct list_head spln;
+} uvm_pl_entry;
+
+// One VA block counted in the Working Chunk Set Size. Queued on
+// uvm_gpu_t.used_blocks; is_in_gpu distinguishes blocks currently resident
+// from ones retained speculatively after eviction.
+typedef struct
+{
+    uvm_va_block_t *block;
+    NvBool is_in_gpu;
+    struct list_head spln;
+} uvm_used_entry;
+
 // UVM_VA_BLOCK_BITS is 21, meaning the maximum block size is 2MB. Rationale:
 // - 2MB matches the largest Turing GPU page size so it's a natural fit
 // - 2MB won't span more than one PDE on any chip, so the VA blocks never need

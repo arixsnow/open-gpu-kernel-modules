@@ -45,6 +45,7 @@
 #include "uvm_va_policy.h"
 #include "uvm_conf_computing.h"
 #include "uvm_migrate.h"
+#include "uvm_procfs.h"
 
 typedef enum
 {
@@ -60,6 +61,8 @@ static struct kmem_cache *g_uvm_va_block_gpu_state_cache __read_mostly;
 static struct kmem_cache *g_uvm_page_mask_cache __read_mostly;
 static struct kmem_cache *g_uvm_va_block_context_cache __read_mostly;
 static struct kmem_cache *g_uvm_va_block_cpu_node_state_cache __read_mostly;
+
+uvm_va_block_host_op_stats_t g_uvm_va_block_host_op_stats;
 
 static int uvm_fault_force_sysmem __read_mostly = 0;
 module_param(uvm_fault_force_sysmem, int, S_IRUGO|S_IWUSR);
@@ -90,6 +93,19 @@ MODULE_PARM_DESC(uvm_exp_gpu_cache_sysmem,
                  "This is an experimental parameter that may cause correctness issues if used.");
 
 static void block_add_eviction_mappings_entry(void *args);
+
+// ARIADNE (HPCA'26). Coefficient in the eviction priority key,
+//
+//     key = (gpu->last_access_time >> 10) + ((coeff * SD) >> 4)
+//
+// where SD is the block's Sharing Degree and the victim is the minimum key.
+// The timestamp is nanoseconds shifted right by ten, so its unit is about
+// 1.024 us, and the SD term is coeff/16 of those units per unit of Sharing
+// Degree. At 1000000 that is roughly 62.5 ms of recency credit per unit of SD,
+// not the 100 us the paper states. Kept at their value, since their published
+// numbers came from it.
+static unsigned uvm_perf_SD_coeff_evictqueue = 1000000;
+module_param(uvm_perf_SD_coeff_evictqueue, uint, S_IRUGO);
 static void block_unmap_cpu(uvm_va_block_t *block,
                             uvm_va_block_context_t *block_context,
                             uvm_va_block_region_t region,
@@ -885,8 +901,69 @@ static block_phys_page_t block_phys_page(uvm_processor_id_t processor, int nid, 
     return (block_phys_page_t){ processor, page_index, nid };
 }
 
+static struct proc_dir_entry *g_va_block_host_op_stats_file;
+
+static int nv_procfs_read_va_block_host_op_stats(struct seq_file *s, void *v)
+{
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
+        return -EAGAIN;
+
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_unmap                 %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.ns_unmap));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_unmap_calls          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_unmap_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_unmap_pages          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_unmap_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_dma_map               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.ns_dma_map));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_dma_map_chunks       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_dma_map_chunks));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_dma_map_pages        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_dma_map_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "num_first_touch_blocks   %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_va_block_host_op_stats.num_first_touch_blocks));
+
+    uvm_up_read(&g_uvm_global.pm.lock);
+
+    return 0;
+}
+
+static int nv_procfs_read_va_block_host_op_stats_entry(struct seq_file *s, void *v)
+{
+    UVM_ENTRY_RET(nv_procfs_read_va_block_host_op_stats(s, v));
+}
+
+UVM_DEFINE_SINGLE_PROCFS_FILE(va_block_host_op_stats_entry);
+
+static NV_STATUS va_block_host_op_stats_procfs_init(void)
+{
+    struct proc_dir_entry *cpu_base_dir_entry = uvm_procfs_get_cpu_base_dir();
+
+    if (uvm_procfs_is_debug_enabled()) {
+        UVM_ASSERT(!g_va_block_host_op_stats_file);
+        g_va_block_host_op_stats_file = NV_CREATE_PROC_FILE("host_op_stats",
+                                                            cpu_base_dir_entry,
+                                                            va_block_host_op_stats_entry,
+                                                            &g_uvm_va_block_host_op_stats);
+        if (!g_va_block_host_op_stats_file)
+            return NV_ERR_OPERATING_SYSTEM;
+    }
+
+    return NV_OK;
+}
+
+static void va_block_host_op_stats_procfs_exit(void)
+{
+    if (g_va_block_host_op_stats_file) {
+        proc_remove(g_va_block_host_op_stats_file);
+        g_va_block_host_op_stats_file = NULL;
+    }
+}
+
 NV_STATUS uvm_va_block_init(void)
 {
+    NV_STATUS status;
+
     if (uvm_enable_builtin_tests)
         g_uvm_va_block_cache = NV_KMEM_CACHE_CREATE("uvm_va_block_wrapper_t", uvm_va_block_wrapper_t);
     else
@@ -912,11 +989,22 @@ NV_STATUS uvm_va_block_init(void)
     if (!g_uvm_va_block_cpu_node_state_cache)
         return NV_ERR_NO_MEMORY;
 
-    return NV_OK;
+    status = va_block_host_op_stats_procfs_init();
+    if (status != NV_OK)
+        return status;
+
+    status = uvm_fault_pipeline_stats_procfs_init();
+    if (status != NV_OK)
+        return status;
+
+    return uvm_lock_stats_procfs_init();
 }
 
 void uvm_va_block_exit(void)
 {
+    uvm_lock_stats_procfs_exit();
+    uvm_fault_pipeline_stats_procfs_exit();
+    va_block_host_op_stats_procfs_exit();
     kmem_cache_destroy_safe(&g_uvm_va_block_cpu_node_state_cache);
     kmem_cache_destroy_safe(&g_uvm_va_block_context_cache);
     kmem_cache_destroy_safe(&g_uvm_page_mask_cache);
@@ -1302,6 +1390,11 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
     uvm_tracker_init(&block->tracker);
     block->prefetch_info.last_migration_proc_id = UVM_ID_INVALID;
 
+    // ARIADNE (HPCA'26). The block is kzalloc'd, so only the non-zero
+    // initialiser matters: diff_utlb_count starts mid-range at 10 and is
+    // clamped to [0, 40] as the Sharing Degree proves steady or volatile.
+    block->utlb_info.diff_utlb_count = 10;
+
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
 
     *out_block = block;
@@ -1336,6 +1429,7 @@ static void cpu_chunk_remove_sysmem_gpu_mapping(uvm_cpu_chunk_t *chunk, uvm_gpu_
 static NV_STATUS cpu_chunk_add_sysmem_gpu_mapping(uvm_cpu_chunk_t *chunk, uvm_va_block_t *block, uvm_gpu_t *gpu)
 {
     NV_STATUS status;
+    NvU64 map_start_time;
 
     // When the Confidential Computing feature is enabled the transfers don't
     // use the DMA mapping of CPU chunks (since it's protected memory), but
@@ -1343,9 +1437,14 @@ static NV_STATUS cpu_chunk_add_sysmem_gpu_mapping(uvm_cpu_chunk_t *chunk, uvm_va
     if (g_uvm_global.conf_computing_enabled)
         return NV_OK;
 
+    map_start_time = NV_GETTIME();
     status = uvm_cpu_chunk_map_gpu(chunk, gpu);
     if (status != NV_OK)
         return status;
+
+    atomic64_add(NV_GETTIME() - map_start_time, &g_uvm_va_block_host_op_stats.ns_dma_map);
+    atomic64_inc(&g_uvm_va_block_host_op_stats.num_dma_map_chunks);
+    atomic64_add(uvm_cpu_chunk_num_pages(chunk), &g_uvm_va_block_host_op_stats.num_dma_map_pages);
 
     // If this GPU requires physical invalidations for new DMA mappings, tell
     // the next relevant operation to issue one before accessing the mapping.
@@ -1418,6 +1517,8 @@ uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get_alloc(uvm_va_block_t *block
     status = block_gpu_map_phys_all_cpu_pages(block, gpu);
     if (status != NV_OK)
         goto error;
+
+    atomic64_inc(&g_uvm_va_block_host_op_stats.num_first_touch_blocks);
 
     return gpu_state;
 
@@ -3397,8 +3498,30 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
     // If the block is of the max size, mark the root chunk as used in PMM.
     // HMM always allocates PAGE_SIZE GPU chunks so skip HMM va_blocks.
     if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
+        uvm_pmm_gpu_t *pmm = &gpu->pmm;
+        uvm_gpu_chunk_t *chunk;
+        NvU32 sd;
+        NvU64 key;
+
         // The chunk has to be there if this GPU is resident
         UVM_ASSERT(uvm_processor_mask_test(&block->resident, id));
+
+        chunk = uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0];
+
+        // ARIADNE (HPCA'26) eviction priority. The timestamp is the per-batch
+        // logical clock in units of about 1.024 us, and the Sharing Degree adds
+        // recency credit proportional to how many uTLBs are touching the block,
+        // so densely shared blocks survive longer. The victim scan takes the
+        // minimum key.
+        sd = (NvU32)block->utlb_info.utlb_count;
+        key = (gpu->last_access_time >> 10) +
+              (((NvU64)uvm_perf_SD_coeff_evictqueue * sd) >> 4);
+
+        uvm_spin_lock(&pmm->list_lock);
+        chunk->last_access_time = gpu->last_access_time;
+        chunk->key = key;
+        uvm_spin_unlock(&pmm->list_lock);
+
         uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm, uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0]);
     }
 }
@@ -4702,6 +4825,22 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
     uvm_processor_mask_t *unmap_processor_mask;
     uvm_page_mask_t *unmap_page_mask = &va_block_context->make_resident.page_mask;
     uvm_page_mask_t *resident_mask;
+    NvU64 t0;
+
+    // Two counter banks, picked once here. This function is shared: eviction
+    // arrives via uvm_va_block_evict_chunks and fault servicing via
+    // uvm_va_block_service_copy. Servicing migrations vastly outnumber
+    // evictions, so one bank would let servicing swamp the eviction signal and
+    // would stop the phases summing inside ns_evict_resident.
+    const bool is_evict = (cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION);
+    atomic64_t *ns_mkres_unmap = is_evict ? &g_uvm_lock_contention_stats.ns_evict_unmap
+                                          : &g_uvm_lock_contention_stats.ns_svc_unmap;
+    atomic64_t *ns_mkres_populate = is_evict ? &g_uvm_lock_contention_stats.ns_evict_populate
+                                             : &g_uvm_lock_contention_stats.ns_svc_populate;
+    atomic64_t *ns_mkres_copy = is_evict ? &g_uvm_lock_contention_stats.ns_evict_copy
+                                         : &g_uvm_lock_contention_stats.ns_svc_copy;
+    atomic64_t *n_mkres = is_evict ? &g_uvm_lock_contention_stats.n_evict_mkres
+                                   : &g_uvm_lock_contention_stats.n_svc_mkres;
 
     va_block_context->make_resident.dest_id = dest_id;
     va_block_context->make_resident.cause = cause;
@@ -4737,8 +4876,23 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
         uvm_page_mask_complement(unmap_page_mask, resident_mask);
     uvm_page_mask_region_clear_outside(unmap_page_mask, region);
 
-    // Unmap all pages not resident on the destination
+    // Unmap all pages not resident on the destination. Both unmap calls
+    // accumulate into the same counter: two begin/end pairs, one destination,
+    // because what matters is the unmap phase as a whole against the other two.
+    t0 = uvm_lock_probe_begin();
+
     status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+
+    // Counted at the FIRST phase, not the last, so the denominator is calls
+    // that entered the phase sequence rather than calls that completed it.
+    // Counting at the end would make an aborted call inflate the per-call time
+    // of every phase that did run. The residual skew is the reverse -- a call
+    // that fails at unmap or populate leaves the later phases with fewer
+    // samples than n_mkres -- and it is bounded by how often those phases fail,
+    // which the existing data puts at zero (evict_success_pct is 100.0).
+    // evict_resident_accounted_pct is the detector if that ever changes.
+    uvm_lock_probe_end(t0, ns_mkres_unmap, n_mkres);
+
     if (status != NV_OK)
         goto out;
 
@@ -4750,7 +4904,13 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
 
     // Also unmap read-duplicated pages excluding dest_id
     uvm_processor_mask_clear(unmap_processor_mask, dest_id);
+
+    t0 = uvm_lock_probe_begin();
+
     status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+
+    uvm_lock_probe_end(t0, ns_mkres_unmap, NULL);
+
     if (status != NV_OK)
         goto out;
 
@@ -4769,9 +4929,22 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
                       &va_block_context->discard.scratch_page_mask,
                       &va_block->discarded_pages);
 
+    // Allocating the destination. On the eviction path dest_id is the CPU, so
+    // this reaches the Linux page allocator through block_populate_pages_cpu ->
+    // uvm_cpu_chunk_alloc_page -> alloc_pages. It is not a push, so without
+    // this counter an allocator stall is invisible to the push probes and gets
+    // misread as tracker or copy time.
+    t0 = uvm_lock_probe_begin();
+
     status = block_populate_pages(va_block, va_block_retry, va_block_context, dest_id, region, page_mask);
+
+    uvm_lock_probe_end(t0, ns_mkres_populate, NULL);
+
     if (status != NV_OK)
         goto out;
+
+    // The copy, which issues the push and so contains the three push probes.
+    t0 = uvm_lock_probe_begin();
 
     status = block_copy_resident_pages(va_block,
                                        va_block_context,
@@ -4780,6 +4953,10 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
                                        page_mask,
                                        prefetch_page_mask,
                                        UVM_VA_BLOCK_TRANSFER_MODE_MOVE);
+
+    // Closed before the error handling below so a failed copy still records the
+    // time it spent.
+    uvm_lock_probe_end(t0, ns_mkres_copy, NULL);
 
     // HMM does its own clean up.
     if (status != NV_OK && !uvm_va_block_is_hmm(va_block)) {
@@ -4904,8 +5081,14 @@ void uvm_va_block_make_resident_finish(uvm_va_block_t *va_block,
     //
     // Skip this if we didn't do anything (the input region and/or page mask was
     // empty).
-    if (uvm_processor_mask_test(&va_block->resident, dst_id))
-        block_mark_memory_used(va_block, dst_id);
+    // ARIADNE (HPCA'26). Suppressed so the eviction key is stamped once per
+    // residency transition, from block_set_resident_processor, rather than
+    // again on every make-resident. Their tree comments this call out for the
+    // same reason. The ever_fully_resident update below is stock 610 and stays,
+    // since block_populate_gpu_chunk reads it.
+    //
+    // if (uvm_processor_mask_test(&va_block->resident, dst_id))
+    //     block_mark_memory_used(va_block, dst_id);
 
     if (UVM_ID_IS_GPU(dst_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dst_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dst_id);
@@ -5158,8 +5341,11 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
     //
     // Skip this if we didn't do anything (the input region and/or page mask was
     // empty).
-    if (uvm_processor_mask_test(&va_block->resident, dest_id))
-        block_mark_memory_used(va_block, dest_id);
+    // ARIADNE (HPCA'26). Suppressed for the same reason as the equivalent call
+    // in uvm_va_block_make_resident_finish above.
+    //
+    // if (uvm_processor_mask_test(&va_block->resident, dest_id))
+    //     block_mark_memory_used(va_block, dest_id);
 
     if (UVM_ID_IS_GPU(dest_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dest_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_id);
@@ -5793,10 +5979,17 @@ static void block_unmap_cpu(uvm_va_block_t *block,
         // We can't actually unmap HMM ranges from the CPU here. Unmapping
         // happens as part of migrate_vma_setup(), but we need to record the
         // updated CPU mapping information in the va_block.
-        if (!uvm_va_block_is_hmm(block))
+        if (!uvm_va_block_is_hmm(block)) {
+            NvU64 unmap_start_time = NV_GETTIME();
+
             unmap_mapping_range(va_space->mapping,
                                 uvm_va_block_region_start(block, subregion),
                                 uvm_va_block_region_size(subregion), 1);
+
+            atomic64_add(NV_GETTIME() - unmap_start_time, &g_uvm_va_block_host_op_stats.ns_unmap);
+            atomic64_inc(&g_uvm_va_block_host_op_stats.num_unmap_calls);
+            atomic64_add(uvm_va_block_region_num_pages(subregion), &g_uvm_va_block_host_op_stats.num_unmap_pages);
+        }
 
         for (pte_bit = 0; pte_bit < UVM_PTE_BITS_CPU_MAX; pte_bit++)
             uvm_page_mask_region_clear(&block->cpu.pte_bits[pte_bit], subregion);
@@ -11171,7 +11364,13 @@ static uvm_processor_id_t block_select_processor_residency(uvm_va_block_t *va_bl
         return UVM_ID_CPU;
     }
 
-    may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
+    // ARIADNE (HPCA'26) forces this false. A read-duplicated page is resident
+    // in more than one place at once, so it has no single residency for the
+    // Sharing Degree to describe or for Zero-copy to pin, and the host-pin path
+    // in uvm_policy.c would refuse it. Their tree makes the same change.
+    //
+    // may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
+    may_read_duplicate = false;
 
     // Read/prefetch faults on a VA range with read duplication enabled
     // always create a copy of the page on the faulting processor's memory.
@@ -12450,13 +12649,21 @@ NV_STATUS uvm_va_block_cpu_fault(uvm_va_block_t *va_block,
     // That is, there must be a reference held on the vma's vm_mm, and
     // vm_mm->mmap_lock is held in at least read mode. Note that current->mm
     // might not be vma->vm_mm.
-    status = UVM_VA_BLOCK_LOCK_RETRY(va_block,
-                                     &va_block_retry,
-                                     block_cpu_fault_locked(va_block,
-                                                            &va_block_retry,
-                                                            fault_addr,
-                                                            fault_access_type,
-                                                            service_context));
+    // How long CPU faults stall behind GPU servicing of the same block. The
+    // probed variant times the acquisition inside the macro; the macro holds
+    // the block lock for the whole of block_cpu_fault_locked, so timing it from
+    // out here would measure servicing rather than waiting. The other callers
+    // of UVM_VA_BLOCK_LOCK_RETRY (block discard among them) pass no counters,
+    // so their waits stay out of this number.
+    status = UVM_VA_BLOCK_LOCK_RETRY_PROBED(va_block,
+                                            &va_block_retry,
+                                            &g_uvm_lock_contention_stats.ns_block_lock_wait_cpu,
+                                            &g_uvm_lock_contention_stats.n_cpu_faults,
+                                            block_cpu_fault_locked(va_block,
+                                                                   &va_block_retry,
+                                                                   fault_addr,
+                                                                   fault_access_type,
+                                                                   service_context));
     return status;
 }
 
@@ -12861,6 +13068,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     uvm_va_space_t *va_space = uvm_va_block_get_va_space_maybe_dead(va_block);
     struct mm_struct *mm;
     bool accessed_by_set = false;
+    NvU64 t0;
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -12883,6 +13091,15 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     // block_add_eviction_mappings() will be scheduled below.
     mm = uvm_va_space_mm_retain(va_space);
 
+    // Timed because it is one of the two candidates for the serial section
+    // ns_evict_chunks exposed: cost per call rising 5x across the worker ladder
+    // at fixed work. Note this runs before the chunk walk below decides whether
+    // there is anything to evict at all, so every call pays it, and it is more
+    // than one slab allocation -- the context carries a page mask per possible
+    // NUMA node. The failure return leaves the probe unclosed on purpose: a
+    // sample is only meaningful for a call that got a context.
+    t0 = uvm_lock_probe_begin();
+
     service_context = uvm_service_block_context_alloc(mm);
     if (!service_context) {
         if (mm)
@@ -12890,6 +13107,13 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
 
         return NV_ERR_NO_MEMORY;
     }
+
+    // Counted, not shared with n_evict_block_lock_acqs: the three early returns
+    // above increment that one without reaching any phase, so it is the wrong
+    // denominator here and its ratio to this count is how often they fire.
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_evict_ctx_alloc,
+                       &g_uvm_lock_contention_stats.n_evict_ctx_alloc);
 
     block_context = service_context->block_context;
 
@@ -12901,6 +13125,12 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     pages_to_evict = &block_context->caller_page_mask;
     uvm_page_mask_zero(pages_to_evict);
     chunk_region.outer = 0;
+
+    // The walk is timed separately from the migration that follows it because
+    // the two carry opposite verdicts. If this is what grows with worker count
+    // then each call really is doing more work and the fixed-work premise
+    // behind the serial-section reading is wrong.
+    t0 = uvm_lock_probe_begin();
 
     // Find all chunks that are subchunks of the root chunk
     for (i = 0; i < num_gpu_chunks; ++i) {
@@ -12925,6 +13155,10 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
         ++chunks_to_evict;
     }
 
+    // Closed before the early exit so a call that finds nothing still records
+    // the walk it did to find that out.
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_scan, NULL);
+
     if (chunks_to_evict == 0)
         goto out;
 
@@ -12937,6 +13171,14 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
+
+    // The migration proper, and the leading candidate for the growth. One probe
+    // spans the whole if/else rather than one per arm, so the three sub-phases
+    // still partition the call whichever path a block takes. This is the part
+    // that pushes to the GPU, so a rise here is read together with ns_push_sema
+    // and ns_push_claim: with either of those it is the shared push path, with
+    // neither it is the tracker or the copy and not a queue at all.
+    t0 = uvm_lock_probe_begin();
 
     if (uvm_va_block_is_hmm(va_block)) {
         status = uvm_hmm_va_block_evict_chunks(va_block,
@@ -12973,6 +13215,14 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                                             NULL,
                                             UVM_MAKE_RESIDENT_CAUSE_EVICTION);
     }
+
+    // Closed before the status check so a failed migration still records the
+    // time it spent before failing. Counted separately from ctx_alloc because
+    // the chunks_to_evict == 0 exit above skips this phase and not that one.
+    uvm_lock_probe_end(t0,
+                       &g_uvm_lock_contention_stats.ns_evict_resident,
+                       &g_uvm_lock_contention_stats.n_evict_resident);
+
     if (status != NV_OK)
         goto out;
 

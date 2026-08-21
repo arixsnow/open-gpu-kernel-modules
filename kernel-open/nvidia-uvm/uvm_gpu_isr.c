@@ -97,8 +97,16 @@ static unsigned schedule_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
 
     // Use raw call instead of UVM helper. Ownership will be recorded in the
     // bottom half. See comment replayable_faults_isr_bottom_half().
-    if (down_trylock(&parent_gpu->isr.replayable_faults.service_lock.sem) != 0)
+    if (down_trylock(&parent_gpu->isr.replayable_faults.service_lock.sem) != 0) {
+        // A bottom half is already servicing this GPU, so the interrupt is
+        // backlog rather than new work. Counted, not timed: this runs in hard
+        // IRQ context with interrupts_lock held and fires on every contended
+        // interrupt, and a failed trylock has no wait to measure anyway.
+        if (uvm_lock_probes_enabled())
+            atomic64_inc(&g_uvm_lock_contention_stats.n_top_half_trylock_fail);
+
         return 0;
+    }
 
     if (!uvm_parent_gpu_replayable_faults_pending(parent_gpu)) {
         up(&parent_gpu->isr.replayable_faults.service_lock.sem);
@@ -109,6 +117,8 @@ static unsigned schedule_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
 
     // Interrupts need to be disabled here to avoid an interrupt storm
     uvm_parent_gpu_replayable_faults_intr_disable(parent_gpu);
+
+    parent_gpu->isr.replayable_faults.stats.bh_schedule_timestamp = NV_GETTIME();
 
     // Schedule a bottom half, but do *not* release the GPU ISR lock. The bottom
     // half releases the GPU ISR lock as part of its cleanup.
@@ -284,7 +294,7 @@ NV_STATUS uvm_isr_top_half_entry(const NvProcessorUuid *gpu_uuid)
     UVM_ENTRY_RET(uvm_isr_top_half(gpu_uuid));
 }
 
-static NV_STATUS init_queue_on_node(nv_kthread_q_t *queue, const char *name, int node)
+NV_STATUS uvm_isr_init_queue_on_node(nv_kthread_q_t *queue, const char *name, int node)
 {
 #if UVM_THREAD_AFFINITY_SUPPORTED()
     if (node != -1 && !cpumask_empty(cpumask_of_node(node))) {
@@ -382,7 +392,9 @@ NV_STATUS uvm_parent_gpu_init_isr(uvm_parent_gpu_t *parent_gpu)
     parent_gpu->isr.replayable_faults.handling = true;
 
     snprintf(kthread_name, sizeof(kthread_name), "UVM GPU%u BH", uvm_parent_id_value(parent_gpu->id));
-    status = init_queue_on_node(&parent_gpu->isr.bottom_half_q, kthread_name, parent_gpu->closest_cpu_numa_node);
+    status = uvm_isr_init_queue_on_node(&parent_gpu->isr.bottom_half_q,
+                                        kthread_name,
+                                        parent_gpu->closest_cpu_numa_node);
     if (status != NV_OK) {
         UVM_ERR_PRINT("Failed in nv_kthread_q_init for bottom_half_q: %s, GPU %s\n",
                       nvstatusToString(status),
@@ -409,7 +421,7 @@ NV_STATUS uvm_parent_gpu_init_isr(uvm_parent_gpu_t *parent_gpu)
     parent_gpu->isr.non_replayable_faults.handling = true;
 
     snprintf(kthread_name, sizeof(kthread_name), "UVM GPU%u KC", uvm_parent_id_value(parent_gpu->id));
-    status = init_queue_on_node(&parent_gpu->isr.kill_channel_q,
+    status = uvm_isr_init_queue_on_node(&parent_gpu->isr.kill_channel_q,
                                 kthread_name,
                                 parent_gpu->closest_cpu_numa_node);
     if (status != NV_OK) {
@@ -593,6 +605,7 @@ static void replayable_faults_isr_bottom_half(void *args)
 {
     uvm_parent_gpu_t *parent_gpu = (uvm_parent_gpu_t *)args;
     unsigned int cpu;
+    NvU64 bh_queue_delay;
 
     // Record the lock ownership
     // The service_lock semaphore is taken in the top half using a raw
@@ -611,6 +624,12 @@ static void replayable_faults_isr_bottom_half(void *args)
     cpumask_set_cpu(cpu, &parent_gpu->isr.replayable_faults.stats.cpus_used_mask);
     ++parent_gpu->isr.replayable_faults.stats.cpu_exec_count[cpu];
     put_cpu();
+
+    bh_queue_delay = NV_GETTIME() - parent_gpu->isr.replayable_faults.stats.bh_schedule_timestamp;
+    parent_gpu->fault_buffer.replayable.stats.ns_bh_queue_delay += bh_queue_delay;
+
+    // Mirror into the module-lifetime global aggregate (cpu/fault_stats).
+    atomic64_add(bh_queue_delay, &g_uvm_fault_pipeline_stats.ns_bh_queue_delay);
 
     uvm_parent_gpu_service_replayable_faults(parent_gpu);
 
