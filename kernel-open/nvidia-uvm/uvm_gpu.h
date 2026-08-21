@@ -405,6 +405,11 @@ struct uvm_fault_service_batch_context_struct
 
     NvU32 num_replays;
 
+    // ARIADNE (HPCA'26). Number of distinct VA blocks this batch touches, and
+    // the number of valid entries in gpu->batch_blocks. Also gates the
+    // Populate/Copy pipeline, which does nothing on an empty batch.
+    NvU32 num_block_faults;
+
     uvm_ats_fault_context_t ats_context;
 
     // Unique id (per-GPU) generated for tools events recording

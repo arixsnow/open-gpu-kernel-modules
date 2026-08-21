@@ -275,15 +275,10 @@ const char *uvm_pmm_gpu_chunk_state_string(uvm_pmm_gpu_chunk_state_t state)
     }
 }
 
-// The PMA APIs that can be called from PMA eviction callbacks (pmaPinPages and
-// pmaFreePages*) need to be called differently depending whether it's as part
-// of PMA eviction or not. The PMM context is used to plumb that information
-// through the stack in a couple of places.
-typedef enum
-{
-    PMM_CONTEXT_DEFAULT,
-    PMM_CONTEXT_PMA_EVICTION,
-} uvm_pmm_context_t;
+// ARIADNE (HPCA'26) moved uvm_pmm_context_t to uvm_pmm_gpu.h so the eviction
+// kthread in uvm_gpu_replayable_faults.c can name PMM_CONTEXT_DEFAULT when it
+// calls evict_root_chunk. The definition now lives there; the comment that
+// explained it stays with it.
 
 // Freeing the root chunk not only needs to differentiate between two different
 // contexts for calling pmaFreePages(), but also in some cases the free back to
@@ -328,7 +323,7 @@ static struct list_head *find_free_list(uvm_pmm_gpu_t *pmm,
                                         uvm_pmm_list_zero_t zero_type);
 static bool check_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static struct list_head *find_free_list_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
-static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
+void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 
 static size_t root_chunk_index(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk)
 {
@@ -1213,6 +1208,54 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
 
     uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_chunks, NULL);
 
+    // ARIADNE (HPCA'26). The block has just left GPU memory, so decide whether
+    // it leaves the Working Chunk Set Size with it, or is retained as a
+    // Zero-copy candidate.
+    //
+    // Retained when the workload looks like it will want the block back: either
+    // the average Sharing Degree is low, meaning sparse access that thrashes
+    // badly, or demand already exceeds what is resident by more than ten per
+    // cent. A retained block is queued for host-pinning, so the next access maps
+    // it remotely instead of dragging it back across PCIe.
+    //
+    // used_entry is NULL-checked, which theirs does not do. Their invariant is
+    // that every block reaching eviction was counted by the populate path, and
+    // on 610 that does not hold: the populate side only counts full 2 MB
+    // non-HMM blocks, and the reaper in the fault loop can have already
+    // dropped the entry.
+    if (va_block->prefetch_info.used_entry) {
+        uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+
+        va_block->prefetch_info.last_migration_time = NV_GETTIME();
+        va_block->prefetch_info.used_entry->is_in_gpu = 0;
+
+        if (uvm_perf_SDaware &&
+            (gpu->per_gpu_count_avg <= uvm_dynzero_thr_avg_sd ||
+             gpu->active_blocks > (gpu->man_size * 11) / 10)) {
+            va_block->prefetch_info.is_thrashed = 1;
+        }
+
+        if (va_block->prefetch_info.is_thrashed) {
+            uvm_pl_entry *pl_entry;
+
+            NV_KMALLOC(pl_entry, sizeof(*pl_entry));
+            if (pl_entry) {
+                pl_entry->va_space = uvm_va_block_get_va_space(va_block);
+                pl_entry->start = va_block->start;
+                pl_entry->endtime = 0;
+                list_add_tail(&pl_entry->spln, &gpu->spl_blocks);
+            }
+        }
+        else {
+            list_del_init(&va_block->prefetch_info.used_entry->spln);
+            NV_KFREE(va_block->prefetch_info.used_entry, sizeof(uvm_used_entry));
+            va_block->prefetch_info.used_entry = NULL;
+
+            if (gpu->active_blocks > 0)
+                gpu->active_blocks--;
+        }
+    }
+
     uvm_mutex_unlock(&va_block->lock);
 
     // The block has been retained by find_and_retain_va_block_to_evict(),
@@ -1329,7 +1372,7 @@ static bool root_chunk_has_elevated_page(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_
     return page_count(page) > UVM_CHUNK_SIZE_MAX / PAGE_SIZE;
 }
 
-static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, uvm_pmm_context_t pmm_context)
+NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, uvm_pmm_context_t pmm_context)
 {
     NV_STATUS status;
     NV_STATUS free_status;
@@ -1549,10 +1592,67 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
             UVM_ASSERT(chunk->is_zero);
     }
 
-    // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
-    // they get mapped.
-    if (!chunk)
-        chunk = get_first_allocated_chunk(pmm);
+    // ARIADNE (HPCA'26) victim selection, replacing the stock
+    // "first allocated chunk" fallback.
+    //
+    // Two things change. Chunks whose VA block is being serviced in the current
+    // fault batch are skipped, because evicting one would undo work in flight.
+    // And with uvm_perf_SDaware on, the victim is the minimum eviction key
+    // rather than the head of the list, so a block touched by many uTLBs earns
+    // recency credit and survives longer than a sparsely accessed one.
+    //
+    // Scoped to UVM_PMM_ALLOC_LIST_USED only. 610 split the old single
+    // va_block_used list into three, and the other two are wrong here: UNUSED
+    // chunks have no VA block to have a Sharing Degree, and DISCARDED did not
+    // exist when this policy was designed. The stock fallback above walked all
+    // three, so if the SD scan finds nothing this returns NULL and the caller
+    // reports no memory, exactly as theirs does.
+    if (!chunk) {
+        uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+        uvm_gpu_chunk_t *tmp;
+        NvU64 min_key = 0;
+
+        list_for_each_entry(tmp, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+            NvU32 i;
+            bool in_batch = false;
+
+            // Touched by the batch being serviced right now.
+            if (tmp->last_access_time == gpu->last_access_time)
+                continue;
+
+            // Populated but not yet attached to a block, i.e. mid-flight
+            // between the populate and copy stages.
+            if (!tmp->va_block)
+                continue;
+
+            for (i = 0; i < UVM_ARIADNE_BATCH_BLOCKS_MAX && gpu->batch_blocks[i] != 0; i++) {
+                if (gpu->batch_blocks[i] == (tmp->va_block->start / UVM_VA_BLOCK_SIZE)) {
+                    in_batch = true;
+                    break;
+                }
+            }
+
+            if (in_batch)
+                continue;
+
+            if (uvm_perf_SDaware) {
+                if (min_key == 0 || min_key > tmp->key) {
+                    chunk = tmp;
+                    min_key = tmp->key;
+                }
+            }
+            else {
+                // Without the Sharing Degree policy this degrades to the first
+                // eligible chunk, which is the stock behaviour plus the batch
+                // exclusion. This is the no-PL-SD ablation arm.
+                chunk = tmp;
+                break;
+            }
+        }
+
+        if (chunk)
+            gpu->oversubed = 6000;
+    }
 
     if (chunk)
         chunk_start_eviction(pmm, chunk);
@@ -1563,6 +1663,63 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
         return root_chunk_from_chunk(pmm, chunk);
 
     return NULL;
+}
+
+// ARIADNE (HPCA'26). Victim picker for the proactive eviction kthread, which
+// runs ahead of demand rather than in response to a failed allocation.
+//
+// Unlike pick_root_chunk_to_evict there is no free-list preamble: the thread is
+// only woken when free chunks are already scarce, so going straight to the used
+// list is the point.
+//
+// Their version declares chunk uninitialised, writes through it before the
+// if (chunk) guard, and so dereferences stack garbage under pmm->list_lock
+// whenever the scan finds no candidate. On a 4090 under deep oversubscription
+// that is a reachable path, not a theoretical one, and it is a wild kernel
+// write. Initialised here, and the write moved inside the guard.
+uvm_gpu_root_chunk_t *pick_used_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
+{
+    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+    uvm_gpu_chunk_t *chunk = NULL;
+    uvm_gpu_chunk_t *tmp;
+    NvU64 min_key = 0;
+
+    uvm_spin_lock(&pmm->list_lock);
+
+    list_for_each_entry(tmp, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        NvU32 i;
+        bool in_batch = false;
+
+        if (tmp->last_access_time == gpu->last_access_time)
+            continue;
+
+        if (!tmp->va_block)
+            continue;
+
+        for (i = 0; i < UVM_ARIADNE_BATCH_BLOCKS_MAX && gpu->batch_blocks[i] != 0; i++) {
+            if (gpu->batch_blocks[i] == (tmp->va_block->start / UVM_VA_BLOCK_SIZE)) {
+                in_batch = true;
+                break;
+            }
+        }
+
+        if (in_batch)
+            continue;
+
+        if (min_key == 0 || min_key > tmp->key) {
+            chunk = tmp;
+            min_key = tmp->key;
+        }
+    }
+
+    if (chunk) {
+        gpu->oversubed = 6000;
+        chunk_start_eviction(pmm, chunk);
+    }
+
+    uvm_spin_unlock(&pmm->list_lock);
+
+    return chunk ? root_chunk_from_chunk(pmm, chunk) : NULL;
 }
 
 static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
@@ -2346,7 +2503,7 @@ static bool chunk_is_last_allocated_child(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *c
     return chunk->parent->suballoc->allocated == 1;
 }
 
-static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
 

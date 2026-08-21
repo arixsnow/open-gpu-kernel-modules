@@ -3019,6 +3019,46 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
 
     gpu_state->chunks[chunk_index] = chunk;
 
+    // ARIADNE (HPCA'26). Count this block in the Working Chunk Set Size, the
+    // estimate of what the workload actually demands, measured in 2 MB blocks
+    // rather than bytes. The host-pin decision is driven by the surplus of WCSS
+    // over what is resident, so a block has to be counted from the moment it
+    // first gets GPU backing.
+    //
+    // is_thrashed records that the block has been migrated before, which is
+    // what later makes it a Zero-copy candidate rather than a straight eviction.
+    //
+    // Restricted to full 2 MB non-HMM blocks. Theirs counts whatever reaches
+    // here, relying on an invariant that only max-size blocks do. That does not
+    // hold on 610, where HMM and sub-chunk blocks share this path, and counting
+    // them would inflate the WCSS with entries the eviction side never removes.
+    if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
+        if (!block->prefetch_info.used_entry) {
+            uvm_used_entry *used_entry;
+
+            NV_KMALLOC(used_entry, sizeof(*used_entry));
+            if (used_entry) {
+                block->prefetch_info.is_thrashed = (block->prefetch_info.last_migration_time != 0);
+                used_entry->block = block;
+                used_entry->is_in_gpu = 1;
+                block->prefetch_info.used_entry = used_entry;
+                list_add_tail(&used_entry->spln, &gpu->used_blocks);
+                gpu->active_blocks++;
+            }
+
+            // A failed allocation only costs accuracy in the WCSS estimate, so
+            // it is not worth failing the populate over.
+        }
+        else {
+            block->prefetch_info.used_entry->is_in_gpu = 1;
+        }
+
+        if (chunk_index == 0)
+            gpu->cur_chg_2mb_pages++;
+    }
+
+    chunk->last_access_time = gpu->last_access_time;
+
     return NV_OK;
 
 chunk_unmap:

@@ -1219,6 +1219,52 @@ static NV_STATUS preprocess_fault_batch(uvm_parent_gpu_t *parent_gpu,
          cmp_sort_fault_entry_by_va_space_gpu_address_access_type,
          NULL);
 
+    // ARIADNE (HPCA'26). Build the set of VA blocks this batch touches, which
+    // the eviction victim scan uses to avoid evicting a block that is being
+    // serviced right now. The cache is already sorted by address, so distinct
+    // blocks are the runs of equal index.
+    //
+    // Two departures from their version, both deliberate.
+    //
+    // The write is clamped. Theirs increments through a bare [256] with no
+    // bound, and the fields immediately after it are the four kthread pointers,
+    // the copy payload and the pin mutex, so an overrun corrupts them. On their
+    // A5000 at the stock batch cap the array happens to fit exactly, but
+    // phase-0 measured this driver's fetch loop running 350 to 450 faults per
+    // batch at that same cap, so it does not fit here. Excess blocks are
+    // dropped rather than written past the end, which only makes the exclusion
+    // set incomplete and costs at worst an eviction that should have been
+    // skipped.
+    //
+    // The index keys on address alone, as theirs does, so blocks at the same
+    // offset in different VA spaces collide and the set over-excludes. That is
+    // harmless for single-process runs, which is all the ARIADNE arms do.
+    {
+        uvm_gpu_t *gpu = ariadne_gpu(parent_gpu);
+
+        if (gpu && batch_context->num_coalesced_faults > 0) {
+            NvU32 last_blk_id;
+            NvU32 i;
+
+            batch_context->num_block_faults = 1;
+            gpu->batch_blocks[0] = ordered_fault_cache[0]->fault_address / UVM_VA_BLOCK_SIZE;
+            last_blk_id = gpu->batch_blocks[0];
+
+            for (i = 1; i < batch_context->num_coalesced_faults; i++) {
+                NvU32 current_blk_id = ordered_fault_cache[i]->fault_address / UVM_VA_BLOCK_SIZE;
+
+                if (current_blk_id != last_blk_id) {
+                    last_blk_id = current_blk_id;
+
+                    if (batch_context->num_block_faults >= UVM_ARIADNE_BATCH_BLOCKS_MAX)
+                        break;
+
+                    gpu->batch_blocks[batch_context->num_block_faults++] = current_blk_id;
+                }
+            }
+        }
+    }
+
     return NV_OK;
 }
 
@@ -1575,6 +1621,98 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
                 uvm_page_mask_zero(&block_context->thrashing_pin_mask);
 
             uvm_page_mask_set(&block_context->thrashing_pin_mask, page_index);
+        }
+
+        // ARIADNE (HPCA'26) Sharing Degree. Push this fault's source uTLB into
+        // the block's ring and keep utlb_count equal to the number of distinct
+        // IDs it holds, which is the Sharing Degree the eviction key reads.
+        //
+        // The count is maintained incrementally rather than recomputed: the ID
+        // about to be overwritten is dropped from the count if it was unique,
+        // and the incoming one is added if it is new. diff_utlb_count records
+        // whether the count moved, saturating in [0, 40], and is their measure
+        // of how volatile the sharing pattern is.
+        //
+        // Two properties of theirs preserved deliberately. Prefetch faults are
+        // excluded, so the ring reflects demand only. And zero doubles as the
+        // empty-slot sentinel, which means faults from uTLB 0 are invisible to
+        // the count. That undercounts on uTLB 0 and is theirs, not a port
+        // artifact, so it stays.
+        if (service_access_type != UVM_FAULT_ACCESS_TYPE_PREFETCH) {
+            NvU8 *ring = va_block->utlb_info.recent_utlb_info;
+            NvU8 head = va_block->utlb_info.start;
+            NvU8 incoming = (NvU8)current_entry->fault_source.utlb_id;
+            bool count_changed = false;
+            bool unique;
+            int i;
+
+            // The entry being evicted from the ring: if no other slot holds
+            // the same ID, the distinct count loses one.
+            if (ring[head] != 0) {
+                unique = true;
+                for (i = 0; i < UVM_PERF_PREFETCH_INFO_STORE_SIZE && ring[i] != 0; i++) {
+                    if (i != head && ring[i] == ring[head]) {
+                        unique = false;
+                        break;
+                    }
+                }
+
+                if (unique && va_block->utlb_info.utlb_count > 0) {
+                    va_block->utlb_info.utlb_count--;
+                    count_changed = !count_changed;
+                }
+            }
+
+            ring[head] = incoming;
+
+            // The entry just admitted: if no other slot already held it, the
+            // distinct count gains one.
+            if (incoming != 0) {
+                unique = true;
+                for (i = 0; i < UVM_PERF_PREFETCH_INFO_STORE_SIZE && ring[i] != 0; i++) {
+                    if (i != head && ring[i] == incoming) {
+                        unique = false;
+                        break;
+                    }
+                }
+
+                if (unique && va_block->utlb_info.utlb_count < UVM_PERF_PREFETCH_INFO_STORE_SIZE) {
+                    va_block->utlb_info.utlb_count++;
+                    count_changed = !count_changed;
+                }
+            }
+
+            va_block->utlb_info.start = (head + 1) % UVM_PERF_PREFETCH_INFO_STORE_SIZE;
+
+            if (count_changed) {
+                if (va_block->utlb_info.diff_utlb_count < 40)
+                    va_block->utlb_info.diff_utlb_count++;
+            }
+            else if (va_block->utlb_info.diff_utlb_count > 0) {
+                va_block->utlb_info.diff_utlb_count--;
+            }
+
+            // Per-GPU running average of the Sharing Degree, over the last
+            // UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE blocks serviced. The host-pin
+            // decision reads it to tell a sparse workload from a dense one.
+            //
+            // Note the divisor is the buffer size over ten, not the buffer
+            // size, so per_gpu_count_avg is ten times the true mean. That is
+            // theirs, and it is why uvm_dynzero_thr_avg_sd is 15 rather than
+            // the 1.5 it actually tests for. Preserved, or every threshold
+            // comparison shifts by an order of magnitude.
+            gpu->per_gpu_count_sum += va_block->utlb_info.utlb_count;
+            gpu->per_gpu_count_sum -= gpu->per_gpu_count[gpu->per_gpu_count_start];
+            gpu->per_gpu_count[gpu->per_gpu_count_start] = va_block->utlb_info.utlb_count;
+            gpu->per_gpu_count_start = (gpu->per_gpu_count_start + 1) % UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE;
+            gpu->per_gpu_count_avg = gpu->per_gpu_count_sum / (UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE / 10);
+
+            gpu->per_gpu_diff_count_sum += 10 * va_block->utlb_info.diff_utlb_count;
+            gpu->per_gpu_diff_count_sum -= gpu->per_gpu_diff_count[gpu->per_gpu_diff_count_start];
+            gpu->per_gpu_diff_count[gpu->per_gpu_diff_count_start] = 10 * va_block->utlb_info.diff_utlb_count;
+            gpu->per_gpu_diff_count_start =
+                (gpu->per_gpu_diff_count_start + 1) % UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE;
+            gpu->per_gpu_diff_count_avg = gpu->per_gpu_diff_count_sum / UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE;
         }
 
         // Compute new residency and update the masks

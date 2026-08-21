@@ -68,6 +68,20 @@
 // for why 15 means a mean Sharing Degree of 1.5.
 extern unsigned uvm_dynzero_thr_avg_sd;
 
+// The PMA APIs that can be called from PMA eviction callbacks (pmaPinPages and
+// pmaFreePages*) need to be called differently depending whether it's as part
+// of PMA eviction or not. The PMM context is used to plumb that information
+// through the stack in a couple of places.
+//
+// ARIADNE moved this out of uvm_pmm_gpu.c so its eviction kthread can name
+// PMM_CONTEXT_DEFAULT.
+typedef enum
+{
+    PMM_CONTEXT_DEFAULT,
+    PMM_CONTEXT_PMA_EVICTION,
+} uvm_pmm_context_t;
+
+
 typedef enum
 {
     UVM_CHUNK_SIZE_1       =           1,
@@ -419,6 +433,15 @@ static void uvm_gpu_chunk_set_size(uvm_gpu_chunk_t *chunk, uvm_chunk_size_t size
 // Retrieve the GPU associated with the chunk. Users of this helper must only
 // use it if the owning GPU is retained.
 uvm_gpu_t *uvm_gpu_chunk_get_gpu(const uvm_gpu_chunk_t *chunk);
+
+// ARIADNE (HPCA'26). Exported for the proactive eviction kthread, which drives
+// the eviction path directly rather than reaching it through a failed
+// allocation. Declared here rather than beside uvm_pmm_context_t above because
+// they need uvm_gpu_root_chunk_t and uvm_pmm_gpu_t, both of which close later
+// in this header.
+uvm_gpu_root_chunk_t *pick_used_root_chunk_to_evict(uvm_pmm_gpu_t *pmm);
+NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, uvm_pmm_context_t pmm_context);
+void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 
 // Returns true for user chunks.
 static bool uvm_gpu_chunk_is_user(const uvm_gpu_chunk_t *chunk)
