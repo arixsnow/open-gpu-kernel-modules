@@ -1571,6 +1571,23 @@ typedef struct
     atomic64_t ns_block_lock_wait_gpu;
     atomic64_t n_block_lock_acqs_gpu;
 
+    // Whole-call cost of servicing one va_block's faults: service_fault_batch_block
+    // from entry to return, so it contains the block-lock wait above, the retry
+    // loop and the tracker merge. Divide by n_va_block_service for the mean cost
+    // of handling one block.
+    //
+    // This exists to make one number comparable across mechanisms that are
+    // otherwise structured differently. service_fault_batch_block is stock, so
+    // the serial path, a worker pool and a stage pipeline all pass through it
+    // once per block, and the same probe measures all three. Nothing else in
+    // this struct can be divided down to a per-block figure: ns_service is a
+    // whole-batch makespan, and the make-resident bank covers only the
+    // migration phase.
+    //
+    // Contains ns_block_lock_wait_gpu, so the two must never be summed.
+    atomic64_t ns_va_block_service;
+    atomic64_t n_va_block_service;
+
     // va_block->lock in uvm_va_block_cpu_fault: how long CPU faults stall
     // behind GPU servicing. Strictly the acquisition, not the servicing that
     // follows it, which is why the CPU fault path uses the probed variant of

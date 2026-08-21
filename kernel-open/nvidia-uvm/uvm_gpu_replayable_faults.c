@@ -1864,6 +1864,13 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     uvm_va_block_retry_t va_block_retry;
     NV_STATUS tracker_status;
     NvU64 block_lock_wait_start;
+    NvU64 block_service_start;
+
+    // Whole-call cost of servicing this block, taken before the HMM wait so it
+    // covers everything the caller pays for one va_block. This function is stock,
+    // so every servicing mechanism passes through it once per block and the same
+    // number is comparable across them.
+    block_service_start = uvm_lock_probe_begin();
 
     fault_block_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
     fault_block_context->num_retries = 0;
@@ -1900,6 +1907,10 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
 
     if (uvm_va_block_is_hmm(va_block))
         uvm_hmm_migrate_finish(va_block);
+
+    uvm_lock_probe_end(block_service_start,
+                       &g_uvm_lock_contention_stats.ns_va_block_service,
+                       &g_uvm_lock_contention_stats.n_va_block_service);
 
     return status == NV_OK? tracker_status: status;
 }

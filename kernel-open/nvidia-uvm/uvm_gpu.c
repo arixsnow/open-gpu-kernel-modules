@@ -1200,6 +1200,10 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_block_lock_wait_gpu));
     UVM_SEQ_OR_DBG_PRINT(s, "n_block_lock_acqs_gpu     %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_block_lock_acqs_gpu));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_va_block_service       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_va_block_service));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_va_block_service        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_va_block_service));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_block_lock_wait_cpu    %llu\n",
                          (NvU64)atomic64_read(&g_uvm_lock_contention_stats.ns_block_lock_wait_cpu));
     UVM_SEQ_OR_DBG_PRINT(s, "n_cpu_faults              %llu\n",
