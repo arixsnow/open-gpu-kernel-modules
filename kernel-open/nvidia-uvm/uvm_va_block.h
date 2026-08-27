@@ -895,6 +895,21 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
                                           const uvm_page_mask_t *prefetch_page_mask,
                                           uvm_make_resident_cause_t cause);
 
+// ARIADNE (HPCA'26). Populate half of uvm_va_block_make_resident_copy: unmaps
+// and allocates the destination, but issues no copy, updates no residency and
+// creates no mapping. That last part is the safety property of the split, since
+// it means a fault replayed before the copy completes re-faults rather than
+// reading stale data. The copy is issued later by
+// uvm_va_block_service_copy_finish.
+NV_STATUS uvm_va_block_make_resident_populate(uvm_va_block_t *va_block,
+                                              uvm_va_block_retry_t *va_block_retry,
+                                              uvm_va_block_context_t *va_block_context,
+                                              uvm_processor_id_t dest_id,
+                                              uvm_va_block_region_t region,
+                                              const uvm_page_mask_t *page_mask,
+                                              const uvm_page_mask_t *prefetch_page_mask,
+                                              uvm_make_resident_cause_t cause);
+
 // The page_mask must be the same or a subset of the page_mask passed to
 // uvm_va_block_make_resident_copy(). This step updates the residency and breaks
 // read duplication.
@@ -1358,6 +1373,32 @@ NV_STATUS uvm_va_block_service_locked(uvm_gpu_t *gpu,
                                       uvm_va_block_t *va_block,
                                       uvm_va_block_retry_t *block_retry,
                                       uvm_service_block_context_t *service_context);
+
+// ARIADNE (HPCA'26) pipeline entry points. The fault thread calls
+// uvm_va_block_service_locked_populate and returns as soon as the destination
+// pages exist; the copy kthread later calls uvm_va_block_service_copy_finish on
+// the staged context to issue the transfer and complete servicing.
+//
+// The two must be paired on the same service context. Between them the block is
+// allocated and unmapped from everywhere else, but holds no data and is mapped
+// nowhere, so an access in that window re-faults.
+//
+// uvm_va_block_service_populate is the per-destination half used by
+// uvm_va_block_service_locked_populate.
+NV_STATUS uvm_va_block_service_locked_populate(uvm_gpu_t *gpu,
+                                               uvm_va_block_t *va_block,
+                                               uvm_va_block_retry_t *block_retry,
+                                               uvm_service_block_context_t *service_context);
+
+NV_STATUS uvm_va_block_service_populate(uvm_processor_id_t processor_id,
+                                        uvm_processor_id_t new_residency,
+                                        uvm_va_block_t *va_block,
+                                        uvm_va_block_retry_t *block_retry,
+                                        uvm_service_block_context_t *service_context);
+
+NV_STATUS uvm_va_block_service_copy_finish(uvm_processor_id_t processor_id,
+                                           uvm_va_block_t *va_block,
+                                           uvm_service_block_context_t *service_context);
 
 // Performs population of the destination pages, unmapping and copying source
 // pages to new_residency.

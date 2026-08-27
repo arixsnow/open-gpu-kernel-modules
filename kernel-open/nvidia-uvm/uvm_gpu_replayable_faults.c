@@ -34,6 +34,9 @@
 #include "uvm_va_range.h"
 #include "uvm_va_space.h"
 #include "uvm_va_space_mm.h"
+// ARIADNE (HPCA'26): pick_used_root_chunk_to_evict, evict_root_chunk and
+// chunk_free_locked for the eviction kthread.
+#include "uvm_pmm_gpu.h"
 #include "uvm_procfs.h"
 #include "uvm_perf_thrashing.h"
 #include "uvm_gpu_non_replayable_faults.h"
@@ -1452,6 +1455,214 @@ static uvm_fault_access_type_t check_fault_access_permissions(uvm_gpu_t *gpu,
 // data are performed by the performance heuristics code.
 //
 // Fatal faults are flagged as fatal for later cancellation. Servicing is not
+// ----------------------------------------------------------------------------
+// ARIADNE (HPCA'26) kthreads
+// ----------------------------------------------------------------------------
+//
+// Three per-GPU threads, created lazily on the first fault batch and torn down
+// with the va_space. Copy and Eviction are gated on uvm_perf_fhp; the unpin
+// thread runs whenever Zero-copy is in use.
+//
+// The wait is theirs, verbatim, and it does not sleep.
+// NV_NSECS_TO_JIFFIES(500000) is 500000 * HZ / 1e9, which truncates to 0 at
+// HZ=1000, so wait_for_completion_timeout polls once and returns. Both threads
+// therefore spin. That is a units slip rather than a design, but it is what
+// produced their published numbers, so it is kept and reported rather than
+// repaired. It costs two cores while an ARIADNE arm runs and nothing that the
+// capture script records.
+
+// Copy stage. Takes the block the fault thread staged, issues the transfer that
+// uvm_va_block_service_locked_populate deferred, and completes servicing.
+//
+// Runs with no lock held. uvm_va_block_service_copy_finish reaches
+// uvm_va_block_map, uvm_va_block_unmap and block_copy_resident_pages, each of
+// which asserts the block lock, so a debug build trips immediately. That is
+// their mechanism, not a port artifact, and it is why the ARIADNE arm is
+// validated on release builds only.
+static int uvm_gpu_copy(void *data)
+{
+    parallel_data_struct *pcd = (parallel_data_struct *)data;
+
+    while (!kthread_should_stop()) {
+        uvm_processor_id_t new_residency;
+
+        if (wait_for_completion_timeout(&pcd->start, NV_NSECS_TO_JIFFIES(500000)) == 0)
+            continue;
+
+        reinit_completion(&pcd->start);
+
+        if (pcd->stop)
+            break;
+
+        if (pcd->va_block) {
+            for_each_id_in_mask(new_residency, &pcd->service_context.resident_processors) {
+                pcd->status = uvm_va_block_service_copy_finish(pcd->processor_id,
+                                                               pcd->va_block,
+                                                               &pcd->service_context);
+                if (pcd->status != NV_OK)
+                    break;
+            }
+        }
+
+        pcd->gpu->pd_copy.va_block = NULL;
+        pcd->gpu->pd_copy.new_residency = UVM_ID_INVALID;
+        pcd->gpu->pd_copy.processor_id = UVM_ID_INVALID;
+
+        complete(&pcd->done);
+    }
+
+    return 0;
+}
+
+// Proactive eviction. Woken from the fault path when free 2MB chunks run low,
+// so that a populate finds a chunk waiting rather than driving eviction itself.
+//
+// It reuses gpu->pd_copy.start and .done as its doorbell, which is theirs and
+// is confusing given the copy thread waits on gpu->cd->start. Left as-is: the
+// two never contend, because the fault thread rings one and waits on it before
+// ringing the other.
+static int uvm_gpu_evict_root_chunks_async_agr(void *data)
+{
+    uvm_gpu_t *gpu = (uvm_gpu_t *)data;
+    uvm_pmm_gpu_t *pmm = &gpu->pmm;
+
+    while (!kthread_should_stop()) {
+        NvU32 evicted = 0;
+
+        if (wait_for_completion_timeout(&gpu->pd_copy.start, NV_NSECS_TO_JIFFIES(500000)) == 0)
+            continue;
+
+        reinit_completion(&gpu->pd_copy.start);
+
+        if (gpu->pd_copy.stop)
+            break;
+
+        // One 2MB chunk per wake. Theirs loops until it has freed one, with an
+        // unchecked NULL from the picker and a double unlock on the error path.
+        // Bounded here instead: the picker can legitimately find nothing when
+        // every candidate is in the current batch, and spinning on that would
+        // hold pmm->lock against the fault thread.
+        while (evicted < 1) {
+            uvm_gpu_root_chunk_t *root_chunk;
+            NV_STATUS status;
+
+            uvm_mutex_lock(&pmm->lock);
+
+            root_chunk = pick_used_root_chunk_to_evict(pmm);
+            if (!root_chunk) {
+                uvm_mutex_unlock(&pmm->lock);
+                break;
+            }
+
+            if (uvm_gpu_chunk_get_size(&root_chunk->chunk) == UVM_CHUNK_SIZE_MAX)
+                evicted++;
+
+            status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
+
+            if (status == NV_OK) {
+                uvm_spin_lock(&pmm->list_lock);
+                chunk_free_locked(pmm, &root_chunk->chunk);
+                uvm_spin_unlock(&pmm->list_lock);
+            }
+
+            uvm_mutex_unlock(&pmm->lock);
+
+            if (status != NV_OK)
+                break;
+        }
+
+        complete(&gpu->pd_copy.done);
+    }
+
+    return 0;
+}
+
+// Zero-copy expiry. Walks the host-pinned list and revokes the GPU mapping of
+// any block whose pin time has passed, so the next access re-faults and the
+// driver can reconsider where the block belongs.
+//
+// The only one of the three that actually sleeps.
+static int uvm_gpu_unpin_period(void *data)
+{
+    uvm_gpu_t *gpu = (uvm_gpu_t *)data;
+
+    while (!kthread_should_stop()) {
+        uvm_pl_entry *entry, *next;
+        NvU64 now;
+        NvU32 decay;
+        NvU32 budget;
+
+        msleep_interruptible(uvm_dynzero_unpin_period);
+
+        if (kthread_should_stop())
+            break;
+
+        // trylock, not lock: the fault path holds pin_lock across its host-pin
+        // walk, and this thread has nothing urgent enough to block it.
+        if (!uvm_mutex_trylock(&gpu->pin_lock))
+            continue;
+
+        now = NV_GETTIME();
+
+        // Self-throttle. The more blocks are pinned, the fewer are released per
+        // sweep, so a large pinned set does not turn into a burst of refaults
+        // and a PCIe storm. Theirs, including the constants.
+        decay = (gpu->num_spled >> 8) + (NvU32)(((NvU64)gpu->num_spled * gpu->num_spled) >> 21);
+        budget = (decay < 99) ? (100 - decay) : 1;
+
+        list_for_each_entry_safe(entry, next, &gpu->spled_blocks, spln) {
+            uvm_va_block_t *block = NULL;
+            uvm_va_block_context_t *block_context;
+            uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+            struct mm_struct *mm;
+
+            if (budget == 0)
+                break;
+
+            if (entry->endtime > now)
+                continue;
+
+            mm = uvm_va_space_mm_retain_lock(entry->va_space);
+            uvm_va_space_down_read(entry->va_space);
+
+            // Their code does not check this return before dereferencing the
+            // block. The va_space can have dropped the range while the block
+            // sat pinned, so it is checked here.
+            if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
+                block_context = uvm_va_space_block_context(entry->va_space, mm);
+
+                block->prefetch_info.is_spled = 0;
+
+                uvm_mutex_lock(&block->lock);
+                uvm_va_block_unmap(block,
+                                   block_context,
+                                   gpu->id,
+                                   uvm_va_block_region_from_block(block),
+                                   NULL,
+                                   &local_tracker);
+                uvm_mutex_unlock(&block->lock);
+
+                uvm_tracker_wait_deinit(&local_tracker);
+            }
+
+            uvm_va_space_up_read(entry->va_space);
+            uvm_va_space_mm_release_unlock(entry->va_space, mm);
+
+            list_del_init(&entry->spln);
+            NV_KFREE(entry, sizeof(uvm_pl_entry));
+
+            if (gpu->num_spled > 0)
+                gpu->num_spled--;
+
+            budget--;
+        }
+
+        uvm_mutex_unlock(&gpu->pin_lock);
+    }
+
+    return 0;
+}
+
 // interrupted on fatal faults due to insufficient permissions or invalid
 // addresses.
 //
@@ -1779,7 +1990,44 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
     // are pages to be serviced
     if (page_fault_count > 0) {
         block_context->region = uvm_va_block_region(first_page_index, last_page_index + 1);
-        status = uvm_va_block_service_locked(gpu, va_block, va_block_retry, block_context);
+
+        // ARIADNE (HPCA'26). With the pipeline on, populate here and stage the
+        // block so the copy kthread finishes it while the fault thread moves to
+        // the next one. Otherwise the stock path, which is the no-PL arm.
+        // HMM blocks must not take this path. uvm_va_block_service_locked_populate
+        // hands them to uvm_hmm_va_block_service_locked, which cannot be split at
+        // this boundary and so completes the copy and the residency update
+        // itself. Staging one afterwards would have the copy kthread run
+        // uvm_va_block_service_copy_finish over a block that is already finished,
+        // copying and updating residency a second time with no block lock held.
+        if (uvm_perf_fhp && batch_context->num_block_faults > 0 && gpu->pd_copy.staged_block_context &&
+            !uvm_va_block_is_hmm(va_block)) {
+            status = uvm_va_block_service_locked_populate(gpu, va_block, va_block_retry, block_context);
+
+            if (status == NV_OK) {
+                uvm_va_block_context_t *staged = gpu->pd_copy.staged_block_context;
+
+                // The deep copy the split depends on. On 535 the service
+                // context embedded its uvm_va_block_context_t, so a struct
+                // assignment copied it and the staged slot was independent. On
+                // 610 that member is a pointer, so the same assignment would
+                // leave the slot aliasing the live batch context, which the
+                // next loop iteration overwrites while the copy thread is
+                // reading it. The slot owns a context and the contents are
+                // copied into it, restoring what their code assumed.
+                *staged = *block_context->block_context;
+
+                gpu->pd_copy.service_context = *block_context;
+                gpu->pd_copy.service_context.block_context = staged;
+
+                gpu->pd_copy.va_block = va_block;
+                gpu->pd_copy.processor_id = gpu->id;
+                gpu->pd_copy.new_residency = UVM_ID_INVALID;
+            }
+        }
+        else {
+            status = uvm_va_block_service_locked(gpu, va_block, va_block_retry, block_context);
+        }
     }
 
     *block_faults = i - first_fault_index;
@@ -2479,7 +2727,80 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     bool hmm_migratable = true;
     NvU64 va_space_lock_wait_start;
 
+    // ARIADNE (HPCA'26). Whether a copy or an eviction is in flight on a
+    // kthread and must be waited for before this thread reuses the context.
+    bool ariadne_copy_pending = false;
+    bool ariadne_evict_pending = false;
+
     ats_invalidate->tlb_batch_pending = false;
+
+    // ARIADNE. Bring up the copy and eviction threads on the first batch. The
+    // fault path is the earliest point where the sub-GPU is resolvable, which
+    // is why this is lazy rather than done at GPU registration.
+    if (uvm_perf_fhp && service_mode != FAULT_SERVICE_MODE_CANCEL) {
+        uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+        if (ar_gpu && !ar_gpu->async_copy) {
+            ar_gpu->cd = uvm_kvmalloc_zero(sizeof(*ar_gpu->cd));
+
+            if (ar_gpu->cd) {
+                ar_gpu->cd->staged_block_context = uvm_va_block_context_alloc(NULL);
+                ar_gpu->pd_copy.staged_block_context = uvm_va_block_context_alloc(NULL);
+            }
+
+            if (ar_gpu->cd && ar_gpu->cd->staged_block_context && ar_gpu->pd_copy.staged_block_context) {
+                init_completion(&ar_gpu->cd->start);
+                init_completion(&ar_gpu->cd->done);
+                init_completion(&ar_gpu->pd_copy.start);
+                init_completion(&ar_gpu->pd_copy.done);
+
+                // pd_copy.stop lives in uvm_gpu_t and outlives the threads, so
+                // the teardown's 1 is still there when a second process brings
+                // the pipeline back up on the same GPU. Left set, the fresh
+                // eviction thread would exit on its first doorbell without
+                // completing pd_copy.done, and the fault thread waiting on that
+                // completion would never return. cd is freshly zero-allocated,
+                // so only this one has to be cleared.
+                ar_gpu->pd_copy.stop = 0;
+
+                ar_gpu->cd->gpu = ar_gpu;
+
+                ar_gpu->async_copy = kthread_run(uvm_gpu_copy, ar_gpu->cd, "uvm_gpu_copy");
+                if (IS_ERR(ar_gpu->async_copy))
+                    ar_gpu->async_copy = NULL;
+
+                ar_gpu->async_eviction = kthread_run(uvm_gpu_evict_root_chunks_async_agr,
+                                                     ar_gpu,
+                                                     "uvm_gpu_evict_chunks");
+                if (IS_ERR(ar_gpu->async_eviction))
+                    ar_gpu->async_eviction = NULL;
+            }
+
+            // On any allocation failure the staging test in
+            // service_fault_batch_block_locked sees a NULL context and the
+            // stock serial path runs, so a failed bring-up degrades rather
+            // than faulting. Their version checks none of these returns.
+            if (!ar_gpu->async_copy) {
+                // The eviction thread has to go with it. This bring-up is
+                // re-entered on every fault batch while async_copy is NULL, so
+                // leaving a started eviction thread behind would start another
+                // one per batch and leak them without bound.
+                if (ar_gpu->async_eviction) {
+                    kthread_stop(ar_gpu->async_eviction);
+                    ar_gpu->async_eviction = NULL;
+                }
+
+                if (ar_gpu->cd) {
+                    uvm_va_block_context_free(ar_gpu->cd->staged_block_context);
+                    uvm_kvfree(ar_gpu->cd);
+                    ar_gpu->cd = NULL;
+                }
+
+                uvm_va_block_context_free(ar_gpu->pd_copy.staged_block_context);
+                ar_gpu->pd_copy.staged_block_context = NULL;
+            }
+        }
+    }
 
     for (i = 0; i < batch_context->num_coalesced_faults;) {
         NvU32 block_faults;
@@ -2563,6 +2884,85 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             continue;
         }
 
+        // ARIADNE (HPCA'26). Hand the previously staged block to the copy
+        // thread, and wake the eviction thread if free 2MB chunks have run out,
+        // so both run while this iteration populates the next block. This is
+        // the whole of the overlap: depth one, re-synchronised below.
+        if (uvm_perf_fhp && batch_context->num_block_faults > 0) {
+            uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+            if (ar_gpu && ar_gpu->cd) {
+                uvm_pmm_gpu_t *ar_pmm = &ar_gpu->pmm;
+                uvm_va_block_t *touched_block;
+                struct list_head *cur;
+                NvU32 free_chunks = 0;
+                size_t size_index;
+                NvU64 free_2mb = READ_ONCE(ar_pmm->pma_stats->numFreePages2m) +
+                                 READ_ONCE(ar_pmm->pma_stats->numFreePages2mProtected);
+
+                if (ar_gpu->prev_free_2mb != free_2mb) {
+                    ar_gpu->max_rest_2mb_pages = (free_2mb == 0) ? ar_gpu->prev_free_2mb : 0;
+                    ar_gpu->prev_free_2mb = free_2mb;
+                    ar_gpu->cur_chg_2mb_pages = 0;
+                }
+
+                // Refresh the block's logical timestamp. This is what keeps a
+                // block that is still being faulted on from ageing out of the
+                // Working Chunk Set Size, and what marks it as thrashing-prone
+                // when it is populated again after an eviction.
+                if (uvm_va_block_find(va_space, current_entry->fault_address, &touched_block) == NV_OK)
+                    touched_block->prefetch_info.last_migration_time = ar_gpu->last_access_time;
+
+                // Count the 2MB chunks the driver is holding free. Theirs walks
+                // these two lists with no lock while the eviction kthread and
+                // every other allocator splice entries into them, which can
+                // follow a pointer into freed memory. The walk is kept and the
+                // list lock is taken around it. It is a leaf spinlock, and
+                // these are the driver's own cached chunks rather than all of
+                // PMA's, so the lists are short.
+                size_index = hweight_long(ar_pmm->chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_USER] &
+                                          (UVM_CHUNK_SIZE_2M - 1));
+
+                uvm_spin_lock(&ar_pmm->list_lock);
+
+                list_for_each(cur, &ar_pmm->free_list[UVM_PMM_GPU_MEMORY_TYPE_USER][size_index][UVM_PMM_LIST_ZERO])
+                    free_chunks++;
+
+                list_for_each(cur, &ar_pmm->free_list[UVM_PMM_GPU_MEMORY_TYPE_USER][size_index][UVM_PMM_LIST_NO_ZERO])
+                    free_chunks++;
+
+                uvm_spin_unlock(&ar_pmm->list_lock);
+
+                // Their watermark. The paper says one free chunk, the code says
+                // two, and the code is what produced their numbers.
+                if (free_2mb == 0 &&
+                    ((ar_gpu->max_rest_2mb_pages - ar_gpu->cur_chg_2mb_pages) < 2 || free_chunks < 2)) {
+                    complete(&ar_gpu->pd_copy.start);
+                    ariadne_evict_pending = true;
+                }
+
+                // Resync the charge counter against what is actually free. The
+                // populate and eviction paths each move it by one and neither
+                // sees allocations made outside the fault path, so it drifts.
+                if (ar_gpu->max_rest_2mb_pages - ar_gpu->cur_chg_2mb_pages != (int)free_chunks)
+                    ar_gpu->cur_chg_2mb_pages = ar_gpu->max_rest_2mb_pages - (int)free_chunks;
+
+                if (ar_gpu->pd_copy.va_block) {
+                    ar_gpu->cd->processor_id = ar_gpu->pd_copy.processor_id;
+                    ar_gpu->cd->gpu = ar_gpu;
+                    ar_gpu->cd->va_block = ar_gpu->pd_copy.va_block;
+
+                    // Second deep copy, for the same reason as the staging one.
+                    *ar_gpu->cd->staged_block_context = *ar_gpu->pd_copy.staged_block_context;
+                    ar_gpu->cd->service_context = ar_gpu->pd_copy.service_context;
+                    ar_gpu->cd->service_context.block_context = ar_gpu->cd->staged_block_context;
+
+                    complete(&ar_gpu->cd->start);
+                    ariadne_copy_pending = true;
+                }
+            }
+        }
+
         status = service_fault_batch_dispatch(va_space,
                                               gpu_va_space,
                                               batch_context,
@@ -2570,6 +2970,38 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                                               &block_faults,
                                               replay_per_va_block,
                                               hmm_migratable);
+
+        // Re-synchronise before any path that could leave this iteration. The
+        // kthreads are reading a context this thread is about to reuse, so the
+        // waits cannot sit after the continue below.
+        // Both waits re-resolve the GPU and are guarded the same way the kick
+        // sites above are. A flag can only be set when the resolver returned a
+        // GPU with a copy payload, so the guards are for the resolver itself
+        // rather than for a state change, and clearing the flag on a NULL
+        // result is what keeps the next iteration from waiting on a completion
+        // nobody will ever post.
+        if (ariadne_copy_pending) {
+            uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+            if (ar_gpu && ar_gpu->cd) {
+                wait_for_completion(&ar_gpu->cd->done);
+                reinit_completion(&ar_gpu->cd->done);
+            }
+
+            ariadne_copy_pending = false;
+        }
+
+        if (ariadne_evict_pending) {
+            uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+            if (ar_gpu) {
+                wait_for_completion(&ar_gpu->pd_copy.done);
+                reinit_completion(&ar_gpu->pd_copy.done);
+            }
+
+            ariadne_evict_pending = false;
+        }
+
         // TODO: Bug 3900733: clean up locking in service_fault_batch().
         if (status == NV_WARN_MORE_PROCESSING_REQUIRED || status == NV_WARN_MISMATCHED_TARGET) {
             if (status == NV_WARN_MISMATCHED_TARGET)
@@ -2602,6 +3034,37 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         }
     }
 
+    // ARIADNE (HPCA'26). The last block staged in the loop has no following
+    // iteration to hand it to the copy thread, so it is finished inline here.
+    //
+    // This is what makes the default replay policy safe: the batch's copies are
+    // all complete before uvm_parent_gpu_service_replayable_faults pushes the
+    // replay, so the GPU never resumes against a block that was populated but
+    // not copied.
+    if (uvm_perf_fhp && service_mode != FAULT_SERVICE_MODE_CANCEL) {
+        uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+        if (ar_gpu && ar_gpu->pd_copy.va_block) {
+            uvm_processor_id_t new_residency;
+            NV_STATUS drain_status = NV_OK;
+
+            for_each_id_in_mask(new_residency, &ar_gpu->pd_copy.service_context.resident_processors) {
+                drain_status = uvm_va_block_service_copy_finish(ar_gpu->pd_copy.processor_id,
+                                                                ar_gpu->pd_copy.va_block,
+                                                                &ar_gpu->pd_copy.service_context);
+                if (drain_status != NV_OK)
+                    break;
+            }
+
+            ar_gpu->pd_copy.va_block = NULL;
+            ar_gpu->pd_copy.processor_id = UVM_ID_INVALID;
+            ar_gpu->pd_copy.new_residency = UVM_ID_INVALID;
+
+            if (status == NV_OK)
+                status = drain_status;
+        }
+    }
+
     if (prev_gpu_va_space) {
         NV_STATUS invalidate_status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
         if (invalidate_status != NV_OK)
@@ -2609,6 +3072,24 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     }
 
 fail:
+    // ARIADNE (HPCA'26). The error paths jump here past the drain above, so a
+    // block can still be staged. Drop it rather than carry it: the next batch
+    // would hand it to the copy thread, and by then the va_space it belongs to
+    // may be gone. Losing the copy only costs a re-fault, since the populate
+    // half maps nothing.
+    //
+    // The kthread waits sit before every continue and goto in the loop, so
+    // nothing is in flight by the time control reaches here.
+    if (uvm_perf_fhp) {
+        uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+        if (ar_gpu) {
+            ar_gpu->pd_copy.va_block = NULL;
+            ar_gpu->pd_copy.processor_id = UVM_ID_INVALID;
+            ar_gpu->pd_copy.new_residency = UVM_ID_INVALID;
+        }
+    }
+
     if (va_space) {
         uvm_va_space_up_read(va_space);
         uvm_va_space_mm_release_unlock(va_space, mm);
@@ -3162,6 +3643,42 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
     uvm_tracker_init(&batch_context->tracker);
 
+    // ARIADNE (HPCA'26). Age the Working Chunk Set Size and start the unpin
+    // thread.
+    //
+    // A block that is out of GPU memory, not host-pinned, and untouched for the
+    // retention window has stopped being demand, so it leaves the WCSS. Without
+    // this the estimate only grows and every workload eventually looks
+    // oversubscribed. The window is 500 ms, theirs, hardcoded.
+    {
+        uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+        if (ar_gpu) {
+            uvm_used_entry *entry, *next;
+            NvU64 now = NV_GETTIME();
+
+            list_for_each_entry_safe(entry, next, &ar_gpu->used_blocks, spln) {
+                if (!entry->is_in_gpu &&
+                    entry->block &&
+                    !entry->block->prefetch_info.is_spled &&
+                    entry->block->prefetch_info.last_migration_time + UVM_ARIADNE_WCSS_RETAIN_NS < now) {
+                    list_del_init(&entry->spln);
+                    entry->block->prefetch_info.used_entry = NULL;
+                    NV_KFREE(entry, sizeof(uvm_used_entry));
+
+                    if (ar_gpu->active_blocks > 0)
+                        ar_gpu->active_blocks--;
+                }
+            }
+
+            if (!ar_gpu->async_unpin) {
+                ar_gpu->async_unpin = kthread_run(uvm_gpu_unpin_period, ar_gpu, "uvm_gpu_unpin");
+                if (IS_ERR(ar_gpu->async_unpin))
+                    ar_gpu->async_unpin = NULL;
+            }
+        }
+    }
+
     // Process all faults in the buffer
     while (1) {
         if (num_throttled >= uvm_perf_fault_max_throttle_per_service ||
@@ -3175,6 +3692,21 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         batch_context->fatal_va_space              = NULL;
         batch_context->fatal_gpu                   = NULL;
         batch_context->has_throttled_faults        = false;
+
+        // ARIADNE (HPCA'26). Advance the per-batch logical clock and clear the
+        // exclusion set. Every last_access_time comparison in the eviction path
+        // is against this value, so a chunk stamped with it was touched by the
+        // batch now starting and must not be evicted underneath it.
+        {
+            uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+            if (ar_gpu) {
+                ar_gpu->last_access_time = NV_GETTIME();
+                memset(ar_gpu->batch_blocks, 0, sizeof(ar_gpu->batch_blocks));
+            }
+
+            batch_context->num_block_faults = 0;
+        }
 
         batch_start_time = NV_GETTIME();
 
@@ -3241,6 +3773,111 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             }
 
             break;
+        }
+
+        // ARIADNE (HPCA'26). Turn WCSS pressure into Zero-copy.
+        //
+        // Demand minus what is resident minus what is already pinned is the
+        // surplus that cannot fit. That many blocks are taken off the candidate
+        // queue and given a GPU-to-sysmem remote mapping, so the next access
+        // reads them across PCIe instead of dragging them back and evicting
+        // something else. A sparse workload gets an extra allowance, because
+        // low Sharing Degree is what thrashes worst.
+        //
+        // man_size is recounted here rather than tracked, which is theirs.
+        {
+            uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+
+            if (ar_gpu) {
+                uvm_pl_entry *entry, *next_entry;
+                struct list_head *cur;
+                NvU32 resident = 0;
+                NvU32 pinned = 0;
+                NvU32 to_pin;
+                NvU64 now = NV_GETTIME();
+
+                // Under pmm->list_lock. Theirs walks this list bare while the
+                // eviction kthread and every allocator splice entries into it
+                // under that same lock, which can follow a pointer into a freed
+                // chunk.
+                uvm_spin_lock(&ar_gpu->pmm.list_lock);
+
+                list_for_each(cur, &ar_gpu->pmm.root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED])
+                    resident++;
+
+                uvm_spin_unlock(&ar_gpu->pmm.list_lock);
+
+                // pin_lock is taken before spled_blocks is read, not after.
+                // Theirs counts the list first and locks second, so the unpin
+                // kthread can free an entry out from under the walk.
+                uvm_mutex_lock(&ar_gpu->pin_lock);
+
+                list_for_each(cur, &ar_gpu->spled_blocks)
+                    pinned++;
+
+                ar_gpu->man_size = resident;
+                ar_gpu->num_spled = pinned;
+
+                to_pin = (ar_gpu->active_blocks > resident + pinned) ?
+                         (ar_gpu->active_blocks - resident - pinned) : 0;
+
+                if (to_pin && uvm_perf_SDaware && ar_gpu->per_gpu_count_avg < uvm_dynzero_thr_avg_sd)
+                    to_pin += uvm_dynzero_aggradjust;
+
+                list_for_each_entry_safe(entry, next_entry, &ar_gpu->spl_blocks, spln) {
+                    uvm_va_block_t *block = NULL;
+                    uvm_va_block_context_t *block_context;
+                    struct mm_struct *block_mm;
+                    NvU64 pintime;
+
+                    if (to_pin == 0)
+                        break;
+
+                    block_mm = uvm_va_space_mm_retain_lock(entry->va_space);
+                    uvm_va_space_down_read(entry->va_space);
+
+                    // Checked before use, unlike theirs: the range can have
+                    // gone away while the block sat on this queue.
+                    if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
+                        block_context = uvm_va_space_block_context(entry->va_space, block_mm);
+
+                        // The Zero-copy mapping itself. On a CPU-resident block
+                        // this builds a GPU-to-sysmem remote mapping over the
+                        // whole 2 MB block with no migration.
+                        if (uvm_va_block_set_accessed_by(block, block_context, ar_gpu->id) == NV_OK) {
+                            // 50 us per active block, floored at the parameter,
+                            // times five for a repeat offender. Theirs, and it
+                            // is NvU32 nanoseconds in their code, which wraps
+                            // past about 4.3 s. Widened to NvU64 here, which
+                            // only removes the wrap.
+                            pintime = (NvU64)uvm_dynzero_pintime * 500ULL * ar_gpu->active_blocks;
+                            if (pintime < (NvU64)uvm_dynzero_pintime * 1000000ULL)
+                                pintime = (NvU64)uvm_dynzero_pintime * 1000000ULL;
+
+                            block->prefetch_info.thr_count++;
+                            if (block->prefetch_info.thr_count > 1)
+                                pintime *= 5;
+
+                            block->prefetch_info.last_migration_time = now;
+                            block->prefetch_info.is_spled = 1;
+                            entry->endtime = now + pintime;
+
+                            list_move_tail(&entry->spln, &ar_gpu->spled_blocks);
+                            ar_gpu->num_spled++;
+                            to_pin--;
+                        }
+                    }
+                    else {
+                        list_del_init(&entry->spln);
+                        NV_KFREE(entry, sizeof(uvm_pl_entry));
+                    }
+
+                    uvm_va_space_up_read(entry->va_space);
+                    uvm_va_space_mm_release_unlock(entry->va_space, block_mm);
+                }
+
+                uvm_mutex_unlock(&ar_gpu->pin_lock);
+            }
         }
 
         if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {

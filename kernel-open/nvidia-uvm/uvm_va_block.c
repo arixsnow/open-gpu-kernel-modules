@@ -3040,6 +3040,7 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
             if (used_entry) {
                 block->prefetch_info.is_thrashed = (block->prefetch_info.last_migration_time != 0);
                 used_entry->block = block;
+                used_entry->gpu = gpu;
                 used_entry->is_in_gpu = 1;
                 block->prefetch_info.used_entry = used_entry;
                 list_add_tail(&used_entry->spln, &gpu->used_blocks);
@@ -5007,6 +5008,137 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
         // Free allocated CPU pages.
         UVM_ASSERT(block_check_chunks(va_block));
     }
+
+out:
+    uvm_processor_mask_cache_free(unmap_processor_mask);
+    return status;
+}
+
+// ARIADNE (HPCA'26). The Populate half of the Populate/Copy split: everything
+// uvm_va_block_make_resident_copy does up to and including allocating the
+// destination pages, stopping before the copy is issued.
+//
+// This is what lets the fault thread move on to the next block while the copy
+// kthread transfers this one. The split point is deliberate: after this returns
+// the pages are allocated and unmapped from everywhere else, but nothing has
+// been copied, no residency has been updated and nothing has been mapped. That
+// invariant is what makes an early fault replay produce a re-fault rather than a
+// stale read, and it must not be weakened.
+//
+// Two differences from their 535 version, both forced by 610.
+//
+// unmap_processor_mask is heap-allocated here and freed at out:. On 535 it was
+// a stack mask, so their split could simply return at the halfway point. Here
+// the populate half has to own the allocation and free it on every exit,
+// including the successful one, because the copy half never sees it.
+//
+// The discard step below has no 535 equivalent. It belongs on this side because
+// block_populate_pages reads discarded_pages to decide what needs zeroing.
+NV_STATUS uvm_va_block_make_resident_populate(uvm_va_block_t *va_block,
+                                              uvm_va_block_retry_t *va_block_retry,
+                                              uvm_va_block_context_t *va_block_context,
+                                              uvm_processor_id_t dest_id,
+                                              uvm_va_block_region_t region,
+                                              const uvm_page_mask_t *page_mask,
+                                              const uvm_page_mask_t *prefetch_page_mask,
+                                              uvm_make_resident_cause_t cause)
+{
+    NV_STATUS status = NV_OK;
+    uvm_processor_mask_t *unmap_processor_mask;
+    uvm_page_mask_t *unmap_page_mask = &va_block_context->make_resident.page_mask;
+    uvm_page_mask_t *resident_mask;
+    NvU64 t0;
+
+    // Same two-bank selection as uvm_va_block_make_resident_copy. The copy half
+    // records the copy phase itself.
+    const bool is_evict = (cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION);
+    atomic64_t *ns_mkres_unmap = is_evict ? &g_uvm_lock_contention_stats.ns_evict_unmap
+                                          : &g_uvm_lock_contention_stats.ns_svc_unmap;
+    atomic64_t *ns_mkres_populate = is_evict ? &g_uvm_lock_contention_stats.ns_evict_populate
+                                             : &g_uvm_lock_contention_stats.ns_svc_populate;
+    atomic64_t *n_mkres = is_evict ? &g_uvm_lock_contention_stats.n_evict_mkres
+                                   : &g_uvm_lock_contention_stats.n_svc_mkres;
+
+    va_block_context->make_resident.dest_id = dest_id;
+    va_block_context->make_resident.cause = cause;
+    nodes_clear(va_block_context->make_resident.cpu_pages_used.nodes);
+
+    if (prefetch_page_mask) {
+        UVM_ASSERT(cause == UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT ||
+                   cause == UVM_MAKE_RESIDENT_CAUSE_NON_REPLAYABLE_FAULT ||
+                   cause == UVM_MAKE_RESIDENT_CAUSE_ACCESS_COUNTER);
+    }
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    UVM_ASSERT(uvm_va_block_is_hmm(va_block) || va_block->managed_range);
+
+    unmap_processor_mask = uvm_processor_mask_cache_alloc();
+    if (!unmap_processor_mask)
+        return NV_ERR_NO_MEMORY;
+
+    resident_mask = block_resident_mask_get_alloc(va_block, dest_id, va_block_context->make_resident.dest_nid);
+    if (!resident_mask) {
+        status = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+
+    // Unmap all mapped processors
+    uvm_processor_mask_copy(unmap_processor_mask, &va_block->mapped);
+
+    if (page_mask)
+        uvm_page_mask_andnot(unmap_page_mask, page_mask, resident_mask);
+    else
+        uvm_page_mask_complement(unmap_page_mask, resident_mask);
+    uvm_page_mask_region_clear_outside(unmap_page_mask, region);
+
+    t0 = uvm_lock_probe_begin();
+
+    status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+
+    uvm_lock_probe_end(t0, ns_mkres_unmap, n_mkres);
+
+    if (status != NV_OK)
+        goto out;
+
+    if (page_mask)
+        uvm_page_mask_and(unmap_page_mask, page_mask, &va_block->read_duplicated_pages);
+    else
+        uvm_page_mask_init_from_region(unmap_page_mask, region, &va_block->read_duplicated_pages);
+    uvm_page_mask_region_clear_outside(unmap_page_mask, region);
+
+    // Also unmap read-duplicated pages excluding dest_id
+    uvm_processor_mask_clear(unmap_processor_mask, dest_id);
+
+    t0 = uvm_lock_probe_begin();
+
+    status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+
+    uvm_lock_probe_end(t0, ns_mkres_unmap, NULL);
+
+    if (status != NV_OK)
+        goto out;
+
+    uvm_tools_record_read_duplicate_invalidate(va_block,
+                                               dest_id,
+                                               region,
+                                               unmap_page_mask);
+
+    // block_populate_pages and the deferred block_copy_resident_pages also use
+    // va_block_context->make_resident.page_mask.
+    unmap_page_mask = NULL;
+
+    // Set the subset of pages that are to be copied but are discarded. 610 only;
+    // block_populate_pages reads this to decide what to zero.
+    uvm_page_mask_init_from_region(&va_block_context->discard.scratch_page_mask, region, page_mask);
+    uvm_page_mask_and(&va_block_context->discard.discarded_pages,
+                      &va_block_context->discard.scratch_page_mask,
+                      &va_block->discarded_pages);
+
+    t0 = uvm_lock_probe_begin();
+
+    status = block_populate_pages(va_block, va_block_retry, va_block_context, dest_id, region, page_mask);
+
+    uvm_lock_probe_end(t0, ns_mkres_populate, NULL);
 
 out:
     uvm_processor_mask_cache_free(unmap_processor_mask);
@@ -9560,6 +9692,28 @@ static void block_kill(uvm_va_block_t *block)
     if (uvm_va_block_is_dead(block))
         return;
 
+    // ARIADNE (HPCA'26). Take this block out of the Working Chunk Set Size
+    // before it goes away.
+    //
+    // Nothing in their tree does this. An entry is only ever removed by the
+    // eviction path or by the reaper in the fault loop, and neither runs when an
+    // application simply frees the allocation, so the entry outlives the block
+    // it points at. That leaves a freed uvm_va_block_t reachable from
+    // gpu->used_blocks, which the va_space teardown then writes through, and it
+    // leaves active_blocks charged for a block that no longer exists, so the
+    // pressure signal the whole policy reads from only ever grows.
+    if (block->prefetch_info.used_entry) {
+        uvm_used_entry *used_entry = block->prefetch_info.used_entry;
+
+        list_del_init(&used_entry->spln);
+        block->prefetch_info.used_entry = NULL;
+
+        if (used_entry->gpu && used_entry->gpu->active_blocks > 0)
+            used_entry->gpu->active_blocks--;
+
+        NV_KFREE(used_entry, sizeof(uvm_used_entry));
+    }
+
     va_space = uvm_va_block_get_va_space(block);
     event_data.block_destroy.block = block;
     uvm_perf_event_notify(&va_space->perf_events, UVM_PERF_EVENT_BLOCK_DESTROY, &event_data);
@@ -11720,6 +11874,94 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
     }
 }
 
+// ARIADNE (HPCA'26). Populate half of uvm_va_block_service_copy: everything up
+// to and including allocating the destination, with the copy itself deferred to
+// uvm_va_block_service_copy_finish on the copy kthread.
+//
+// The ECC and NVLink checks that follow the migration in service_copy are not
+// here. They exist to catch errors on GPUs involved in a completed transfer, so
+// they belong on the copy side, and running them now would check hardware that
+// has not moved anything yet.
+//
+// Read duplication is handled the same way as in service_copy, but in practice
+// block_select_residency forces may_read_duplicate false under ARIADNE, so the
+// first arm is dead. It is kept so this function stays a faithful fork rather
+// than a rewrite that quietly changes behaviour if that policy is revisited.
+NV_STATUS uvm_va_block_service_populate(uvm_processor_id_t processor_id,
+                                        uvm_processor_id_t new_residency,
+                                        uvm_va_block_t *va_block,
+                                        uvm_va_block_retry_t *block_retry,
+                                        uvm_service_block_context_t *service_context)
+{
+    uvm_processor_mask_t *all_involved_processors =
+        &service_context->block_context->make_resident.all_involved_processors;
+    uvm_page_mask_t *new_residency_mask =
+        &service_context->per_processor_masks[uvm_id_value(new_residency)].new_residency;
+    uvm_page_mask_t *did_migrate_mask = &service_context->block_context->make_resident.pages_changed_residency;
+    uvm_page_mask_t *caller_page_mask = &service_context->block_context->caller_page_mask;
+    uvm_make_resident_cause_t cause;
+    NV_STATUS status;
+
+    switch (service_context->operation) {
+        case UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS:
+            cause = UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT;
+            break;
+        case UVM_SERVICE_OPERATION_NON_REPLAYABLE_FAULTS:
+            cause = UVM_MAKE_RESIDENT_CAUSE_NON_REPLAYABLE_FAULT;
+            break;
+        case UVM_SERVICE_OPERATION_ACCESS_COUNTERS:
+            cause = UVM_MAKE_RESIDENT_CAUSE_ACCESS_COUNTER;
+            service_context->block_context->make_resident.access_counters_buffer_index =
+                service_context->access_counters_buffer_index;
+            break;
+        default:
+            UVM_ASSERT_MSG(false, "Invalid operation value %d\n", service_context->operation);
+            cause = UVM_MAKE_RESIDENT_CAUSE_ACCESS_COUNTER;
+            break;
+    }
+
+    uvm_page_mask_zero(did_migrate_mask);
+    uvm_processor_mask_zero(all_involved_processors);
+
+    if (service_context->read_duplicate_count != 0 &&
+        uvm_page_mask_and(caller_page_mask,
+                          new_residency_mask,
+                          &service_context->read_duplicate_mask)) {
+        status = uvm_va_block_make_resident_read_duplicate(va_block,
+                                                           block_retry,
+                                                           service_context->block_context,
+                                                           new_residency,
+                                                           service_context->region,
+                                                           caller_page_mask,
+                                                           &service_context->prefetch_hint.prefetch_pages_mask,
+                                                           cause);
+        if (status != NV_OK)
+            return status;
+    }
+
+    if (service_context->read_duplicate_count == 0 ||
+        uvm_page_mask_andnot(caller_page_mask, new_residency_mask, &service_context->read_duplicate_mask)) {
+        if (service_context->read_duplicate_count == 0)
+            uvm_page_mask_copy(caller_page_mask, new_residency_mask);
+
+        status = uvm_va_block_make_resident_populate(va_block,
+                                                     block_retry,
+                                                     service_context->block_context,
+                                                     new_residency,
+                                                     service_context->region,
+                                                     caller_page_mask,
+                                                     &service_context->prefetch_hint.prefetch_pages_mask,
+                                                     cause);
+        if (status != NV_OK)
+            return status;
+    }
+
+    if (UVM_ID_IS_CPU(processor_id) && !uvm_processor_mask_empty(all_involved_processors))
+        service_context->cpu_fault.did_migrate = true;
+
+    return NV_OK;
+}
+
 NV_STATUS uvm_va_block_service_copy(uvm_processor_id_t processor_id,
                                     uvm_processor_id_t new_residency,
                                     uvm_va_block_t *va_block,
@@ -12105,6 +12347,58 @@ static NV_STATUS block_service_finish_map_accessed_by(uvm_va_block_t *va_block,
     return status;
 }
 
+// ARIADNE (HPCA'26). Copy half of the split, run on the copy kthread: issue the
+// transfer uvm_va_block_service_populate deferred, then complete servicing.
+//
+// Their version forks the whole of service_finish and prepends the copy. This
+// is a wrapper instead, because 610's service_finish already begins with
+// uvm_va_block_make_resident_finish, so only the copy itself has to be added.
+// Same effect, and it cannot drift from service_finish as 610 changes.
+//
+// new_residency comes from make_resident.dest_id rather than the caller, which
+// is what makes the two halves agree: the populate half set it, and it is still
+// there when the copy runs. processor_id is the faulting processor and is only
+// used for mapping decisions further down.
+//
+// One deliberate departure. They call block_copy_resident_pages and discard its
+// return, then update residency regardless. A failed copy would mark pages
+// resident that hold no data, which the GPU then reads. That is silent data
+// corruption rather than a performance quirk, and they clearly did not intend
+// it, since the status variable is declared and left unused. The status is
+// propagated here.
+NV_STATUS uvm_va_block_service_copy_finish(uvm_processor_id_t processor_id,
+                                           uvm_va_block_t *va_block,
+                                           uvm_service_block_context_t *service_context)
+{
+    uvm_processor_id_t new_residency = service_context->block_context->make_resident.dest_id;
+    uvm_page_mask_t *caller_page_mask = &service_context->block_context->caller_page_mask;
+    NV_STATUS status;
+    NvU64 t0;
+
+    // Same counter bank the populate half used, so the phases still sum.
+    const bool is_evict =
+        (service_context->block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION);
+    atomic64_t *ns_mkres_copy = is_evict ? &g_uvm_lock_contention_stats.ns_evict_copy
+                                         : &g_uvm_lock_contention_stats.ns_svc_copy;
+
+    t0 = uvm_lock_probe_begin();
+
+    status = block_copy_resident_pages(va_block,
+                                       service_context->block_context,
+                                       new_residency,
+                                       service_context->region,
+                                       caller_page_mask,
+                                       &service_context->prefetch_hint.prefetch_pages_mask,
+                                       UVM_VA_BLOCK_TRANSFER_MODE_MOVE);
+
+    uvm_lock_probe_end(t0, ns_mkres_copy, NULL);
+
+    if (status != NV_OK)
+        return status;
+
+    return uvm_va_block_service_finish(processor_id, va_block, service_context);
+}
+
 NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
                                       uvm_va_block_t *va_block,
                                       uvm_service_block_context_t *service_context)
@@ -12202,6 +12496,61 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
     }
 
     return NV_OK;
+}
+
+// ARIADNE (HPCA'26). Populate-only entry point, called from the fault path in
+// place of uvm_va_block_service_locked when the pipeline is on.
+//
+// It runs the populate for every destination and then returns, leaving the copy
+// and the mapping to uvm_va_block_service_copy_finish on the copy kthread. The
+// caller stages the block and picks it up on the next iteration.
+//
+// HMM blocks fall through to the stock path. uvm_hmm_va_block_service_locked
+// does its own copy internally and cannot be split at this boundary, and HMM is
+// not part of what the ARIADNE arms measure.
+NV_STATUS uvm_va_block_service_locked_populate(uvm_gpu_t *gpu,
+                                               uvm_va_block_t *va_block,
+                                               uvm_va_block_retry_t *block_retry,
+                                               uvm_service_block_context_t *service_context)
+{
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_processor_id_t processor_id = gpu ? gpu->id : UVM_ID_CPU;
+    uvm_processor_id_t new_residency;
+    NV_STATUS status = NV_OK;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    UVM_ASSERT(uvm_hmm_check_context_vma_is_valid(va_block,
+                                                  service_context->block_context->hmm.vma,
+                                                  service_context->region));
+
+    if (service_context->operation != UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS || UVM_ID_IS_CPU(processor_id))
+        uvm_assert_rwsem_locked(&va_space->lock);
+    else
+        uvm_assert_rwsem_locked_read(&va_space->lock);
+
+    uvm_va_block_get_prefetch_hint(va_block,
+                                   uvm_va_policy_get_region(va_block, service_context->region),
+                                   service_context);
+
+    for_each_id_in_mask(new_residency, &service_context->resident_processors) {
+        if (uvm_va_block_is_hmm(va_block)) {
+            status = uvm_hmm_va_block_service_locked(gpu,
+                                                     new_residency,
+                                                     va_block,
+                                                     block_retry,
+                                                     service_context);
+            if (status != NV_OK)
+                break;
+
+            continue;
+        }
+
+        status = uvm_va_block_service_populate(processor_id, new_residency, va_block, block_retry, service_context);
+        if (status != NV_OK)
+            break;
+    }
+
+    return status;
 }
 
 NV_STATUS uvm_va_block_service_locked(uvm_gpu_t *gpu,

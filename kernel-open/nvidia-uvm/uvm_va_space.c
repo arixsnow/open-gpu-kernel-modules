@@ -1790,6 +1790,84 @@ static void remove_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space,
     uvm_va_range_t *va_range_next;
     uvm_gpu_t *gpu;
 
+    // ARIADNE (HPCA'26). Stop the per-GPU threads and drop the queues.
+    //
+    // This runs before the ACTIVE guard below, matching their placement, so an
+    // inactive space still tears down cleanly.
+    //
+    // Note the scoping mismatch this inherits: the threads and queues are
+    // per-GPU but are torn down with a va_space, so the first process to exit
+    // stops them for any other process still using that GPU, and frees a struct
+    // those processes' fault paths still hold a pointer to. That is a
+    // use-after-free with concurrent clients. It is not fixed here, because
+    // fixing it means changing lifetimes their design is built on. It is
+    // avoided instead: ARIADNE arms run single-process workloads only and never
+    // the contention cells. Their own artifact never runs concurrent
+    // benchmarks and their paper has no multi-tenant leg, so the path was never
+    // exercised on their side either.
+    if (gpu_va_space && gpu_va_space->gpu) {
+        uvm_gpu_t *ar_gpu = gpu_va_space->gpu;
+        uvm_pl_entry *pl_entry, *pl_next;
+        uvm_used_entry *used_entry, *used_next;
+
+        if (ar_gpu->async_copy) {
+            if (ar_gpu->cd)
+                ar_gpu->cd->stop = 1;
+            ar_gpu->pd_copy.stop = 1;
+
+            kthread_stop(ar_gpu->async_copy);
+            ar_gpu->async_copy = NULL;
+        }
+
+        if (ar_gpu->async_eviction) {
+            kthread_stop(ar_gpu->async_eviction);
+            ar_gpu->async_eviction = NULL;
+        }
+
+        if (ar_gpu->async_unpin) {
+            kthread_stop(ar_gpu->async_unpin);
+            ar_gpu->async_unpin = NULL;
+        }
+
+        if (ar_gpu->cd) {
+            uvm_va_block_context_free(ar_gpu->cd->staged_block_context);
+            uvm_kvfree(ar_gpu->cd);
+            ar_gpu->cd = NULL;
+        }
+
+        uvm_va_block_context_free(ar_gpu->pd_copy.staged_block_context);
+        ar_gpu->pd_copy.staged_block_context = NULL;
+        ar_gpu->pd_copy.va_block = NULL;
+
+        list_for_each_entry_safe(pl_entry, pl_next, &ar_gpu->spl_blocks, spln) {
+            list_del_init(&pl_entry->spln);
+            NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+        }
+
+        list_for_each_entry_safe(pl_entry, pl_next, &ar_gpu->spled_blocks, spln) {
+            list_del_init(&pl_entry->spln);
+            NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+        }
+
+        // Clearing the block's back-pointer matters: their version leaves it
+        // dangling, and a surviving block would later dereference freed memory
+        // from the eviction path.
+        list_for_each_entry_safe(used_entry, used_next, &ar_gpu->used_blocks, spln) {
+            if (used_entry->block)
+                used_entry->block->prefetch_info.used_entry = NULL;
+
+            list_del_init(&used_entry->spln);
+            NV_KFREE(used_entry, sizeof(uvm_used_entry));
+        }
+
+        ar_gpu->active_blocks = 0;
+        ar_gpu->num_spled = 0;
+        ar_gpu->man_size = 0;
+        ar_gpu->cur_chg_2mb_pages = 0;
+        ar_gpu->max_rest_2mb_pages = 0;
+        ar_gpu->prev_free_2mb = 0;
+    }
+
     if (!gpu_va_space || uvm_gpu_va_space_state(gpu_va_space) != UVM_GPU_VA_SPACE_STATE_ACTIVE)
         return;
 

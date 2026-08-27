@@ -61,9 +61,14 @@ typedef struct
 // One VA block counted in the Working Chunk Set Size. Queued on
 // uvm_gpu_t.used_blocks; is_in_gpu distinguishes blocks currently resident
 // from ones retained speculatively after eviction.
+// gpu is not in their struct. They have no path that removes an entry when its
+// VA block dies, so the owning GPU is never needed on that side. Recording it
+// here lets block_kill unlink the entry and uncharge active_blocks without
+// having to search the GPUs for the list the entry sits on.
 typedef struct
 {
     uvm_va_block_t *block;
+    uvm_gpu_t *gpu;
     NvBool is_in_gpu;
     struct list_head spln;
 } uvm_used_entry;

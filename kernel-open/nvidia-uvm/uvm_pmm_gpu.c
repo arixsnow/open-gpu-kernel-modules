@@ -1224,8 +1224,6 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
     // non-HMM blocks, and the reaper in the fault loop can have already
     // dropped the entry.
     if (va_block->prefetch_info.used_entry) {
-        uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
-
         va_block->prefetch_info.last_migration_time = NV_GETTIME();
         va_block->prefetch_info.used_entry->is_in_gpu = 0;
 
@@ -1433,6 +1431,11 @@ NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk,
 
     UVM_ASSERT(check_chunk(pmm, chunk));
 
+    // ARIADNE (HPCA'26). One 2MB chunk has come back, so uncharge it. This is
+    // the counterpart of the increment in block_populate_gpu_chunk, and the
+    // pair is what the fault loop's free-chunk watermark reads.
+    uvm_gpu_chunk_get_gpu(chunk)->cur_chg_2mb_pages--;
+
     return NV_OK;
 
 error:
@@ -1553,7 +1556,12 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
     return UVM_PMM_ALLOC_LIST_COUNT;
 }
 
-static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
+// ARIADNE (HPCA'26) left this without callers. Its one caller was the stock
+// fallback in pick_root_chunk_to_evict, which the Sharing Degree victim scan
+// replaced. Kept rather than deleted, since it is the stock policy and is what
+// the scan would have to fall back to if that policy is ever revisited, and
+// annotated so a -Werror kernel does not fail the build over it.
+static __maybe_unused uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
 {
     uvm_pmm_alloc_list_t alloc_list;
 

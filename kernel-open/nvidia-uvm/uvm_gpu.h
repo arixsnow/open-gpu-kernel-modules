@@ -116,6 +116,11 @@ void uvm_lock_stats_procfs_exit(void);
 // an unbounded writer; the writer here clamps to this.
 #define UVM_ARIADNE_BATCH_BLOCKS_MAX 256
 
+// How long an evicted block stays counted in the Working Chunk Set Size before
+// it is aged out. Retention is what keeps the pressure signal from collapsing
+// as soon as the driver starts relieving it. 500 ms, hardcoded in their tree.
+#define UVM_ARIADNE_WCSS_RETAIN_NS 500000000ULL
+
 #define UVM_GPU_MAGIC_VALUE 0xc001d00d12341993ULL
 
 typedef struct
