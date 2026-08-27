@@ -63,11 +63,6 @@
 #include <linux/memremap.h>
 #endif
 
-// ARIADNE (HPCA'26). Average-Sharing-Degree threshold, read from the host-pin
-// decision in uvm_gpu_replayable_faults.c. See the definition in uvm_pmm_gpu.c
-// for why 15 means a mean Sharing Degree of 1.5.
-extern unsigned uvm_dynzero_thr_avg_sd;
-
 typedef enum
 {
     UVM_CHUNK_SIZE_1       =           1,
@@ -230,14 +225,6 @@ struct uvm_gpu_chunk_struct
     // if we will be able to get it from reverse map and changed
     // into smaller index for subchunks.
     NvU64 address;
-
-    // ARIADNE. last_access_time is stamped with gpu->last_access_time, the
-    // per-batch logical clock, so a chunk touched during the current fault
-    // batch can be excluded from eviction. key is the Sharing-Degree eviction
-    // priority, a coarse timestamp plus a term proportional to the block's
-    // Sharing Degree, and the victim is the chunk with the minimum key.
-    NvU64 last_access_time;
-    NvU64 key;
 
     struct
     {

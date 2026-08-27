@@ -188,17 +188,6 @@ MODULE_PARM_DESC(uvm_global_oversubscription, "Enable (1) or disable (0) global 
 static unsigned uvm_perf_pma_batch_nonpinned_order = UVM_PERF_PMA_BATCH_NONPINNED_ORDER_DEFAULT;
 module_param(uvm_perf_pma_batch_nonpinned_order, uint, S_IRUGO);
 
-// ARIADNE (HPCA'26). Average-Sharing-Degree threshold below which a workload is
-// judged sparse enough to retain evicted blocks in the WCSS speculatively.
-//
-// Read against gpu->per_gpu_count_avg, which their code divides by the ring
-// size over ten rather than the ring size, so it is ten times the true mean.
-// The value 15 therefore means a mean Sharing Degree of 1.5, not 15, and not
-// the 3 the paper states. Non-static because uvm_gpu_replayable_faults.c reads
-// it from the host-pin decision.
-unsigned uvm_dynzero_thr_avg_sd = 15;
-module_param(uvm_dynzero_thr_avg_sd, uint, S_IRUGO);
-
 // Helper type for refcounting cache
 typedef struct
 {
@@ -3168,11 +3157,6 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
         chunk->state = UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED;
         uvm_gpu_chunk_set_size(chunk, UVM_CHUNK_SIZE_MAX);
         chunk->address = i * UVM_CHUNK_SIZE_MAX;
-
-        // ARIADNE. A zero key sorts first, so an untouched chunk is the
-        // preferred eviction victim until it has been stamped.
-        chunk->last_access_time = 0;
-        chunk->key = 0;
     }
 
     status = uvm_bit_locks_init(&pmm->root_chunks.bitlocks, pmm->root_chunks.count, UVM_LOCK_ORDER_PMM_ROOT_CHUNK);

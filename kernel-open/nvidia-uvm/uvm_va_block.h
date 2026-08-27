@@ -71,11 +71,6 @@
 // Note that this means user space will get best allocation efficiency if it
 // allocates memory in 2^UVM_VA_BLOCK_BITS naturally-aligned chunks.
 
-// ARIADNE. Depth of the per-block source-uTLB ring whose distinct-ID count is
-// the Sharing Degree. Sixteen in their implementation, and the divisor in the
-// eviction priority key, so changing it changes the policy.
-#define UVM_PERF_PREFETCH_INFO_STORE_SIZE 16
-
 // enums used for indexing into the array of pte_bits bitmaps in the VA block
 // which hold the current state of each PTE. For a given {processor, PTE}, the
 // bits represented here must be enough to re-create the non-address portion of
@@ -495,41 +490,7 @@ struct uvm_va_block_struct
         uvm_processor_id_t last_migration_proc_id;
 
         NvU16 fault_migrations_to_last_proc;
-
-        // ARIADNE. last_migration_time is stamped from gpu->last_access_time
-        // on migration and eviction and drives both the WCSS retention window
-        // and the Zero-copy deadline. is_thrashed marks a block retained in
-        // the WCSS after eviction because the workload looks thrashing-prone,
-        // which is what makes it a Zero-copy candidate. used_entry is the
-        // back-pointer into gpu->used_blocks, NULL when the block is not
-        // counted. is_spled records that the block is currently host-pinned.
-        // thr_count counts how often it has been, and multiplies the pin time
-        // by five past the first.
-        NvU64 last_migration_time;
-        NvU8 is_thrashed;
-        uvm_used_entry *used_entry;
-        bool is_spled;
-        NvU8 thr_count;
     } prefetch_info;
-
-    // ARIADNE Sharing Degree. A ring of the source uTLB IDs of the most recent
-    // UVM_PERF_PREFETCH_INFO_STORE_SIZE non-prefetch faults on this block, with
-    // utlb_count maintained as the number of distinct IDs present, which is the
-    // Sharing Degree itself. diff_utlb_count tracks how volatile that count is,
-    // clamped to [0, 40] and initialised to 10.
-    //
-    // Two properties of the original worth knowing before reading any number
-    // off it. Every non-prefetch fault is pushed, not one entry per distinct
-    // uTLB per batch, so a warp storming one block from one uTLB fills the ring
-    // and yields a Sharing Degree of 1. And the ring is never cleared or aged,
-    // so a block that goes cold keeps its last Sharing Degree indefinitely.
-    struct
-    {
-        NvU8 recent_utlb_info[UVM_PERF_PREFETCH_INFO_STORE_SIZE];
-        NvU8 start;
-        NvU8 utlb_count;
-        NvU8 diff_utlb_count;
-    } utlb_info;
 
     struct
     {

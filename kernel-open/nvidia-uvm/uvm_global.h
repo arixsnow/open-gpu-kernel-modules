@@ -33,9 +33,6 @@
 #include "uvm_lock.h"
 
 // Global state of the uvm driver
-// ARIADNE (HPCA'26). Sharing-Degree-aware eviction, read from uvm_pmm_gpu.c.
-extern unsigned uvm_perf_SDaware;
-
 struct uvm_global_struct
 {
     // Mask of retained GPUs.

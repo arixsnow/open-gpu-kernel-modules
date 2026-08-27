@@ -48,11 +48,6 @@
 #include "uvm_perf_prefetch.h"
 #include "nv-kthread-q.h"
 #include <linux/mmu_notifier.h>
-
-// ARIADNE's three kthreads, their completions, and the unpin thread's sleep.
-#include <linux/kthread.h>
-#include <linux/completion.h>
-#include <linux/delay.h>
 #include "uvm_conf_computing.h"
 
 #define UVM_PARENT_GPU_UUID_PREFIX "GPU-"
@@ -104,17 +99,6 @@ void uvm_fault_pipeline_stats_procfs_exit(void);
 // Created/destroyed with the module alongside cpu/fault_stats.
 NV_STATUS uvm_lock_stats_procfs_init(void);
 void uvm_lock_stats_procfs_exit(void);
-
-// ----------------------------------------------------------------------------
-// ARIADNE (HPCA'26) shared constants and the copy-kthread payload
-// ----------------------------------------------------------------------------
-
-// Depth of the per-GPU Sharing Degree rings.
-#define UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE 100
-
-// Capacity of the per-batch VA-block exclusion set. Theirs is a bare 256 with
-// an unbounded writer; the writer here clamps to this.
-#define UVM_ARIADNE_BATCH_BLOCKS_MAX 256
 
 #define UVM_GPU_MAGIC_VALUE 0xc001d00d12341993ULL
 
@@ -252,28 +236,6 @@ struct uvm_service_block_context_struct
     // Access counters notification buffer index.
     NvU32 access_counters_buffer_index;
 };
-
-// ARIADNE (HPCA'26). Payload for the copy kthread, and the shape the fault
-// thread stages into. It must sit below uvm_service_block_context_struct
-// because it embeds one by value.
-//
-// staged_block_context is not in their design. On 535 the service context
-// embedded its uvm_va_block_context_t, so their `pd_copy.service_context =
-// *block_context` deep-copied it. On 610 that member is a pointer, so the same
-// assignment would leave the staged slot aliasing the live batch context that
-// the next loop iteration overwrites. This slot owns a context of its own and
-// the staging copies into it, which restores the semantics their code assumed.
-typedef struct
-{
-    uvm_processor_id_t processor_id, new_residency;
-    uvm_va_block_t *va_block;
-    uvm_service_block_context_t service_context;
-    uvm_va_block_context_t *staged_block_context;
-    uvm_gpu_t *gpu;
-    NV_STATUS status;
-    NvBool stop;
-    struct completion start, done;
-} parallel_data_struct;
 
 typedef struct
 {
@@ -811,91 +773,6 @@ struct uvm_gpu_struct
 
     // Should be UVM_GPU_MAGIC_VALUE. Used for memory checking.
     NvU64 magic;
-
-    // ------------------------------------------------------------------------
-    // ARIADNE (HPCA'26) per-GPU state
-    // ------------------------------------------------------------------------
-    //
-    // Their implementation hangs all of this off uvm_gpu_t and reaches it from
-    // the fault-service loop. On 610 that loop is per-parent-GPU and has no
-    // uvm_gpu_t in scope, so the sites that need it resolve the single live
-    // sub-GPU from the parent and assert there is exactly one. That assert
-    // records a limit their own artifact already has, since the prototype is
-    // documented as untested for multi-GPU.
-
-    // Zero-copy queues. spl_blocks holds candidates awaiting a host pin,
-    // spled_blocks those currently pinned and waiting for the unpin kthread.
-    struct list_head spl_blocks;
-    struct list_head spled_blocks;
-
-    // The Working Chunk Set Size, as a list of uvm_used_entry and its
-    // cardinality. man_size is the count of resident root chunks, recounted
-    // once per fault batch. The surplus of active_blocks over man_size plus
-    // the already-pinned count is how many blocks get host-pinned this batch.
-    struct list_head used_blocks;
-    NvU32 man_size;
-    NvU32 active_blocks;
-    NvU32 num_spled;
-
-    // 2MB free-page tracking, used to decide when to wake the eviction kthread.
-    NvU32 prev_free_2mb;
-    int cur_chg_2mb_pages;
-    int max_rest_2mb_pages;
-    int oversubed;
-
-    // Sharing Degree rings. per_gpu_count averages the last
-    // UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE blocks serviced; note the divisor in
-    // their code is the buffer size over ten, so per_gpu_count_avg is ten times
-    // the true mean and the thresholds compared against it are scaled to match.
-    // per_gpu_diff_count is the same construction over the volatility counter.
-    // The NvU16 widths are theirs and are load-bearing for the tuning.
-    NvU16 per_gpu_diff_count_start;
-    NvU16 per_gpu_diff_count_sum;
-    NvU16 per_gpu_diff_count[UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE];
-    NvU16 per_gpu_diff_count_avg;
-    NvU16 per_gpu_count_start;
-    NvU16 per_gpu_count_sum;
-    NvU16 per_gpu_count[UVM_GPU_PER_DIFF_COUNT_BUFFER_SIZE];
-    int per_gpu_count_avg;
-
-    // VA-block indices touched by the current fault batch, used to exclude them
-    // from eviction. Their writer has no bound against the array size; ours
-    // clamps, because 610's fetch loop can exceed the batch cap and the
-    // neighbouring fields here are thread pointers.
-    NvU32 batch_blocks[UVM_ARIADNE_BATCH_BLOCKS_MAX];
-
-    // The per-batch logical clock. Every last_access_time comparison is against
-    // this, so a chunk stamped with the current value was touched this batch.
-    NvU64 last_access_time;
-
-    // Copy, eviction and unpin kthreads. async_populate is declared in their
-    // tree and never created; Populate always runs on the faulting thread.
-    struct task_struct *async_copy, *async_populate, *async_eviction, *async_unpin;
-
-    // Payload handed to the copy kthread, and the staging slot the fault thread
-    // fills. Depth one: one block staged, one in flight, with the producer
-    // waiting on done every iteration.
-    parallel_data_struct *cd;
-
-    struct
-    {
-        uvm_processor_id_t processor_id, new_residency;
-        uvm_va_block_t *va_block;
-        uvm_service_block_context_t service_context;
-
-        // 610 makes uvm_service_block_context_t.block_context a pointer, so
-        // the struct assignment their staging relies on would alias the live
-        // batch context instead of copying it. This slot owns its own context
-        // and the staging deep-copies into it, restoring the by-value
-        // semantics their 535 code had.
-        uvm_va_block_context_t *staged_block_context;
-
-        NvBool stop;
-        struct completion start, done;
-    } pd_copy;
-
-    // Serialises the host-pin walk against the unpin kthread.
-    uvm_mutex_t pin_lock;
 
     struct
     {

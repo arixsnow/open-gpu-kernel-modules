@@ -1560,21 +1560,6 @@ static uvm_gpu_t *alloc_gpu(uvm_parent_gpu_t *parent_gpu, uvm_gpu_id_t gpu_id)
     gpu->magic = UVM_GPU_MAGIC_VALUE;
     uvm_spin_lock_init(&gpu->peer_info.peer_gpu_lock, UVM_LOCK_ORDER_LEAF);
 
-    // ARIADNE (HPCA'26) per-GPU state. uvm_kvmalloc_zero above already cleared
-    // the rings, batch_blocks and the kthread pointers, so only the non-zero
-    // initialisers are written here.
-    //
-    // man_size is deliberately left at zero rather than seeded from
-    // mem_info.max_allocatable_address the way their code does. That field is
-    // not populated this early, so their seed evaluates to zero anyway, and the
-    // value is recomputed from the used-chunk list once per fault batch.
-    INIT_LIST_HEAD(&gpu->spl_blocks);
-    INIT_LIST_HEAD(&gpu->spled_blocks);
-    INIT_LIST_HEAD(&gpu->used_blocks);
-    gpu->last_access_time = NV_GETTIME();
-    gpu->oversubed = -9900;
-    uvm_mutex_init(&gpu->pin_lock, UVM_LOCK_ORDER_VA_SPACES_LIST);
-
     sub_processor_index = uvm_id_sub_processor_index(gpu_id);
     parent_gpu->gpus[sub_processor_index] = gpu;
 

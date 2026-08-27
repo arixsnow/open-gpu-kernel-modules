@@ -93,19 +93,6 @@ MODULE_PARM_DESC(uvm_exp_gpu_cache_sysmem,
                  "This is an experimental parameter that may cause correctness issues if used.");
 
 static void block_add_eviction_mappings_entry(void *args);
-
-// ARIADNE (HPCA'26). Coefficient in the eviction priority key,
-//
-//     key = (gpu->last_access_time >> 10) + ((coeff * SD) >> 4)
-//
-// where SD is the block's Sharing Degree and the victim is the minimum key.
-// The timestamp is nanoseconds shifted right by ten, so its unit is about
-// 1.024 us, and the SD term is coeff/16 of those units per unit of Sharing
-// Degree. At 1000000 that is roughly 62.5 ms of recency credit per unit of SD,
-// not the 100 us the paper states. Kept at their value, since their published
-// numbers came from it.
-static unsigned uvm_perf_SD_coeff_evictqueue = 1000000;
-module_param(uvm_perf_SD_coeff_evictqueue, uint, S_IRUGO);
 static void block_unmap_cpu(uvm_va_block_t *block,
                             uvm_va_block_context_t *block_context,
                             uvm_va_block_region_t region,
@@ -1389,11 +1376,6 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
     block->managed_range = managed_range;
     uvm_tracker_init(&block->tracker);
     block->prefetch_info.last_migration_proc_id = UVM_ID_INVALID;
-
-    // ARIADNE (HPCA'26). The block is kzalloc'd, so only the non-zero
-    // initialiser matters: diff_utlb_count starts mid-range at 10 and is
-    // clamped to [0, 40] as the Sharing Degree proves steady or volatile.
-    block->utlb_info.diff_utlb_count = 10;
 
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
 
@@ -3498,30 +3480,8 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
     // If the block is of the max size, mark the root chunk as used in PMM.
     // HMM always allocates PAGE_SIZE GPU chunks so skip HMM va_blocks.
     if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
-        uvm_pmm_gpu_t *pmm = &gpu->pmm;
-        uvm_gpu_chunk_t *chunk;
-        NvU32 sd;
-        NvU64 key;
-
         // The chunk has to be there if this GPU is resident
         UVM_ASSERT(uvm_processor_mask_test(&block->resident, id));
-
-        chunk = uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0];
-
-        // ARIADNE (HPCA'26) eviction priority. The timestamp is the per-batch
-        // logical clock in units of about 1.024 us, and the Sharing Degree adds
-        // recency credit proportional to how many uTLBs are touching the block,
-        // so densely shared blocks survive longer. The victim scan takes the
-        // minimum key.
-        sd = (NvU32)block->utlb_info.utlb_count;
-        key = (gpu->last_access_time >> 10) +
-              (((NvU64)uvm_perf_SD_coeff_evictqueue * sd) >> 4);
-
-        uvm_spin_lock(&pmm->list_lock);
-        chunk->last_access_time = gpu->last_access_time;
-        chunk->key = key;
-        uvm_spin_unlock(&pmm->list_lock);
-
         uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm, uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0]);
     }
 }
@@ -5081,14 +5041,8 @@ void uvm_va_block_make_resident_finish(uvm_va_block_t *va_block,
     //
     // Skip this if we didn't do anything (the input region and/or page mask was
     // empty).
-    // ARIADNE (HPCA'26). Suppressed so the eviction key is stamped once per
-    // residency transition, from block_set_resident_processor, rather than
-    // again on every make-resident. Their tree comments this call out for the
-    // same reason. The ever_fully_resident update below is stock 610 and stays,
-    // since block_populate_gpu_chunk reads it.
-    //
-    // if (uvm_processor_mask_test(&va_block->resident, dst_id))
-    //     block_mark_memory_used(va_block, dst_id);
+    if (uvm_processor_mask_test(&va_block->resident, dst_id))
+        block_mark_memory_used(va_block, dst_id);
 
     if (UVM_ID_IS_GPU(dst_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dst_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dst_id);
@@ -5341,11 +5295,8 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
     //
     // Skip this if we didn't do anything (the input region and/or page mask was
     // empty).
-    // ARIADNE (HPCA'26). Suppressed for the same reason as the equivalent call
-    // in uvm_va_block_make_resident_finish above.
-    //
-    // if (uvm_processor_mask_test(&va_block->resident, dest_id))
-    //     block_mark_memory_used(va_block, dest_id);
+    if (uvm_processor_mask_test(&va_block->resident, dest_id))
+        block_mark_memory_used(va_block, dest_id);
 
     if (UVM_ID_IS_GPU(dest_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dest_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_id);
@@ -11364,13 +11315,7 @@ static uvm_processor_id_t block_select_processor_residency(uvm_va_block_t *va_bl
         return UVM_ID_CPU;
     }
 
-    // ARIADNE (HPCA'26) forces this false. A read-duplicated page is resident
-    // in more than one place at once, so it has no single residency for the
-    // Sharing Degree to describe or for Zero-copy to pin, and the host-pin path
-    // in uvm_policy.c would refuse it. Their tree makes the same change.
-    //
-    // may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
-    may_read_duplicate = false;
+    may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
 
     // Read/prefetch faults on a VA range with read duplication enabled
     // always create a copy of the page on the faulting processor's memory.
