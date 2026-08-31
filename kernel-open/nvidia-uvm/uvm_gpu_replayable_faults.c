@@ -185,6 +185,61 @@ static uvm_gpu_t *ariadne_gpu(uvm_parent_gpu_t *parent_gpu)
     return gpu;
 }
 
+// Non-blocking version of uvm_va_space_down_read, for the unpin kthread.
+//
+// The blocking one deadlocks against teardown. remove_gpu_va_space runs under
+// uvm_va_space_down_write and calls kthread_stop on this thread, and kthread_stop
+// waits for the thread to exit. If the thread is sitting in down_read on that
+// same va_space it can never get the lock, never exits, and both sides are stuck
+// with the write lock held. Every process exit is a chance to hit it.
+//
+// Mirrors the macro's two acquisitions exactly, including the out-of-order
+// unlock, and takes neither if it cannot take both. A failed attempt just means
+// the entry waits for the next sweep forty milliseconds later, which is the same
+// answer the thread already gives when its pin_lock trylock fails.
+static bool ariadne_va_space_tryread(uvm_va_space_t *va_space)
+{
+    if (!uvm_mutex_trylock(&va_space->read_acquire_write_release_lock))
+        return false;
+
+    if (!uvm_down_read_trylock(&va_space->lock)) {
+        uvm_mutex_unlock(&va_space->read_acquire_write_release_lock);
+        return false;
+    }
+
+    uvm_mutex_unlock_out_of_order(&va_space->read_acquire_write_release_lock);
+    return true;
+}
+
+// Wait for a kthread to hand the batch back, and say so if it does not.
+//
+// The plain wait_for_completion this replaces was silent. When the copy thread
+// exited on its stop flag without posting done, the fault thread parked here
+// forever holding the va_space read lock, the faulting process went into
+// uninterruptible sleep and could not be killed, and teardown could never take
+// the write lock to stop the thread. From outside, the box showed a stalled
+// runner and an nvidia-smi with no processes on it, and nothing anywhere said
+// which wait was stuck.
+//
+// The missing completions are fixed, so this should never fire. It exists
+// because the next such bug should announce itself in dmesg rather than
+// presenting as an unexplained stall, and because the hung-task detector needs
+// something in the log to sit beside its own trace.
+static void ariadne_wait_done(struct completion *done, const char *which)
+{
+    // 10 seconds. A 2MB block copy is microseconds, so anything approaching
+    // this is already a failure rather than a slow path.
+    const unsigned long warn_after = msecs_to_jiffies(10000);
+    unsigned long waited = 0;
+
+    while (wait_for_completion_timeout(done, warn_after) == 0) {
+        waited += 10;
+        UVM_ERR_PRINT("ARIADNE %s thread has not completed after %lu s. The fault "
+                      "handler is stuck and this GPU is not servicing faults.\n",
+                      which, waited);
+    }
+}
+
 // This function is used for both the initial fault buffer initialization and
 // the power management resume path.
 static void fault_buffer_reinit_replayable_faults(uvm_parent_gpu_t *parent_gpu)
@@ -1491,10 +1546,23 @@ static int uvm_gpu_copy(void *data)
 
         reinit_completion(&pcd->start);
 
-        if (pcd->stop)
-            break;
-
-        if (pcd->va_block) {
+        // The doorbell has been consumed by this point, so the fault thread is
+        // already committed to waiting on done. Every path out of here from now
+        // on has to post it.
+        //
+        // Getting this wrong is what wedged the first run of the ARIADNE arm:
+        // the stop check below used to break straight out of the loop, leaving
+        // the fault thread parked in an unbounded wait_for_completion inside
+        // uvm_parent_gpu_service_replayable_faults, holding the va_space read
+        // lock. The task was then unkillable and teardown could never take the
+        // write lock to stop this thread, so nothing could recover the GPU.
+        //
+        // The kthread_should_stop() test in the loop condition looks like the
+        // same hazard and is not one. kthread_stop comes from
+        // remove_gpu_va_space, which runs under the va_space write lock, and the
+        // fault thread holds the read lock across its wait. The two cannot
+        // overlap, so the loop can only exit there with no batch in flight.
+        if (!pcd->stop && pcd->va_block) {
             for_each_id_in_mask(new_residency, &pcd->service_context.resident_processors) {
                 pcd->status = uvm_va_block_service_copy_finish(pcd->processor_id,
                                                                pcd->va_block,
@@ -1509,6 +1577,9 @@ static int uvm_gpu_copy(void *data)
         pcd->gpu->pd_copy.processor_id = UVM_ID_INVALID;
 
         complete(&pcd->done);
+
+        if (pcd->stop)
+            break;
     }
 
     return 0;
@@ -1534,8 +1605,12 @@ static int uvm_gpu_evict_root_chunks_async_agr(void *data)
 
         reinit_completion(&gpu->pd_copy.start);
 
-        if (gpu->pd_copy.stop)
+        // Same rule as the copy thread. The doorbell is consumed, so done must
+        // be posted before leaving, or the fault thread waits forever.
+        if (gpu->pd_copy.stop) {
+            complete(&gpu->pd_copy.done);
             break;
+        }
 
         // One 2MB chunk per wake. Theirs loops until it has freed one, with an
         // unchecked NULL from the picker and a double unlock on the error path.
@@ -1622,8 +1697,25 @@ static int uvm_gpu_unpin_period(void *data)
             if (entry->endtime > now)
                 continue;
 
+            // One narrower version of the same deadlock is left standing here.
+            // This takes mmap_lock for read, and teardown holds a read lock on
+            // it too, so the two do not block each other on their own. They do
+            // if a writer is queued between them: the new reader waits behind
+            // the writer, the thread does not exit, and kthread_stop waits for
+            // it. Closing it means adding an mmap read trylock, which this tree
+            // has no wrapper for, so the fix would be a new locking primitive
+            // rather than a use of an existing one. Left as is, and the
+            // hung-task detector the runner arms turns it into a reboot after
+            // 300 s rather than a wedged box.
             mm = uvm_va_space_mm_retain_lock(entry->va_space);
-            uvm_va_space_down_read(entry->va_space);
+
+            // Never block here. See ariadne_va_space_tryread for why: blocking
+            // on this lock deadlocks against the teardown that is trying to stop
+            // this very thread. Leave the entry queued and move on.
+            if (!ariadne_va_space_tryread(entry->va_space)) {
+                uvm_va_space_mm_release_unlock(entry->va_space, mm);
+                continue;
+            }
 
             // Their code does not check this return before dereferencing the
             // block. The va_space can have dropped the range while the block
@@ -2984,7 +3076,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
 
             if (ar_gpu && ar_gpu->cd) {
-                wait_for_completion(&ar_gpu->cd->done);
+                ariadne_wait_done(&ar_gpu->cd->done, "copy");
                 reinit_completion(&ar_gpu->cd->done);
             }
 
@@ -2995,7 +3087,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
 
             if (ar_gpu) {
-                wait_for_completion(&ar_gpu->pd_copy.done);
+                ariadne_wait_done(&ar_gpu->pd_copy.done, "eviction");
                 reinit_completion(&ar_gpu->pd_copy.done);
             }
 
