@@ -211,6 +211,40 @@ static bool ariadne_va_space_tryread(uvm_va_space_t *va_space)
     return true;
 }
 
+// Copy a block context without copying the allocation it owns.
+//
+// uvm_va_block_context_t is not safe to assign. It owns node_masks, an array of
+// num_possible_nodes() page masks that block_context_alloc_tracking allocates and
+// uvm_va_block_context_free releases. A struct assignment copies that pointer, so
+// the destination's own array is leaked and two contexts are left owning one
+// allocation. Teardown then frees both, block_context_free_tracking runs twice over
+// the same slab objects, and the freelist is corrupted. That is what crashed the
+// first three ARIADNE runs, as a general protection fault in kmem_cache_free under
+// remove_gpu_va_space, and it also left the live batch context pointing at freed
+// memory once staging had run.
+//
+// uvm_va_block_context_init saves and restores this same field for the same reason.
+//
+// The contents are copied rather than only the ownership restored, because the copy
+// stage reads the tracking: uvm_va_block_make_resident_finish iterates
+// cpu_pages_used.nodes and reads the per-node masks. nodes is a nodemask_t held by
+// value, so the assignment already carries it.
+static void ariadne_block_context_copy(uvm_va_block_context_t *dst,
+                                       const uvm_va_block_context_t *src)
+{
+    uvm_page_mask_t **dst_masks = dst->make_resident.cpu_pages_used.node_masks;
+    uvm_page_mask_t **src_masks = src->make_resident.cpu_pages_used.node_masks;
+    size_t i;
+
+    *dst = *src;
+    dst->make_resident.cpu_pages_used.node_masks = dst_masks;
+
+    for (i = 0; i < num_possible_nodes(); i++) {
+        if (dst_masks[i] && src_masks[i])
+            uvm_page_mask_copy(dst_masks[i], src_masks[i]);
+    }
+}
+
 // Wait for a kthread to hand the batch back, and say so if it does not.
 //
 // The plain wait_for_completion this replaces was silent. When the copy thread
@@ -2107,7 +2141,11 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
                 // next loop iteration overwrites while the copy thread is
                 // reading it. The slot owns a context and the contents are
                 // copied into it, restoring what their code assumed.
-                *staged = *block_context->block_context;
+                //
+                // Through the helper, not a struct assignment: the context owns
+                // a per-node mask array that a plain copy would alias into the
+                // live context and teardown would then free twice.
+                ariadne_block_context_copy(staged, block_context->block_context);
 
                 gpu->pd_copy.service_context = *block_context;
                 gpu->pd_copy.service_context.block_context = staged;
@@ -3044,8 +3082,13 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                     ar_gpu->cd->gpu = ar_gpu;
                     ar_gpu->cd->va_block = ar_gpu->pd_copy.va_block;
 
-                    // Second deep copy, for the same reason as the staging one.
-                    *ar_gpu->cd->staged_block_context = *ar_gpu->pd_copy.staged_block_context;
+                    // Second deep copy, for the same reason as the staging one,
+                    // and through the same helper. A struct assignment here was
+                    // the second half of the double free: it gave cd's context
+                    // the staging slot's mask array, so teardown released one
+                    // allocation twice.
+                    ariadne_block_context_copy(ar_gpu->cd->staged_block_context,
+                                               ar_gpu->pd_copy.staged_block_context);
                     ar_gpu->cd->service_context = ar_gpu->pd_copy.service_context;
                     ar_gpu->cd->service_context.block_context = ar_gpu->cd->staged_block_context;
 
