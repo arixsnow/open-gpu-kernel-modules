@@ -727,6 +727,22 @@ bool __uvm_locking_initialized(void);
         nv_mmap_read_lock(_mm);                         \
     })
 
+// Non-blocking uvm_down_read_mmap_lock. Evaluates to true with the lock held,
+// or false with nothing taken and nothing recorded.
+//
+// A kernel thread that can be the target of kthread_stop cannot afford to block
+// here. Teardown holds this same mmap_lock for read, so the two do not contend
+// directly, but a writer queued between them puts the new reader behind it and
+// the thread never reaches its exit. Callers that can retry should use this and
+// come back on the next sweep.
+#define uvm_down_read_mmap_lock_trylock(mm) ({          \
+        typeof(mm) _mm = (mm);                          \
+        bool _locked = nv_mmap_read_trylock(_mm) != 0;  \
+        if (_locked)                                    \
+            uvm_record_lock_mmap_lock_read(_mm);        \
+        _locked;                                        \
+    })
+
 #define uvm_up_read_mmap_lock(mm) ({                    \
         typeof(mm) _mm = (mm);                          \
         nv_mmap_read_unlock(_mm);                       \

@@ -1596,20 +1596,47 @@ static int uvm_gpu_copy(void *data)
         // remove_gpu_va_space, which runs under the va_space write lock, and the
         // fault thread holds the read lock across its wait. The two cannot
         // overlap, so the loop can only exit there with no batch in flight.
+        // The id has to be a GPU before it is used. uvm_va_block_map calls
+        // uvm_gpu_get, which indexes g_uvm_global.parent_gpus with no bounds
+        // check of its own; the only check is the UVM_ASSERT inside
+        // uvm_id_gpu_index, and this arm is built release-only, so that assert
+        // is compiled out. UVM_ID_INVALID lands exactly one past the end of a
+        // 32-entry array and the pointer read back from there is what oopsed.
+        //
+        // After the staging slot became single-writer this cannot happen, which
+        // is why it prints rather than repairs. Same role as ariadne_wait_done:
+        // the next defect of this class says so in dmesg instead of taking the
+        // box down with it.
         if (!pcd->stop && pcd->va_block) {
-            for_each_id_in_mask(new_residency, &pcd->service_context.resident_processors) {
-                pcd->status = uvm_va_block_service_copy_finish(pcd->processor_id,
-                                                               pcd->va_block,
-                                                               &pcd->service_context);
-                if (pcd->status != NV_OK)
-                    break;
+            if (UVM_ID_IS_GPU(pcd->processor_id)) {
+                for_each_id_in_mask(new_residency, &pcd->service_context.resident_processors) {
+                    pcd->status = uvm_va_block_service_copy_finish(pcd->processor_id,
+                                                                   pcd->va_block,
+                                                                   &pcd->service_context);
+                    if (pcd->status != NV_OK)
+                        break;
+                }
+            }
+            else {
+                UVM_ERR_PRINT("ARIADNE copy thread was handed a batch with processor id %u, "
+                              "which is not a GPU. The staging slot has more than one writer "
+                              "again. Batch dropped.\n",
+                              uvm_id_value(pcd->processor_id));
+
+                // Recorded for the same reason the NV_OK path records it: status
+                // is this thread's own bookkeeping and nothing outside the loop
+                // reads it. Theirs does not propagate it either.
+                pcd->status = NV_ERR_INVALID_STATE;
             }
         }
 
-        pcd->gpu->pd_copy.va_block = NULL;
-        pcd->gpu->pd_copy.new_residency = UVM_ID_INVALID;
-        pcd->gpu->pd_copy.processor_id = UVM_ID_INVALID;
-
+        // The staging slot is NOT cleared here. It belongs to the fault thread,
+        // which drains it at the hand-off in service_fault_batch. Clearing it
+        // from this thread is what crashed the 20260831_213654 campaign: the
+        // fault thread refills the slot from service_fault_batch_dispatch while
+        // this thread is still running, so the two raced on va_block and
+        // processor_id with nothing ordering them, and the fault thread's guard
+        // tests va_block while the payload comes from processor_id.
         complete(&pcd->done);
 
         if (pcd->stop)
@@ -1731,21 +1758,22 @@ static int uvm_gpu_unpin_period(void *data)
             if (entry->endtime > now)
                 continue;
 
-            // One narrower version of the same deadlock is left standing here.
-            // This takes mmap_lock for read, and teardown holds a read lock on
-            // it too, so the two do not block each other on their own. They do
-            // if a writer is queued between them: the new reader waits behind
-            // the writer, the thread does not exit, and kthread_stop waits for
-            // it. Closing it means adding an mmap read trylock, which this tree
-            // has no wrapper for, so the fix would be a new locking primitive
-            // rather than a use of an existing one. Left as is, and the
-            // hung-task detector the runner arms turns it into a reboot after
-            // 300 s rather than a wedged box.
-            mm = uvm_va_space_mm_retain_lock(entry->va_space);
+            // Never block on either lock. Both deadlock against the teardown
+            // that is trying to stop this very thread.
+            //
+            // mmap_lock is the narrower of the two. Teardown holds it for read
+            // as well, so the two do not block each other on their own; they do
+            // once a writer is queued between them, because the new reader
+            // waits behind the writer, the thread never exits, and kthread_stop
+            // waits for the thread. See ariadne_va_space_tryread for the
+            // va_space half.
+            //
+            // A failed attempt costs one sweep. The entry stays queued and is
+            // reconsidered forty milliseconds later, which is the same answer
+            // both trylocks already give.
+            if (!uvm_va_space_mm_retain_trylock(entry->va_space, &mm))
+                continue;
 
-            // Never block here. See ariadne_va_space_tryread for why: blocking
-            // on this lock deadlocks against the teardown that is trying to stop
-            // this very thread. Leave the entry queued and move on.
             if (!ariadne_va_space_tryread(entry->va_space)) {
                 uvm_va_space_mm_release_unlock(entry->va_space, mm);
                 continue;
@@ -1787,6 +1815,172 @@ static int uvm_gpu_unpin_period(void *data)
     }
 
     return 0;
+}
+
+// Stop the three kthreads and free the payload they share with the fault path.
+// Caller holds pin_lock.
+//
+// Holding pin_lock across kthread_stop is deliberate, and is what makes a
+// va_space registering during this teardown wait for it rather than attach to
+// threads that are going away. The wait is bounded: the copy and eviction
+// threads busy-spin and leave on their stop flags immediately, and the unpin
+// thread's msleep_interruptible is woken by kthread_stop while its own pin_lock
+// acquisition is a trylock, so it fails, loops, and reaches its exit check
+// without ever blocking here.
+static void ariadne_stop_threads(uvm_gpu_t *gpu)
+{
+    uvm_assert_mutex_locked(&gpu->pin_lock);
+
+    if (gpu->async_copy) {
+        if (gpu->cd)
+            gpu->cd->stop = 1;
+        gpu->pd_copy.stop = 1;
+
+        kthread_stop(gpu->async_copy);
+        gpu->async_copy = NULL;
+    }
+
+    if (gpu->async_eviction) {
+        kthread_stop(gpu->async_eviction);
+        gpu->async_eviction = NULL;
+    }
+
+    if (gpu->async_unpin) {
+        kthread_stop(gpu->async_unpin);
+        gpu->async_unpin = NULL;
+    }
+
+    if (gpu->cd) {
+        uvm_va_block_context_free(gpu->cd->staged_block_context);
+        uvm_kvfree(gpu->cd);
+        gpu->cd = NULL;
+    }
+
+    uvm_va_block_context_free(gpu->pd_copy.staged_block_context);
+    gpu->pd_copy.staged_block_context = NULL;
+    gpu->pd_copy.va_block = NULL;
+}
+
+// Drop every queue entry belonging to one va_space. Caller holds pin_lock.
+//
+// This is the genuinely per-va_space part of teardown: the entries name a
+// va_space that is going away, so the kthreads must not be left to walk them.
+// The counters come down per entry rather than being zeroed, because the queues
+// may still hold other clients' entries.
+static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
+{
+    uvm_pl_entry *pl_entry, *pl_next;
+    uvm_used_entry *used_entry, *used_next;
+
+    uvm_assert_mutex_locked(&gpu->pin_lock);
+
+    list_for_each_entry_safe(pl_entry, pl_next, &gpu->spl_blocks, spln) {
+        if (dying && pl_entry->va_space != dying)
+            continue;
+
+        list_del_init(&pl_entry->spln);
+        NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+    }
+
+    list_for_each_entry_safe(pl_entry, pl_next, &gpu->spled_blocks, spln) {
+        if (dying && pl_entry->va_space != dying)
+            continue;
+
+        list_del_init(&pl_entry->spln);
+        NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+
+        if (gpu->num_spled)
+            gpu->num_spled--;
+    }
+
+    // block_kill already unlinks a used_entry when its block dies, and tearing
+    // down a va_space kills its blocks, so this is a safety net rather than the
+    // primary mechanism.
+    //
+    // Clearing the block's back-pointer matters: their version leaves it
+    // dangling, and a surviving block would later dereference freed memory from
+    // the eviction path.
+    list_for_each_entry_safe(used_entry, used_next, &gpu->used_blocks, spln) {
+        // The NULL block test belongs to the filter, not to the loop. An entry
+        // with no block cannot be matched against a va_space, so it is skipped
+        // while filtering, but the unfiltered sweep still has to free it or GPU
+        // removal leaks it.
+        if (dying) {
+            if (!used_entry->block || uvm_va_block_get_va_space_maybe_dead(used_entry->block) != dying)
+                continue;
+        }
+
+        if (used_entry->block)
+            used_entry->block->prefetch_info.used_entry = NULL;
+
+        list_del_init(&used_entry->spln);
+        NV_KFREE(used_entry, sizeof(uvm_used_entry));
+
+        if (gpu->active_blocks)
+            gpu->active_blocks--;
+    }
+}
+
+void uvm_ariadne_gpu_va_space_get(uvm_gpu_t *gpu)
+{
+    uvm_mutex_lock(&gpu->pin_lock);
+    gpu->ariadne_users++;
+    uvm_mutex_unlock(&gpu->pin_lock);
+}
+
+void uvm_ariadne_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying)
+{
+    uvm_mutex_lock(&gpu->pin_lock);
+
+    ariadne_drop_va_space_entries(gpu, dying);
+
+    // Their code stops the threads here unconditionally, which strands every
+    // other client on this GPU and frees a cd struct their fault paths still
+    // point at. The only thing added is the count: stop on the last user out,
+    // which for a single-client run is every process exit, exactly as theirs
+    // behaved.
+    if (gpu->ariadne_users && --gpu->ariadne_users == 0) {
+        ariadne_stop_threads(gpu);
+
+        // Safe to zero only now that no client and no thread is left. These
+        // describe the GPU rather than any one client, and they are recomputed
+        // per fault batch anyway, so this is tidiness rather than correctness.
+        gpu->man_size = 0;
+        gpu->cur_chg_2mb_pages = 0;
+        gpu->max_rest_2mb_pages = 0;
+        gpu->prev_free_2mb = 0;
+    }
+
+    uvm_mutex_unlock(&gpu->pin_lock);
+}
+
+// Final sweep at GPU removal. By here the refcount is zero and the threads are
+// long stopped; what can remain is a queue entry whose va_space went away by a
+// path that never reached uvm_ariadne_gpu_va_space_put.
+void uvm_ariadne_gpu_deinit(uvm_gpu_t *gpu)
+{
+    uvm_mutex_lock(&gpu->pin_lock);
+
+    if (gpu->ariadne_users) {
+        UVM_ERR_PRINT("ARIADNE: GPU removed with %u va_space users still counted. "
+                      "A get without its put.\n",
+                      gpu->ariadne_users);
+        gpu->ariadne_users = 0;
+    }
+
+    ariadne_stop_threads(gpu);
+
+    // NULL dying: take everything, whoever it belonged to.
+    ariadne_drop_va_space_entries(gpu, NULL);
+
+    gpu->active_blocks = 0;
+    gpu->num_spled = 0;
+    gpu->man_size = 0;
+    gpu->cur_chg_2mb_pages = 0;
+    gpu->max_rest_2mb_pages = 0;
+    gpu->prev_free_2mb = 0;
+
+    uvm_mutex_unlock(&gpu->pin_lock);
 }
 
 // interrupted on fatal faults due to insufficient permissions or invalid
@@ -2870,7 +3064,30 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     if (uvm_perf_fhp && service_mode != FAULT_SERVICE_MODE_CANCEL) {
         uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
 
-        if (ar_gpu && !ar_gpu->async_copy) {
+        // Bring-up runs under pin_lock so it cannot overlap the teardown in
+        // uvm_ariadne_gpu_va_space_put. Without it a process registering while
+        // the previous one's last put is stopping the threads could see a NULL
+        // async_copy, allocate a second cd, and start a second set of threads
+        // against the one being torn down.
+        //
+        // Double-checked, so the steady state costs exactly what theirs costs:
+        // one load of async_copy and no lock. Taking the lock unconditionally
+        // here would put a mutex on every fault batch for the life of the
+        // module, which is a cost their code does not have and this measurement
+        // should not invent.
+        //
+        // The unsynchronised outer read is safe. Teardown only runs when the
+        // last va_space using this GPU goes away, and this path is servicing a
+        // fault for a va_space that is still registered, so the count is at
+        // least one and no teardown can be in flight beneath it. The lock is
+        // for the bring-up race between two processes, and the re-test under it
+        // is what settles that.
+        const bool ar_bringup = ar_gpu && !ar_gpu->async_copy;
+
+        if (ar_bringup)
+            uvm_mutex_lock(&ar_gpu->pin_lock);
+
+        if (ar_bringup && !ar_gpu->async_copy) {
             ar_gpu->cd = uvm_kvmalloc_zero(sizeof(*ar_gpu->cd));
 
             if (ar_gpu->cd) {
@@ -2930,6 +3147,9 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                 ar_gpu->pd_copy.staged_block_context = NULL;
             }
         }
+
+        if (ar_bringup)
+            uvm_mutex_unlock(&ar_gpu->pin_lock);
     }
 
     for (i = 0; i < batch_context->num_coalesced_faults;) {
@@ -3091,6 +3311,24 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                                                ar_gpu->pd_copy.staged_block_context);
                     ar_gpu->cd->service_context = ar_gpu->pd_copy.service_context;
                     ar_gpu->cd->service_context.block_context = ar_gpu->cd->staged_block_context;
+
+                    // Drain the staging slot here, on the thread that owns it,
+                    // rather than from the copy kthread once it is done with the
+                    // batch. Their code cleared it from the consumer, which gave
+                    // the slot two writers: this thread refills it from
+                    // service_fault_batch_dispatch below while that thread is
+                    // still running, and nothing orders the two sets of stores.
+                    // A batch could then reach the copy thread with va_block set
+                    // from one staging and processor_id already cleared by the
+                    // other, and UVM_ID_INVALID indexes one past
+                    // g_uvm_global.parent_gpus in uvm_va_block_map.
+                    //
+                    // The reason their clear existed is kept. The block has been
+                    // handed to cd, so the guard above must not kick it a second
+                    // time before :2153 stages a new one.
+                    ar_gpu->pd_copy.va_block = NULL;
+                    ar_gpu->pd_copy.processor_id = UVM_ID_INVALID;
+                    ar_gpu->pd_copy.new_residency = UVM_ID_INVALID;
 
                     complete(&ar_gpu->cd->start);
                     ariadne_copy_pending = true;

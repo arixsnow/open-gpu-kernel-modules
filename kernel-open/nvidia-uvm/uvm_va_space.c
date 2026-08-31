@@ -1619,6 +1619,10 @@ static void add_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space)
     uvm_processor_mask_set(&va_space->registered_gpu_va_spaces, gpu->id);
     va_space->gpu_va_spaces[uvm_id_gpu_index(gpu->id)] = gpu_va_space;
     gpu_va_space->state = UVM_GPU_VA_SPACE_STATE_ACTIVE;
+
+    // ARIADNE (HPCA'26). This is the only ACTIVE transition, so it is where the
+    // per-GPU kthreads gain a user. remove_gpu_va_space drops it again.
+    uvm_ariadne_gpu_va_space_get(gpu);
 }
 
 static NV_STATUS check_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space)
@@ -1790,83 +1794,26 @@ static void remove_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space,
     uvm_va_range_t *va_range_next;
     uvm_gpu_t *gpu;
 
-    // ARIADNE (HPCA'26). Stop the per-GPU threads and drop the queues.
+    // ARIADNE (HPCA'26). Give up this va_space's claim on the per-GPU kthreads
+    // and drop the queue entries that name it.
     //
-    // This runs before the ACTIVE guard below, matching their placement, so an
-    // inactive space still tears down cleanly.
+    // Their code stops the threads and empties all three queues here
+    // unconditionally. That is a scoping error rather than a design choice: the
+    // threads, the cd payload and the queues all belong to the GPU, and a
+    // va_space is one of possibly several users of it. With two clients the
+    // first to exit stopped threads the second was still using and freed the cd
+    // struct that client's fault path still pointed at.
     //
-    // Note the scoping mismatch this inherits: the threads and queues are
-    // per-GPU but are torn down with a va_space, so the first process to exit
-    // stops them for any other process still using that GPU, and frees a struct
-    // those processes' fault paths still hold a pointer to. That is a
-    // use-after-free with concurrent clients. It is not fixed here, because
-    // fixing it means changing lifetimes their design is built on. It is
-    // avoided instead: ARIADNE arms run single-process workloads only and never
-    // the contention cells. Their own artifact never runs concurrent
-    // benchmarks and their paper has no multi-tenant leg, so the path was never
-    // exercised on their side either.
-    if (gpu_va_space && gpu_va_space->gpu) {
-        uvm_gpu_t *ar_gpu = gpu_va_space->gpu;
-        uvm_pl_entry *pl_entry, *pl_next;
-        uvm_used_entry *used_entry, *used_next;
-
-        if (ar_gpu->async_copy) {
-            if (ar_gpu->cd)
-                ar_gpu->cd->stop = 1;
-            ar_gpu->pd_copy.stop = 1;
-
-            kthread_stop(ar_gpu->async_copy);
-            ar_gpu->async_copy = NULL;
-        }
-
-        if (ar_gpu->async_eviction) {
-            kthread_stop(ar_gpu->async_eviction);
-            ar_gpu->async_eviction = NULL;
-        }
-
-        if (ar_gpu->async_unpin) {
-            kthread_stop(ar_gpu->async_unpin);
-            ar_gpu->async_unpin = NULL;
-        }
-
-        if (ar_gpu->cd) {
-            uvm_va_block_context_free(ar_gpu->cd->staged_block_context);
-            uvm_kvfree(ar_gpu->cd);
-            ar_gpu->cd = NULL;
-        }
-
-        uvm_va_block_context_free(ar_gpu->pd_copy.staged_block_context);
-        ar_gpu->pd_copy.staged_block_context = NULL;
-        ar_gpu->pd_copy.va_block = NULL;
-
-        list_for_each_entry_safe(pl_entry, pl_next, &ar_gpu->spl_blocks, spln) {
-            list_del_init(&pl_entry->spln);
-            NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
-        }
-
-        list_for_each_entry_safe(pl_entry, pl_next, &ar_gpu->spled_blocks, spln) {
-            list_del_init(&pl_entry->spln);
-            NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
-        }
-
-        // Clearing the block's back-pointer matters: their version leaves it
-        // dangling, and a surviving block would later dereference freed memory
-        // from the eviction path.
-        list_for_each_entry_safe(used_entry, used_next, &ar_gpu->used_blocks, spln) {
-            if (used_entry->block)
-                used_entry->block->prefetch_info.used_entry = NULL;
-
-            list_del_init(&used_entry->spln);
-            NV_KFREE(used_entry, sizeof(uvm_used_entry));
-        }
-
-        ar_gpu->active_blocks = 0;
-        ar_gpu->num_spled = 0;
-        ar_gpu->man_size = 0;
-        ar_gpu->cur_chg_2mb_pages = 0;
-        ar_gpu->max_rest_2mb_pages = 0;
-        ar_gpu->prev_free_2mb = 0;
-    }
+    // Refcounted instead, so the threads stop on the last user out. For a
+    // single-client run that is every process exit, which is exactly where and
+    // when their code stopped them, so nothing about their timing changes.
+    //
+    // Guarded on ACTIVE to pair one-for-one with the get in add_gpu_va_space.
+    // The state becomes DEAD further down in this function, so a second call
+    // early-returns before reaching here and cannot double-drop the count.
+    if (gpu_va_space && gpu_va_space->gpu && gpu_va_space->va_space &&
+        uvm_gpu_va_space_state(gpu_va_space) == UVM_GPU_VA_SPACE_STATE_ACTIVE)
+        uvm_ariadne_gpu_va_space_put(gpu_va_space->gpu, gpu_va_space->va_space);
 
     if (!gpu_va_space || uvm_gpu_va_space_state(gpu_va_space) != UVM_GPU_VA_SPACE_STATE_ACTIVE)
         return;

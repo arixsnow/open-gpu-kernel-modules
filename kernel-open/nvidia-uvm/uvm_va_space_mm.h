@@ -181,6 +181,32 @@ void uvm_va_space_mm_release(uvm_va_space_t *va_space);
 // the VA space lock.
 void uvm_va_space_mm_or_current_release(uvm_va_space_t *va_space, struct mm_struct *mm);
 
+// Non-blocking uvm_va_space_mm_retain_lock, for kernel threads that must not
+// block against the teardown trying to stop them. See
+// uvm_down_read_mmap_lock_trylock for the deadlock this avoids. Declared here
+// rather than beside its blocking sibling because it needs
+// uvm_va_space_mm_release above.
+//
+// Returns true on success, with *mm_out holding the retained mm, which may be
+// NULL when the va_space has no mm. As with the blocking version, mmap_lock is
+// held only for a non-NULL mm, and uvm_va_space_mm_release_unlock below is the
+// counterpart in both cases.
+//
+// Returns false when the mm could not be locked. The retain is dropped before
+// returning, so a caller that gives up has nothing left to undo.
+static bool uvm_va_space_mm_retain_trylock(uvm_va_space_t *va_space, struct mm_struct **mm_out)
+{
+    struct mm_struct *mm = uvm_va_space_mm_retain(va_space);
+
+    if (mm && !uvm_down_read_mmap_lock_trylock(mm)) {
+        uvm_va_space_mm_release(va_space);
+        return false;
+    }
+
+    *mm_out = mm;
+    return true;
+}
+
 static void uvm_va_space_mm_release_unlock(uvm_va_space_t *va_space, struct mm_struct *mm)
 {
     if (mm) {

@@ -904,8 +904,19 @@ struct uvm_gpu_struct
         struct completion start, done;
     } pd_copy;
 
-    // Serialises the host-pin walk against the unpin kthread.
+    // Serialises the host-pin walk against the unpin kthread, and guards
+    // ariadne_users below along with the three queues and the kthread pointers.
     uvm_mutex_t pin_lock;
+
+    // How many va_spaces currently have this GPU registered, which is what the
+    // three kthreads above are kept alive for. Their code has no such count and
+    // stops the threads on the first va_space to go away, which strands every
+    // other client on the same GPU. Guarded by pin_lock.
+    //
+    // With one client this goes 1 to 0 at process exit and the threads stop
+    // exactly where theirs stopped them, so lifetime and timing are unchanged
+    // from the original. With two, the threads live until both have gone.
+    NvU32 ariadne_users;
 
     struct
     {
@@ -1737,6 +1748,35 @@ void uvm_gpu_exit(void);
 NV_STATUS uvm_gpu_init_va_space(uvm_va_space_t *va_space);
 
 void uvm_gpu_exit_va_space(uvm_va_space_t *va_space);
+
+// ARIADNE (HPCA'26). The three kthreads are per-GPU but are kept alive for the
+// va_spaces using them, so their lifetime is refcounted. All three are defined
+// in uvm_gpu_replayable_faults.c beside the threads they manage.
+//
+// LOCKING for all three: they take gpu->pin_lock internally. That lock is
+// declared UVM_LOCK_ORDER_VA_SPACES_LIST, which sits before UVM_LOCK_ORDER_VA_SPACE,
+// and the get and put are both called with the va_space write lock already held.
+// So is their own host-pin walk in the fault path, under the read lock. Every
+// ARIADNE site takes pin_lock in that direction. The cycle is closed by the only
+// holder that takes pin_lock first, the unpin kthread, which uses a trylock for
+// pin_lock and trylocks for the va_space lock and mmap_lock, so it can never
+// block while holding it. Nothing checks this at runtime: uvm_record_lock is
+// UVM_IS_DEBUG()-only and the ARIADNE arm is built release-only.
+
+// One more va_space is using this GPU. Call when a gpu_va_space becomes ACTIVE.
+void uvm_ariadne_gpu_va_space_get(uvm_gpu_t *gpu);
+
+// One fewer. Drops dying's entries from the three queues, then, if it was the
+// last user, stops the kthreads and frees the cd payload and staged contexts.
+// Call when an ACTIVE gpu_va_space is removed, exactly once, to pair with the
+// get above.
+void uvm_ariadne_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying);
+
+// Final sweep at GPU removal, from deinit_gpu, which holds the global lock with
+// the GPU's retained count already at zero. By then the refcount should be zero
+// and the kthreads already stopped; this exists for queue entries that outlived
+// the va_space that made them.
+void uvm_ariadne_gpu_deinit(uvm_gpu_t *gpu);
 
 static unsigned int uvm_gpu_numa_node(uvm_gpu_t *gpu)
 {

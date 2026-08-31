@@ -2092,6 +2092,21 @@ static void deinit_gpu(uvm_gpu_t *gpu)
 {
     uvm_gpu_t *other_gpu;
 
+    // ARIADNE (HPCA'26). Stop the per-GPU kthreads and free the payload they
+    // share with the fault path.
+    //
+    // That state belongs to the GPU, not to any one va_space. Their code tore
+    // it down from remove_gpu_va_space, so with concurrent clients the first
+    // process to exit stopped threads the others were still using and freed a
+    // cd struct their fault paths still pointed at. Here the caller holds the
+    // global lock and the GPU's retained count is already zero, so there is no
+    // va_space left to race with and no client left to strand.
+    //
+    // Before uvm_pmm_gpu_sync and uvm_channel_manager_destroy below, because
+    // the copy thread reaches PMM and pushes work, so it has to be gone before
+    // either is torn down.
+    uvm_ariadne_gpu_deinit(gpu);
+
     // Remove any pointers to this GPU from other GPUs' trackers.
     for_each_gpu(other_gpu) {
         UVM_ASSERT(other_gpu != gpu);
