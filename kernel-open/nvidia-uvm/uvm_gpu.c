@@ -1571,9 +1571,11 @@ static uvm_gpu_t *alloc_gpu(uvm_parent_gpu_t *parent_gpu, uvm_gpu_id_t gpu_id)
     INIT_LIST_HEAD(&gpu->spl_blocks);
     INIT_LIST_HEAD(&gpu->spled_blocks);
     INIT_LIST_HEAD(&gpu->used_blocks);
+    init_llist_head(&gpu->spl_pending);
     gpu->last_access_time = NV_GETTIME();
     gpu->oversubed = -9900;
     uvm_mutex_init(&gpu->pin_lock, UVM_LOCK_ORDER_VA_SPACES_LIST);
+    uvm_spin_lock_init(&gpu->used_lock, UVM_LOCK_ORDER_LEAF);
 
     sub_processor_index = uvm_id_sub_processor_index(gpu_id);
     parent_gpu->gpus[sub_processor_index] = gpu;

@@ -138,10 +138,17 @@ module_param(uvm_dynzero_unpin_period, uint, S_IRUGO);
 static unsigned uvm_dynzero_aggradjust = 20;
 module_param(uvm_dynzero_aggradjust, uint, S_IRUGO);
 
+// uvm_dynzero_enable and the other four gating knobs live in uvm_global.c
+// beside uvm_perf_SDaware, because the sites they gate are spread across three
+// files. See the block there for what each one covers.
+
 // Master switch for the Populate/Copy pipeline and the copy and eviction
 // kthreads. Their ablation reaches no-PL with this at 0, and no-PL-SD with
 // uvm_perf_SDaware at 0 as well.
-static unsigned uvm_perf_fhp = 1;
+//
+// Non-static, like uvm_perf_SDaware beside it in uvm_global.c, because
+// uvm_global_init has to see it to enforce the uvm_ariadne_chg2mb dependency.
+unsigned uvm_perf_fhp = 1;
 module_param(uvm_perf_fhp, uint, S_IRUGO);
 
 // ARIADNE hangs all of its per-GPU state off uvm_gpu_t and reaches it from the
@@ -1874,6 +1881,24 @@ static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
 
     uvm_assert_mutex_locked(&gpu->pin_lock);
 
+    // The inbox is drained onto spl_blocks first, so a candidate published by
+    // the eviction path but not yet picked up by the fault path is considered
+    // here too. Without this a va_space could go away leaving its entries in
+    // the inbox, and the next fault batch would splice them onto spl_blocks and
+    // walk a dead va_space.
+    {
+        struct llist_node *pending = llist_del_all(&gpu->spl_pending);
+        struct llist_node *pnext;
+
+        while (pending) {
+            uvm_pl_entry *pe = container_of(pending, uvm_pl_entry, pll);
+
+            pnext = pending->next;
+            list_add_tail(&pe->spln, &gpu->spl_blocks);
+            pending = pnext;
+        }
+    }
+
     list_for_each_entry_safe(pl_entry, pl_next, &gpu->spl_blocks, spln) {
         if (dying && pl_entry->va_space != dying)
             continue;
@@ -1900,6 +1925,13 @@ static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
     // Clearing the block's back-pointer matters: their version leaves it
     // dangling, and a surviving block would later dereference freed memory from
     // the eviction path.
+    //
+    // used_lock as well as pin_lock, because the populate path and the eviction
+    // path reach this list without pin_lock and cannot be excluded by it. Order
+    // is pin_lock then used_lock everywhere, and used_lock is LEAF so nothing is
+    // taken under it.
+    uvm_spin_lock(&gpu->used_lock);
+
     list_for_each_entry_safe(used_entry, used_next, &gpu->used_blocks, spln) {
         // The NULL block test belongs to the filter, not to the loop. An entry
         // with no block cannot be matched against a va_space, so it is skipped
@@ -1919,6 +1951,8 @@ static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
         if (gpu->active_blocks)
             gpu->active_blocks--;
     }
+
+    uvm_spin_unlock(&gpu->used_lock);
 }
 
 void uvm_ariadne_gpu_va_space_get(uvm_gpu_t *gpu)
@@ -1973,7 +2007,14 @@ void uvm_ariadne_gpu_deinit(uvm_gpu_t *gpu)
     // NULL dying: take everything, whoever it belonged to.
     ariadne_drop_va_space_entries(gpu, NULL);
 
+    // active_blocks belongs to used_lock, so it is reset under it even here,
+    // where the GPU is going away with its retained count already at zero and
+    // nothing should be racing. Consistency at every site is what makes the
+    // rule checkable by reading.
+    uvm_spin_lock(&gpu->used_lock);
     gpu->active_blocks = 0;
+    uvm_spin_unlock(&gpu->used_lock);
+
     gpu->num_spled = 0;
     gpu->man_size = 0;
     gpu->cur_chg_2mb_pages = 0;
@@ -4023,13 +4064,29 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     // retention window has stopped being demand, so it leaves the WCSS. Without
     // this the estimate only grows and every workload eventually looks
     // oversubscribed. The window is 500 ms, theirs, hardcoded.
+    //
+    // The reap is gated on uvm_ariadne_wcss and the unpin bring-up below on
+    // uvm_dynzero_enable, separately. Gating the enclosing ar_gpu lookup on
+    // wcss would have taken the unpin thread with it, which is a different
+    // mechanism and belongs to a different knob.
+    //
+    // With wcss at 0 the list is empty by construction, so the walk would find
+    // nothing. It is skipped anyway rather than left to spin, because it takes
+    // used_lock once per fault batch and an arm meant to be a stock path should
+    // not pay for a lock the stock driver has no idea exists.
     {
         uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
 
-        if (ar_gpu) {
+        if (ar_gpu && uvm_ariadne_wcss) {
             uvm_used_entry *entry, *next;
             NvU64 now = NV_GETTIME();
 
+            // Under used_lock. Theirs walks this list bare while the populate
+            // path appends to it and the eviction path deletes from it, so a
+            // reap could free an entry another thread was standing on. Nothing
+            // in the loop sleeps: the test reads fields, and NV_KFREE is
+            // kfree, which is safe with a spinlock held.
+            uvm_spin_lock(&ar_gpu->used_lock);
             list_for_each_entry_safe(entry, next, &ar_gpu->used_blocks, spln) {
                 if (!entry->is_in_gpu &&
                     entry->block &&
@@ -4043,7 +4100,20 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                         ar_gpu->active_blocks--;
                 }
             }
+            uvm_spin_unlock(&ar_gpu->used_lock);
+        }
 
+        // Separate test, not nested in the one above. The unpin kthread belongs
+        // to Zero-copy, the reap belongs to the working-set accounting, and
+        // they are different knobs. Nesting compiled fine and would have made
+        // uvm_ariadne_wcss=0 silently disable Zero-copy as well.
+        //
+        // The kthread exists only to expire host pins, so with Zero-copy off it
+        // would wake every 40 ms to walk an empty list. Not starting it also
+        // keeps the arm honest: an ariadne:nozc or ariadne:stockpath arm then
+        // runs with the same thread count as stock, and a per-thread cost
+        // cannot leak into the comparison.
+        if (ar_gpu && uvm_dynzero_enable) {
             if (!ar_gpu->async_unpin) {
                 ar_gpu->async_unpin = kthread_run(uvm_gpu_unpin_period, ar_gpu, "uvm_gpu_unpin");
                 if (IS_ERR(ar_gpu->async_unpin))
@@ -4158,8 +4228,14 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         // low Sharing Degree is what thrashes worst.
         //
         // man_size is recounted here rather than tracked, which is theirs.
+        //
+        // The whole block is gated on uvm_dynzero_enable. With it at 0 nothing
+        // here runs, no block is ever host-pinned, and the arm services faults
+        // on the stock placement policy. Neither uvm_perf_fhp nor
+        // uvm_perf_SDaware reaches this loop, which is why the switch had to be
+        // added; see its definition at the top of this file.
         {
-            uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
+            uvm_gpu_t *ar_gpu = uvm_dynzero_enable ? ariadne_gpu(parent_gpu) : NULL;
 
             if (ar_gpu) {
                 uvm_pl_entry *entry, *next_entry;
@@ -4184,6 +4260,30 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 // Theirs counts the list first and locks second, so the unpin
                 // kthread can free an entry out from under the walk.
                 uvm_mutex_lock(&ar_gpu->pin_lock);
+
+                // Drain the inbox onto spl_blocks before anything reads it.
+                // The eviction path publishes candidates here rather than
+                // appending to spl_blocks directly, because it holds locks
+                // ordered after pin_lock; see uvm_gpu_t.spl_pending. This is
+                // the only consumer, and it runs under pin_lock, so the list
+                // below is stable for the rest of the block.
+                //
+                // llist_del_all reverses the batch, and the order of candidates
+                // within one drain carries no meaning: to_pin takes some prefix
+                // of a queue whose entries were all evicted at about the same
+                // time.
+                {
+                    struct llist_node *pending = llist_del_all(&ar_gpu->spl_pending);
+                    struct llist_node *pnext;
+
+                    while (pending) {
+                        uvm_pl_entry *pe = container_of(pending, uvm_pl_entry, pll);
+
+                        pnext = pending->next;
+                        list_add_tail(&pe->spln, &ar_gpu->spl_blocks);
+                        pending = pnext;
+                    }
+                }
 
                 list_for_each(cur, &ar_gpu->spled_blocks)
                     pinned++;

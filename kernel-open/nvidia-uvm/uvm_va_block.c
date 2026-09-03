@@ -3032,29 +3032,47 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
     // here, relying on an invariant that only max-size blocks do. That does not
     // hold on 610, where HMM and sub-chunk blocks share this path, and counting
     // them would inflate the WCSS with entries the eviction side never removes.
+    //
+    // The two accountings inside are gated separately and must stay that way.
+    // uvm_ariadne_wcss is the working set that Zero-copy reads to decide how
+    // many blocks to pin; uvm_ariadne_chg2mb is the 2 MB charge that drives the
+    // eviction kthread doorbell. An arm running their servicing on stock
+    // placement needs the second and not the first, so nesting one inside the
+    // other would silently disable the doorbell and change what fhp=1 means.
     if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
-        if (!block->prefetch_info.used_entry) {
-            uvm_used_entry *used_entry;
+        // The knob test wraps both arms, not just the allocating one. Putting
+        // it only on the `if` would send a wcss=0 populate into the `else`,
+        // where used_entry is NULL by construction and is dereferenced.
+        if (uvm_ariadne_wcss) {
+            if (!block->prefetch_info.used_entry) {
+                uvm_used_entry *used_entry;
 
-            NV_KMALLOC(used_entry, sizeof(*used_entry));
-            if (used_entry) {
-                block->prefetch_info.is_thrashed = (block->prefetch_info.last_migration_time != 0);
-                used_entry->block = block;
-                used_entry->gpu = gpu;
-                used_entry->is_in_gpu = 1;
-                block->prefetch_info.used_entry = used_entry;
-                list_add_tail(&used_entry->spln, &gpu->used_blocks);
-                gpu->active_blocks++;
+                // Allocated before used_lock is taken, because NV_KMALLOC uses
+                // GFP_KERNEL and can sleep. The lock covers the list surgery
+                // and the counter only.
+                NV_KMALLOC(used_entry, sizeof(*used_entry));
+                if (used_entry) {
+                    block->prefetch_info.is_thrashed = (block->prefetch_info.last_migration_time != 0);
+                    used_entry->block = block;
+                    used_entry->gpu = gpu;
+                    used_entry->is_in_gpu = 1;
+                    block->prefetch_info.used_entry = used_entry;
+
+                    uvm_spin_lock(&gpu->used_lock);
+                    list_add_tail(&used_entry->spln, &gpu->used_blocks);
+                    gpu->active_blocks++;
+                    uvm_spin_unlock(&gpu->used_lock);
+                }
+
+                // A failed allocation only costs accuracy in the WCSS
+                // estimate, so it is not worth failing the populate over.
             }
-
-            // A failed allocation only costs accuracy in the WCSS estimate, so
-            // it is not worth failing the populate over.
-        }
-        else {
-            block->prefetch_info.used_entry->is_in_gpu = 1;
+            else {
+                block->prefetch_info.used_entry->is_in_gpu = 1;
+            }
         }
 
-        if (chunk_index == 0)
+        if (uvm_ariadne_chg2mb && chunk_index == 0)
             gpu->cur_chg_2mb_pages++;
     }
 
@@ -3554,14 +3572,23 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
         // recency credit proportional to how many uTLBs are touching the block,
         // so densely shared blocks survive longer. The victim scan takes the
         // minimum key.
-        sd = (NvU32)block->utlb_info.utlb_count;
-        key = (gpu->last_access_time >> 10) +
-              (((NvU64)uvm_perf_SD_coeff_evictqueue * sd) >> 4);
+        //
+        // Gated on the knob that owns the scan reading it. Nothing reads key or
+        // last_access_time once uvm_ariadne_evict_policy is 0, and with the
+        // stock LRU calls restored under that same knob this function now runs
+        // on every make-resident rather than once per residency transition, so
+        // leaving the stamping in would add a spinlock round trip per call to a
+        // path that is supposed to be doing exactly what stock does.
+        if (uvm_ariadne_evict_policy) {
+            sd = (NvU32)block->utlb_info.utlb_count;
+            key = (gpu->last_access_time >> 10) +
+                  (((NvU64)uvm_perf_SD_coeff_evictqueue * sd) >> 4);
 
-        uvm_spin_lock(&pmm->list_lock);
-        chunk->last_access_time = gpu->last_access_time;
-        chunk->key = key;
-        uvm_spin_unlock(&pmm->list_lock);
+            uvm_spin_lock(&pmm->list_lock);
+            chunk->last_access_time = gpu->last_access_time;
+            chunk->key = key;
+            uvm_spin_unlock(&pmm->list_lock);
+        }
 
         uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm, uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0]);
     }
@@ -5259,8 +5286,17 @@ void uvm_va_block_make_resident_finish(uvm_va_block_t *va_block,
     // same reason. The ever_fully_resident update below is stock 610 and stays,
     // since block_populate_gpu_chunk reads it.
     //
-    // if (uvm_processor_mask_test(&va_block->resident, dst_id))
-    //     block_mark_memory_used(va_block, dst_id);
+    // Restored under uvm_ariadne_evict_policy=0, and it has to be. This call is
+    // also the stock LRU maintenance: uvm_pmm_gpu_mark_root_chunk_used moves a
+    // re-touched chunk to the tail of the used list. Suppressed, that list
+    // degrades from least-recently-used to first-became-resident, so restoring
+    // the stock get_first_allocated_chunk victim picker while leaving this
+    // suppressed would hand it a differently ordered list and produce neither
+    // their policy nor stock.
+    if (!uvm_ariadne_evict_policy) {
+        if (uvm_processor_mask_test(&va_block->resident, dst_id))
+            block_mark_memory_used(va_block, dst_id);
+    }
 
     if (UVM_ID_IS_GPU(dst_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dst_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dst_id);
@@ -5514,10 +5550,12 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
     // Skip this if we didn't do anything (the input region and/or page mask was
     // empty).
     // ARIADNE (HPCA'26). Suppressed for the same reason as the equivalent call
-    // in uvm_va_block_make_resident_finish above.
-    //
-    // if (uvm_processor_mask_test(&va_block->resident, dest_id))
-    //     block_mark_memory_used(va_block, dest_id);
+    // in uvm_va_block_make_resident_finish above, and restored under the same
+    // knob for the same reason.
+    if (!uvm_ariadne_evict_policy) {
+        if (uvm_processor_mask_test(&va_block->resident, dest_id))
+            block_mark_memory_used(va_block, dest_id);
+    }
 
     if (UVM_ID_IS_GPU(dest_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dest_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_id);
@@ -9705,13 +9743,34 @@ static void block_kill(uvm_va_block_t *block)
     if (block->prefetch_info.used_entry) {
         uvm_used_entry *used_entry = block->prefetch_info.used_entry;
 
-        list_del_init(&used_entry->spln);
-        block->prefetch_info.used_entry = NULL;
+        // Under the owning GPU's used_lock, like every other mutation of that
+        // list. Without the gpu back-pointer there would be nothing to lock,
+        // which is a second reason the port records it.
+        //
+        // The else is unreachable: the only site that creates a used_entry sets
+        // gpu at the same time. If it ever fires, the entry sits on a list that
+        // cannot be identified and so cannot be unlinked safely, so it is left
+        // linked and not freed. That leaks one small struct and keeps
+        // active_blocks charged, which is a far cheaper failure than unlinking
+        // without the lock or freeing a node another thread is walking. The
+        // block back-pointer is cleared either way, since the block is going.
+        if (used_entry->gpu) {
+            uvm_spin_lock(&used_entry->gpu->used_lock);
+            list_del_init(&used_entry->spln);
+            if (used_entry->gpu->active_blocks > 0)
+                used_entry->gpu->active_blocks--;
+            used_entry->block = NULL;
+            uvm_spin_unlock(&used_entry->gpu->used_lock);
 
-        if (used_entry->gpu && used_entry->gpu->active_blocks > 0)
-            used_entry->gpu->active_blocks--;
-
-        NV_KFREE(used_entry, sizeof(uvm_used_entry));
+            block->prefetch_info.used_entry = NULL;
+            NV_KFREE(used_entry, sizeof(uvm_used_entry));
+        }
+        else {
+            UVM_ERR_PRINT("ARIADNE: used_entry for a dying block has no owning GPU, "
+                          "so it cannot be unlinked safely. Leaked deliberately.\n");
+            used_entry->block = NULL;
+            block->prefetch_info.used_entry = NULL;
+        }
     }
 
     va_space = uvm_va_block_get_va_space(block);
@@ -11563,8 +11622,15 @@ static uvm_processor_id_t block_select_processor_residency(uvm_va_block_t *va_bl
     // Sharing Degree to describe or for Zero-copy to pin, and the host-pin path
     // in uvm_policy.c would refuse it. Their tree makes the same change.
     //
-    // may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
-    may_read_duplicate = false;
+    // Gated, because it is one of five divergences from stock that neither of
+    // their published knobs reaches, and it changes results rather than cost:
+    // read duplication is what keeps a page read by both processors resident in
+    // both places instead of bouncing it. At 0 the stock decision is restored,
+    // which is what makes an ariadne:stockpath arm a stock path.
+    if (uvm_ariadne_disable_read_dup)
+        may_read_duplicate = false;
+    else
+        may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
 
     // Read/prefetch faults on a VA range with read duplication enabled
     // always create a copy of the page on the faulting processor's memory.

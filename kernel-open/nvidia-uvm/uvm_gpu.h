@@ -835,8 +835,18 @@ struct uvm_gpu_struct
 
     // Zero-copy queues. spl_blocks holds candidates awaiting a host pin,
     // spled_blocks those currently pinned and waiting for the unpin kthread.
+    // Both are walked and mutated only under pin_lock.
     struct list_head spl_blocks;
     struct list_head spled_blocks;
+
+    // Inbox for spl_blocks. Theirs appends straight onto spl_blocks from the
+    // eviction path, which holds va_block->lock and pmm->lock and cannot take
+    // pin_lock without inverting the order, so that append raced the fault
+    // path walking and freeing the same list. An llist takes a lock-free
+    // producer, and the fault path splices the whole inbox onto spl_blocks
+    // under pin_lock before its walk. Single producer side, single consumer
+    // side, no new lock and no new order.
+    struct llist_head spl_pending;
 
     // The Working Chunk Set Size, as a list of uvm_used_entry and its
     // cardinality. man_size is the count of resident root chunks, recounted
@@ -846,6 +856,21 @@ struct uvm_gpu_struct
     NvU32 man_size;
     NvU32 active_blocks;
     NvU32 num_spled;
+
+    // Guards used_blocks and active_blocks, and nothing else.
+    //
+    // used_blocks could not use the llist trick, because unlike spl_blocks it
+    // is not append-only: the populate path adds, the eviction path deletes
+    // and frees, and the reaper in the fault loop walks it deleting and
+    // freeing as it goes. Theirs holds no lock at any of the three, so with
+    // their copy kthread populating while the fault thread reaps, one thread
+    // frees entries another is walking.
+    //
+    // LEAF because it is taken under va_block->lock and under pmm->lock, so it
+    // has to be innermost, and it is only ever held across list surgery and a
+    // counter update. Every allocation happens before it is taken and every
+    // free under it is kfree, which is safe in atomic context.
+    uvm_spinlock_t used_lock;
 
     // 2MB free-page tracking, used to decide when to wake the eviction kthread.
     NvU32 prev_free_2mb;

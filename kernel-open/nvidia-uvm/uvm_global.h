@@ -36,6 +36,19 @@
 // ARIADNE (HPCA'26). Sharing-Degree-aware eviction, read from uvm_pmm_gpu.c.
 extern unsigned uvm_perf_SDaware;
 
+// ARIADNE (HPCA'26) gating knobs added by the port, all defaulting to their
+// shipped behaviour. See uvm_global.c for what each one covers and why they
+// had to exist at all.
+extern unsigned uvm_dynzero_enable;
+extern unsigned uvm_ariadne_disable_read_dup;
+extern unsigned uvm_ariadne_evict_policy;
+extern unsigned uvm_ariadne_wcss;
+extern unsigned uvm_ariadne_chg2mb;
+
+// Theirs, defined in uvm_gpu_replayable_faults.c. Visible here only so
+// uvm_global_init can enforce the uvm_ariadne_chg2mb dependency on it.
+extern unsigned uvm_perf_fhp;
+
 struct uvm_global_struct
 {
     // Mask of retained GPUs.

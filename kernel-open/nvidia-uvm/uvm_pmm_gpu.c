@@ -1233,7 +1233,13 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
             va_block->prefetch_info.is_thrashed = 1;
         }
 
-        if (va_block->prefetch_info.is_thrashed) {
+        // Gated on uvm_dynzero_enable as well as on their flag. With Zero-copy
+        // off the pin loop in uvm_gpu_replayable_faults.c does not run, so a
+        // candidate queued here would have no consumer: spl_blocks would grow
+        // for the life of the va_space and only be drained at teardown. Taking
+        // the else branch instead is what stock does, namely let the block
+        // leave the working set when it leaves GPU memory.
+        if (uvm_dynzero_enable && va_block->prefetch_info.is_thrashed) {
             uvm_pl_entry *pl_entry;
 
             NV_KMALLOC(pl_entry, sizeof(*pl_entry));
@@ -1241,16 +1247,27 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
                 pl_entry->va_space = uvm_va_block_get_va_space(va_block);
                 pl_entry->start = va_block->start;
                 pl_entry->endtime = 0;
-                list_add_tail(&pl_entry->spln, &gpu->spl_blocks);
+                INIT_LIST_HEAD(&pl_entry->spln);
+                // Published through the lock-free inbox, not appended straight
+                // onto spl_blocks. This runs under va_block->lock and
+                // pmm->lock, both ordered after pin_lock, so it cannot take
+                // pin_lock, and theirs appends here with no lock at all while
+                // the fault path is walking and freeing that same list.
+                llist_add(&pl_entry->pll, &gpu->spl_pending);
             }
         }
         else {
+            // used_lock, for the same reason. The reaper in the fault loop
+            // walks this list freeing entries as it goes, so an unlocked
+            // delete here can unlink a node that walk is standing on.
+            uvm_spin_lock(&gpu->used_lock);
             list_del_init(&va_block->prefetch_info.used_entry->spln);
-            NV_KFREE(va_block->prefetch_info.used_entry, sizeof(uvm_used_entry));
-            va_block->prefetch_info.used_entry = NULL;
-
             if (gpu->active_blocks > 0)
                 gpu->active_blocks--;
+            uvm_spin_unlock(&gpu->used_lock);
+
+            NV_KFREE(va_block->prefetch_info.used_entry, sizeof(uvm_used_entry));
+            va_block->prefetch_info.used_entry = NULL;
         }
     }
 
@@ -1434,7 +1451,12 @@ NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk,
     // ARIADNE (HPCA'26). One 2MB chunk has come back, so uncharge it. This is
     // the counterpart of the increment in block_populate_gpu_chunk, and the
     // pair is what the fault loop's free-chunk watermark reads.
-    uvm_gpu_chunk_get_gpu(chunk)->cur_chg_2mb_pages--;
+    //
+    // Gated on the same knob as that increment, and it has to be, because the
+    // two form a balanced pair. Gating only one side would leave the counter
+    // drifting in whichever direction was left switched on.
+    if (uvm_ariadne_chg2mb)
+        uvm_gpu_chunk_get_gpu(chunk)->cur_chg_2mb_pages--;
 
     return NV_OK;
 
@@ -1556,12 +1578,11 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
     return UVM_PMM_ALLOC_LIST_COUNT;
 }
 
-// ARIADNE (HPCA'26) left this without callers. Its one caller was the stock
-// fallback in pick_root_chunk_to_evict, which the Sharing Degree victim scan
-// replaced. Kept rather than deleted, since it is the stock policy and is what
-// the scan would have to fall back to if that policy is ever revisited, and
-// annotated so a -Werror kernel does not fail the build over it.
-static __maybe_unused uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
+// The stock victim fallback. ARIADNE (HPCA'26) left this without callers, its
+// one caller in pick_root_chunk_to_evict having been replaced by their victim
+// scan. The port kept it rather than deleting it, and that is what now makes
+// uvm_ariadne_evict_policy=0 a two-line restore instead of a reimplementation.
+static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
 {
     uvm_pmm_alloc_list_t alloc_list;
 
@@ -1615,7 +1636,19 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
     // exist when this policy was designed. The stock fallback above walked all
     // three, so if the SD scan finds nothing this returns NULL and the caller
     // reports no memory, exactly as theirs does.
-    if (!chunk) {
+    //
+    // Gated on uvm_ariadne_evict_policy, because this replacement is always on
+    // in their tree and neither of their published knobs reaches it.
+    // uvm_perf_SDaware only chooses between minimum-key and first-eligible
+    // WITHIN the replacement, so their no-PL-SD arm still evicts differently
+    // from stock: it sees one alloc list instead of three and skips chunks
+    // whose block is in the batch being serviced. At 0 the stock
+    // get_first_allocated_chunk fallback runs instead, which is what makes an
+    // ariadne:stockpath arm comparable to the stock binary.
+    if (!chunk && !uvm_ariadne_evict_policy)
+        chunk = get_first_allocated_chunk(pmm);
+
+    if (!chunk && uvm_ariadne_evict_policy) {
         uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
         uvm_gpu_chunk_t *tmp;
         NvU64 min_key = 0;
@@ -1714,9 +1747,26 @@ uvm_gpu_root_chunk_t *pick_used_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
         if (in_batch)
             continue;
 
-        if (min_key == 0 || min_key > tmp->key) {
+        // Gated on uvm_perf_SDaware, like the identical decision in
+        // pick_root_chunk_to_evict. Theirs applies minimum-key selection here
+        // unconditionally, so their own no-SD ablation still picks victims by
+        // Sharing Degree whenever the proactive eviction kthread is the one
+        // evicting. That makes uvm_perf_SDaware=0 mean two different things
+        // depending on which path reached eviction, and it leaks a placement
+        // policy into any arm running their servicing mechanism.
+        //
+        // With SD off this degrades to the first eligible chunk, which is what
+        // the sibling picker does and is as close to stock as a function stock
+        // does not have can get.
+        if (uvm_perf_SDaware) {
+            if (min_key == 0 || min_key > tmp->key) {
+                chunk = tmp;
+                min_key = tmp->key;
+            }
+        }
+        else {
             chunk = tmp;
-            min_key = tmp->key;
+            break;
         }
     }
 

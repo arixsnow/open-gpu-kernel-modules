@@ -56,6 +56,59 @@ module_param(uvm_force_conf_computing, uint, S_IRUGO);
 unsigned uvm_perf_SDaware = 1;
 module_param(uvm_perf_SDaware, uint, S_IRUGO);
 
+// ----------------------------------------------------------------------------
+// ARIADNE (HPCA'26) gating knobs added by the port
+// ----------------------------------------------------------------------------
+//
+// Their artifact diverges from stock in five always-on ways, and their two
+// published knobs, uvm_perf_fhp and uvm_perf_SDaware, reach none of them. So
+// their no-PL-SD arm, which the paper presents as both mechanisms disabled, is
+// not a stock path. Campaign 20260902_014043 measured what that is worth: on
+// MVT at 150 per cent oversubscription it finished in 0.69 s against stock at
+// 325 s, migrating 103924 pages against 45928648, with both answers verified
+// identical.
+//
+// Every default below is their shipped behaviour, so ariadne:full is unchanged
+// and none of this is a fix to their mechanism. These are ablation knobs of the
+// same kind as their own two, and they exist so that placement policy and
+// servicing mechanism can be varied one at a time. Without them there is no
+// configuration of their build that can be compared against ours.
+//
+// Declared here beside uvm_perf_SDaware, and externed in uvm_global.h, because
+// the sites they gate are spread across uvm_va_block.c, uvm_pmm_gpu.c and
+// uvm_gpu_replayable_faults.c.
+
+// Dynamic Zero-copy. At 0 the host-pin loop does not run, the eviction path
+// queues no candidates, and the unpin kthread is never started, which is the
+// only way to get an ARIADNE build running the stock placement policy.
+unsigned uvm_dynzero_enable = 1;
+module_param(uvm_dynzero_enable, uint, S_IRUGO);
+
+// Read duplication. Theirs forces may_read_duplicate false for every workload,
+// so a page read by both processors is migrated back and forth instead of being
+// resident in both places. At 0 the stock can_read_duplicate decision is
+// restored. This one changes results, not just cost.
+unsigned uvm_ariadne_disable_read_dup = 1;
+module_param(uvm_ariadne_disable_read_dup, uint, S_IRUGO);
+
+// Eviction victim selection. Theirs replaces the stock fallback with a scan of
+// ALLOC_LIST_USED alone plus a batch-exclusion test; uvm_perf_SDaware only
+// chooses between minimum-key and first-eligible within that replacement. At 0
+// the stock get_first_allocated_chunk fallback is restored.
+unsigned uvm_ariadne_evict_policy = 1;
+module_param(uvm_ariadne_evict_policy, uint, S_IRUGO);
+
+// Working Chunk Set Size accounting, the used_blocks list and active_blocks.
+// At 0 no used_entry is allocated and nothing is charged. Zero-copy reads
+// active_blocks, so uvm_dynzero_enable forces this on; see uvm_global_init.
+unsigned uvm_ariadne_wcss = 1;
+module_param(uvm_ariadne_wcss, uint, S_IRUGO);
+
+// The 2 MB free-page charge counters that drive the eviction kthread doorbell.
+// At 0 nothing is charged. uvm_perf_fhp forces this on for the same reason.
+unsigned uvm_ariadne_chg2mb = 1;
+module_param(uvm_ariadne_chg2mb, uint, S_IRUGO);
+
 static NV_STATUS uvm_register_callbacks(void)
 {
     NV_STATUS status = NV_OK;
@@ -93,6 +146,34 @@ NV_STATUS uvm_global_init(void)
     // (addition) of the thread context associated with the UVM module entry
     // point that is calling this function.
     UVM_ASSERT(uvm_thread_context_global_initialized());
+
+    // ARIADNE (HPCA'26) knob dependencies, resolved here rather than left to
+    // whoever writes the modprobe line. Both combinations below load without
+    // complaint and then quietly do nothing, which is the worst way for an
+    // experiment to fail: the arm runs, produces numbers, and the numbers are
+    // of a different configuration than the label says.
+    //
+    // Zero-copy sizes its host-pin batch from active_blocks, which only the
+    // working-set accounting maintains. With that accounting off, active_blocks
+    // stays zero, to_pin evaluates to zero on every batch, and not one block is
+    // ever pinned.
+    if (uvm_dynzero_enable && !uvm_ariadne_wcss) {
+        UVM_ERR_PRINT("ARIADNE: uvm_dynzero_enable=1 needs uvm_ariadne_wcss=1, "
+                      "since Zero-copy sizes its batch from active_blocks. "
+                      "Forcing uvm_ariadne_wcss=1.\n");
+        uvm_ariadne_wcss = 1;
+    }
+
+    // The proactive eviction kthread wakes on a watermark computed from
+    // max_rest_2mb_pages minus cur_chg_2mb_pages. With the charge counters off
+    // that difference never moves and the thread never has anything to do, so
+    // the Populate/Copy pipeline runs without the eviction half it assumes.
+    if (uvm_perf_fhp && !uvm_ariadne_chg2mb) {
+        UVM_ERR_PRINT("ARIADNE: uvm_perf_fhp=1 needs uvm_ariadne_chg2mb=1, "
+                      "since the eviction kthread doorbell reads those counters. "
+                      "Forcing uvm_ariadne_chg2mb=1.\n");
+        uvm_ariadne_chg2mb = 1;
+    }
 
     uvm_mutex_init(&g_uvm_global.global_lock, UVM_LOCK_ORDER_GLOBAL);
     uvm_init_rwsem(&g_uvm_global.pm.lock, UVM_LOCK_ORDER_GLOBAL_PM);

@@ -50,12 +50,19 @@
 // state. Queued on uvm_gpu_t.spl_blocks while waiting and moved to
 // spled_blocks once pinned, with endtime giving the deadline at which the
 // unpin kthread revokes the GPU mapping.
+//
+// pll is how the entry reaches spl_blocks. The eviction path that creates it
+// cannot take pin_lock, so it publishes through uvm_gpu_t.spl_pending with
+// llist_add and the fault path splices the inbox onto spl_blocks under
+// pin_lock. The two links are never live at the same time: pll is used only
+// between the producer and that splice, spln only after it.
 typedef struct
 {
     NvU64 start;
     uvm_va_space_t *va_space;
     NvU64 endtime;
     struct list_head spln;
+    struct llist_node pll;
 } uvm_pl_entry;
 
 // One VA block counted in the Working Chunk Set Size. Queued on
