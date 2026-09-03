@@ -835,16 +835,16 @@ struct uvm_gpu_struct
 
     // Zero-copy queues. spl_blocks holds candidates awaiting a host pin,
     // spled_blocks those currently pinned and waiting for the unpin kthread.
-    // Both are walked and mutated only under pin_lock.
+    // Both are walked and mutated only under zc_lock.
     struct list_head spl_blocks;
     struct list_head spled_blocks;
 
     // Inbox for spl_blocks. Theirs appends straight onto spl_blocks from the
     // eviction path, which holds va_block->lock and pmm->lock and cannot take
-    // pin_lock without inverting the order, so that append raced the fault
-    // path walking and freeing the same list. An llist takes a lock-free
+    // the queue lock without inverting the order, so that append raced the
+    // fault path walking and freeing the same list. An llist takes a lock-free
     // producer, and the fault path splices the whole inbox onto spl_blocks
-    // under pin_lock before its walk. Single producer side, single consumer
+    // under zc_lock before its walk. Single producer side, single consumer
     // side, no new lock and no new order.
     struct llist_head spl_pending;
 
@@ -929,14 +929,44 @@ struct uvm_gpu_struct
         struct completion start, done;
     } pd_copy;
 
-    // Serialises the host-pin walk against the unpin kthread, and guards
-    // ariadne_users below along with the three queues and the kthread pointers.
-    uvm_mutex_t pin_lock;
+    // Guards spl_blocks, spled_blocks, num_spled and man_size, and NOTHING is
+    // taken under it. Every walk detaches the entries it wants onto a local
+    // list, drops this, does the sleeping work with no ARIADNE lock held, and
+    // takes it again to put survivors back.
+    //
+    // ARIADNE holds one mutex across the whole host-pin walk instead, taking
+    // mmap_lock and the va_space lock inside it. That cannot be given a
+    // consistent lock order once anything takes the same mutex from a path
+    // that already holds mmap_lock, and the per-va_space refcount below does:
+    // remove_gpu_va_space reaches uvm_ariadne_gpu_va_space_put holding
+    // mmap_lock and the va_space write lock. One site then wants the mutex
+    // before mmap_lock and the other after, and the fault bottom half and a
+    // process teardown can face each other on the same GPU and va_space:
+    //
+    //   fault bottom half : holds the mutex, waits for mmap_lock
+    //   process teardown  : holds mmap_lock, waits for the mutex
+    //
+    // Detach-then-process removes the question. A LEAF spinlock that is never
+    // held across a sleep cannot be half of any cycle.
+    uvm_spinlock_t zc_lock;
+
+    // Guards ariadne_users below and the three kthread pointers, and only
+    // those. A mutex rather than a spinlock because it is held across
+    // kthread_stop and the pipeline bring-up, both of which sleep.
+    //
+    // LEAF, because it has to be innermost: add_gpu_va_space and
+    // remove_gpu_va_space take it holding the va_space write lock and
+    // mmap_lock, and the fault path takes it holding nothing. Nothing is ever
+    // taken under it. The kthreads never take it, so kthread_stop under it
+    // cannot wait on a thread that is waiting for it.
+    //
+    // Never held together with zc_lock or used_lock, which are also LEAF.
+    uvm_mutex_t zc_lifetime_lock;
 
     // How many va_spaces currently have this GPU registered, which is what the
     // three kthreads above are kept alive for. Their code has no such count and
     // stops the threads on the first va_space to go away, which strands every
-    // other client on the same GPU. Guarded by pin_lock.
+    // other client on the same GPU. Guarded by zc_lifetime_lock.
     //
     // With one client this goes 1 to 0 at process exit and the threads stop
     // exactly where theirs stopped them, so lifetime and timing are unchanged
@@ -1778,15 +1808,19 @@ void uvm_gpu_exit_va_space(uvm_va_space_t *va_space);
 // va_spaces using them, so their lifetime is refcounted. All three are defined
 // in uvm_gpu_replayable_faults.c beside the threads they manage.
 //
-// LOCKING for all three: they take gpu->pin_lock internally. That lock is
-// declared UVM_LOCK_ORDER_VA_SPACES_LIST, which sits before UVM_LOCK_ORDER_VA_SPACE,
-// and the get and put are both called with the va_space write lock already held.
-// So is their own host-pin walk in the fault path, under the read lock. Every
-// ARIADNE site takes pin_lock in that direction. The cycle is closed by the only
-// holder that takes pin_lock first, the unpin kthread, which uses a trylock for
-// pin_lock and trylocks for the va_space lock and mmap_lock, so it can never
-// block while holding it. Nothing checks this at runtime: uvm_record_lock is
-// UVM_IS_DEBUG()-only and the ARIADNE arm is built release-only.
+// LOCKING for all three: they take gpu->zc_lifetime_lock for the refcount and
+// the kthread pointers, and gpu->zc_lock for the queues, never both at once and
+// never anything under either. Both are UVM_LOCK_ORDER_LEAF, which is the only
+// order that works, because the get and put are called with the va_space write
+// lock and mmap_lock already held while the fault path takes them holding
+// nothing.
+//
+// ARIADNE uses a single mutex at UVM_LOCK_ORDER_VA_SPACES_LIST for all of this
+// and takes mmap_lock and the va_space lock inside it during the host-pin walk.
+// With the refcount added that is a live deadlock, not just an order violation:
+// the fault bottom half holds the mutex and waits for mmap_lock while a process
+// teardown holds mmap_lock and waits for the mutex, on the same GPU and
+// va_space. See the zc_lock comment on uvm_gpu_t for the full argument.
 
 // One more va_space is using this GPU. Call when a gpu_va_space becomes ACTIVE.
 void uvm_ariadne_gpu_va_space_get(uvm_gpu_t *gpu);

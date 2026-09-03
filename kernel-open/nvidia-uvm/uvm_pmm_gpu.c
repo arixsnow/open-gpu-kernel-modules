@@ -1250,9 +1250,10 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
                 INIT_LIST_HEAD(&pl_entry->spln);
                 // Published through the lock-free inbox, not appended straight
                 // onto spl_blocks. This runs under va_block->lock and
-                // pmm->lock, both ordered after pin_lock, so it cannot take
-                // pin_lock, and theirs appends here with no lock at all while
-                // the fault path is walking and freeing that same list.
+                // pmm->lock, and theirs appends here with no lock at all while
+                // the fault path is walking and freeing that same list. The
+                // inbox keeps the producer lock-free, so no order has to be
+                // negotiated between those two locks and zc_lock.
                 llist_add(&pl_entry->pll, &gpu->spl_pending);
             }
         }

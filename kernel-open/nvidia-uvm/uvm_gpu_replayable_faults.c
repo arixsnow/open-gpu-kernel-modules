@@ -1730,6 +1730,7 @@ static int uvm_gpu_unpin_period(void *data)
     uvm_gpu_t *gpu = (uvm_gpu_t *)data;
 
     while (!kthread_should_stop()) {
+        LIST_HEAD(expired);
         uvm_pl_entry *entry, *next;
         NvU64 now;
         NvU32 decay;
@@ -1740,12 +1741,14 @@ static int uvm_gpu_unpin_period(void *data)
         if (kthread_should_stop())
             break;
 
-        // trylock, not lock: the fault path holds pin_lock across its host-pin
-        // walk, and this thread has nothing urgent enough to block it.
-        if (!uvm_mutex_trylock(&gpu->pin_lock))
-            continue;
-
         now = NV_GETTIME();
+
+        // Detach then process. The expired entries are moved onto a local list
+        // under zc_lock, the lock is dropped, and only then is anything mapped,
+        // unmapped or waited on. Theirs holds one mutex across the whole sweep
+        // and takes mmap_lock and the va_space lock inside it, which is the
+        // half of the deadlock this thread contributes.
+        uvm_spin_lock(&gpu->zc_lock);
 
         // Self-throttle. The more blocks are pinned, the fewer are released per
         // sweep, so a large pinned set does not turn into a burst of refaults
@@ -1754,63 +1757,13 @@ static int uvm_gpu_unpin_period(void *data)
         budget = (decay < 99) ? (100 - decay) : 1;
 
         list_for_each_entry_safe(entry, next, &gpu->spled_blocks, spln) {
-            uvm_va_block_t *block = NULL;
-            uvm_va_block_context_t *block_context;
-            uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
-            struct mm_struct *mm;
-
             if (budget == 0)
                 break;
 
             if (entry->endtime > now)
                 continue;
 
-            // Never block on either lock. Both deadlock against the teardown
-            // that is trying to stop this very thread.
-            //
-            // mmap_lock is the narrower of the two. Teardown holds it for read
-            // as well, so the two do not block each other on their own; they do
-            // once a writer is queued between them, because the new reader
-            // waits behind the writer, the thread never exits, and kthread_stop
-            // waits for the thread. See ariadne_va_space_tryread for the
-            // va_space half.
-            //
-            // A failed attempt costs one sweep. The entry stays queued and is
-            // reconsidered forty milliseconds later, which is the same answer
-            // both trylocks already give.
-            if (!uvm_va_space_mm_retain_trylock(entry->va_space, &mm))
-                continue;
-
-            if (!ariadne_va_space_tryread(entry->va_space)) {
-                uvm_va_space_mm_release_unlock(entry->va_space, mm);
-                continue;
-            }
-
-            // Their code does not check this return before dereferencing the
-            // block. The va_space can have dropped the range while the block
-            // sat pinned, so it is checked here.
-            if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
-                block_context = uvm_va_space_block_context(entry->va_space, mm);
-
-                block->prefetch_info.is_spled = 0;
-
-                uvm_mutex_lock(&block->lock);
-                uvm_va_block_unmap(block,
-                                   block_context,
-                                   gpu->id,
-                                   uvm_va_block_region_from_block(block),
-                                   NULL,
-                                   &local_tracker);
-                uvm_mutex_unlock(&block->lock);
-
-                uvm_tracker_wait_deinit(&local_tracker);
-            }
-
-            uvm_va_space_up_read(entry->va_space);
-            uvm_va_space_mm_release_unlock(entry->va_space, mm);
-
-            list_del_init(&entry->spln);
-            NV_KFREE(entry, sizeof(uvm_pl_entry));
+            list_move_tail(&entry->spln, &expired);
 
             if (gpu->num_spled > 0)
                 gpu->num_spled--;
@@ -1818,25 +1771,94 @@ static int uvm_gpu_unpin_period(void *data)
             budget--;
         }
 
-        uvm_mutex_unlock(&gpu->pin_lock);
+        uvm_spin_unlock(&gpu->zc_lock);
+
+        // Off the queue and owned by this thread alone, so zc_lock is not held
+        // here. The va_space and mm acquisitions are still TRYLOCKS, and that
+        // is a second deadlock, distinct from the one the detach above solves.
+        //
+        // ariadne_stop_threads runs from remove_gpu_va_space, which holds the
+        // va_space WRITE lock, and calls kthread_stop on this thread.
+        // kthread_stop waits for the thread to exit. If the thread were sitting
+        // in down_read on that same va_space it could never get the lock, never
+        // exit, and both sides would be stuck with the write lock held. Every
+        // process exit is a chance to hit it.
+        //
+        // A failed attempt costs one sweep: the entry goes back on the queue
+        // below with its charge restored, and is reconsidered forty
+        // milliseconds later.
+        list_for_each_entry_safe(entry, next, &expired, spln) {
+            uvm_va_block_t *block = NULL;
+            uvm_va_block_context_t *block_context;
+            uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+            struct mm_struct *mm;
+            bool unpinned = false;
+
+            if (!uvm_va_space_mm_retain_trylock(entry->va_space, &mm))
+                continue;
+
+            if (ariadne_va_space_tryread(entry->va_space)) {
+                // Their code does not check this return before dereferencing
+                // the block. The va_space can have dropped the range while the
+                // block sat pinned, so it is checked here.
+                if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
+                    block_context = uvm_va_space_block_context(entry->va_space, mm);
+
+                    block->prefetch_info.is_spled = 0;
+
+                    uvm_mutex_lock(&block->lock);
+                    uvm_va_block_unmap(block,
+                                       block_context,
+                                       gpu->id,
+                                       uvm_va_block_region_from_block(block),
+                                       NULL,
+                                       &local_tracker);
+                    uvm_mutex_unlock(&block->lock);
+
+                    uvm_tracker_wait_deinit(&local_tracker);
+                }
+
+                uvm_va_space_up_read(entry->va_space);
+                unpinned = true;
+            }
+
+            uvm_va_space_mm_release_unlock(entry->va_space, mm);
+
+            if (unpinned) {
+                list_del_init(&entry->spln);
+                NV_KFREE(entry, sizeof(uvm_pl_entry));
+            }
+        }
+
+        // Whatever could not be unpinned this sweep goes back on the queue with
+        // its charge restored, rather than being dropped, which would leak the
+        // entry and leave the block mapped forever.
+        if (!list_empty(&expired)) {
+            uvm_spin_lock(&gpu->zc_lock);
+            list_for_each_entry_safe(entry, next, &expired, spln) {
+                list_move_tail(&entry->spln, &gpu->spled_blocks);
+                gpu->num_spled++;
+            }
+            uvm_spin_unlock(&gpu->zc_lock);
+        }
     }
 
     return 0;
 }
 
 // Stop the three kthreads and free the payload they share with the fault path.
-// Caller holds pin_lock.
+// Caller holds zc_lifetime_lock.
 //
-// Holding pin_lock across kthread_stop is deliberate, and is what makes a
+// Holding that lock across kthread_stop is deliberate, and is what makes a
 // va_space registering during this teardown wait for it rather than attach to
 // threads that are going away. The wait is bounded: the copy and eviction
 // threads busy-spin and leave on their stop flags immediately, and the unpin
-// thread's msleep_interruptible is woken by kthread_stop while its own pin_lock
-// acquisition is a trylock, so it fails, loops, and reaches its exit check
-// without ever blocking here.
+// thread's msleep_interruptible is woken by kthread_stop. None of the three
+// takes zc_lifetime_lock, so none can be waiting on the lock this is held
+// under.
 static void ariadne_stop_threads(uvm_gpu_t *gpu)
 {
-    uvm_assert_mutex_locked(&gpu->pin_lock);
+    uvm_assert_mutex_locked(&gpu->zc_lifetime_lock);
 
     if (gpu->async_copy) {
         if (gpu->cd)
@@ -1868,18 +1890,22 @@ static void ariadne_stop_threads(uvm_gpu_t *gpu)
     gpu->pd_copy.va_block = NULL;
 }
 
-// Drop every queue entry belonging to one va_space. Caller holds pin_lock.
+// Drop every queue entry belonging to one va_space, or all of them when dying
+// is NULL. Takes zc_lock itself; the caller must not hold it.
 //
 // This is the genuinely per-va_space part of teardown: the entries name a
 // va_space that is going away, so the kthreads must not be left to walk them.
 // The counters come down per entry rather than being zeroed, because the queues
 // may still hold other clients' entries.
+//
+// Detach under zc_lock, free outside it, so nothing is held across the frees.
 static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
 {
+    LIST_HEAD(doomed);
     uvm_pl_entry *pl_entry, *pl_next;
     uvm_used_entry *used_entry, *used_next;
 
-    uvm_assert_mutex_locked(&gpu->pin_lock);
+    uvm_spin_lock(&gpu->zc_lock);
 
     // The inbox is drained onto spl_blocks first, so a candidate published by
     // the eviction path but not yet picked up by the fault path is considered
@@ -1903,19 +1929,24 @@ static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
         if (dying && pl_entry->va_space != dying)
             continue;
 
-        list_del_init(&pl_entry->spln);
-        NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+        list_move_tail(&pl_entry->spln, &doomed);
     }
 
     list_for_each_entry_safe(pl_entry, pl_next, &gpu->spled_blocks, spln) {
         if (dying && pl_entry->va_space != dying)
             continue;
 
-        list_del_init(&pl_entry->spln);
-        NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+        list_move_tail(&pl_entry->spln, &doomed);
 
         if (gpu->num_spled)
             gpu->num_spled--;
+    }
+
+    uvm_spin_unlock(&gpu->zc_lock);
+
+    list_for_each_entry_safe(pl_entry, pl_next, &doomed, spln) {
+        list_del_init(&pl_entry->spln);
+        NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
     }
 
     // block_kill already unlinks a used_entry when its block dies, and tearing
@@ -1926,10 +1957,8 @@ static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
     // dangling, and a surviving block would later dereference freed memory from
     // the eviction path.
     //
-    // used_lock as well as pin_lock, because the populate path and the eviction
-    // path reach this list without pin_lock and cannot be excluded by it. Order
-    // is pin_lock then used_lock everywhere, and used_lock is LEAF so nothing is
-    // taken under it.
+    // used_lock is a different LEAF spinlock covering a different list, and the
+    // two are never held together.
     uvm_spin_lock(&gpu->used_lock);
 
     list_for_each_entry_safe(used_entry, used_next, &gpu->used_blocks, spln) {
@@ -1957,16 +1986,20 @@ static void ariadne_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
 
 void uvm_ariadne_gpu_va_space_get(uvm_gpu_t *gpu)
 {
-    uvm_mutex_lock(&gpu->pin_lock);
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
     gpu->ariadne_users++;
-    uvm_mutex_unlock(&gpu->pin_lock);
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
 }
 
 void uvm_ariadne_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying)
 {
-    uvm_mutex_lock(&gpu->pin_lock);
+    bool last_user = false;
 
-    ariadne_drop_va_space_entries(gpu, dying);
+    // Called from remove_gpu_va_space, which already holds mmap_lock and the
+    // va_space write lock. Only zc_lifetime_lock is taken here, and nothing is
+    // taken under it, so there is no order to get wrong. The queue drain below
+    // takes zc_lock separately and never while this is held.
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
 
     // Their code stops the threads here unconditionally, which strands every
     // other client on this GPU and frees a cd struct their fault paths still
@@ -1974,18 +2007,28 @@ void uvm_ariadne_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying)
     // which for a single-client run is every process exit, exactly as theirs
     // behaved.
     if (gpu->ariadne_users && --gpu->ariadne_users == 0) {
+        last_user = true;
         ariadne_stop_threads(gpu);
+    }
 
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
+
+    // After the threads are stopped, so neither can be walking an entry while
+    // it is freed.
+    ariadne_drop_va_space_entries(gpu, dying);
+
+    if (last_user) {
         // Safe to zero only now that no client and no thread is left. These
         // describe the GPU rather than any one client, and they are recomputed
         // per fault batch anyway, so this is tidiness rather than correctness.
+        uvm_spin_lock(&gpu->zc_lock);
         gpu->man_size = 0;
+        uvm_spin_unlock(&gpu->zc_lock);
+
         gpu->cur_chg_2mb_pages = 0;
         gpu->max_rest_2mb_pages = 0;
         gpu->prev_free_2mb = 0;
     }
-
-    uvm_mutex_unlock(&gpu->pin_lock);
 }
 
 // Final sweep at GPU removal. By here the refcount is zero and the threads are
@@ -1993,7 +2036,7 @@ void uvm_ariadne_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying)
 // path that never reached uvm_ariadne_gpu_va_space_put.
 void uvm_ariadne_gpu_deinit(uvm_gpu_t *gpu)
 {
-    uvm_mutex_lock(&gpu->pin_lock);
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
 
     if (gpu->ariadne_users) {
         UVM_ERR_PRINT("ARIADNE: GPU removed with %u va_space users still counted. "
@@ -2004,24 +2047,28 @@ void uvm_ariadne_gpu_deinit(uvm_gpu_t *gpu)
 
     ariadne_stop_threads(gpu);
 
-    // NULL dying: take everything, whoever it belonged to.
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
+
+    // NULL dying: take everything, whoever it belonged to. Takes zc_lock
+    // itself, which is why it is called with nothing held.
     ariadne_drop_va_space_entries(gpu, NULL);
 
-    // active_blocks belongs to used_lock, so it is reset under it even here,
-    // where the GPU is going away with its retained count already at zero and
-    // nothing should be racing. Consistency at every site is what makes the
-    // rule checkable by reading.
+    // Each counter is reset under the lock that owns it, even here, where the
+    // GPU is going away with its retained count already at zero and nothing
+    // should be racing. Consistency at every site is what makes the rule
+    // checkable by reading.
     uvm_spin_lock(&gpu->used_lock);
     gpu->active_blocks = 0;
     uvm_spin_unlock(&gpu->used_lock);
 
+    uvm_spin_lock(&gpu->zc_lock);
     gpu->num_spled = 0;
     gpu->man_size = 0;
+    uvm_spin_unlock(&gpu->zc_lock);
+
     gpu->cur_chg_2mb_pages = 0;
     gpu->max_rest_2mb_pages = 0;
     gpu->prev_free_2mb = 0;
-
-    uvm_mutex_unlock(&gpu->pin_lock);
 }
 
 // interrupted on fatal faults due to insufficient permissions or invalid
@@ -3105,7 +3152,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     if (uvm_perf_fhp && service_mode != FAULT_SERVICE_MODE_CANCEL) {
         uvm_gpu_t *ar_gpu = ariadne_gpu(parent_gpu);
 
-        // Bring-up runs under pin_lock so it cannot overlap the teardown in
+        // Bring-up runs under zc_lifetime_lock so it cannot overlap the teardown in
         // uvm_ariadne_gpu_va_space_put. Without it a process registering while
         // the previous one's last put is stopping the threads could see a NULL
         // async_copy, allocate a second cd, and start a second set of threads
@@ -3126,7 +3173,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         const bool ar_bringup = ar_gpu && !ar_gpu->async_copy;
 
         if (ar_bringup)
-            uvm_mutex_lock(&ar_gpu->pin_lock);
+            uvm_mutex_lock(&ar_gpu->zc_lifetime_lock);
 
         if (ar_bringup && !ar_gpu->async_copy) {
             ar_gpu->cd = uvm_kvmalloc_zero(sizeof(*ar_gpu->cd));
@@ -3190,7 +3237,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         }
 
         if (ar_bringup)
-            uvm_mutex_unlock(&ar_gpu->pin_lock);
+            uvm_mutex_unlock(&ar_gpu->zc_lifetime_lock);
     }
 
     for (i = 0; i < batch_context->num_coalesced_faults;) {
@@ -4113,12 +4160,20 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         // keeps the arm honest: an ariadne:nozc or ariadne:stockpath arm then
         // runs with the same thread count as stock, and a per-thread cost
         // cannot leak into the comparison.
+        //
+        // Under zc_lifetime_lock, which is the same lock
+        // uvm_ariadne_gpu_va_space_put stops the threads under, and the user
+        // count is read there too. Theirs starts it unlocked and reads no
+        // count, so a thread can be started just after the last va_space has
+        // gone and then live until GPU teardown.
         if (ar_gpu && uvm_dynzero_enable) {
-            if (!ar_gpu->async_unpin) {
+            uvm_mutex_lock(&ar_gpu->zc_lifetime_lock);
+            if (!ar_gpu->async_unpin && ar_gpu->ariadne_users > 0) {
                 ar_gpu->async_unpin = kthread_run(uvm_gpu_unpin_period, ar_gpu, "uvm_gpu_unpin");
                 if (IS_ERR(ar_gpu->async_unpin))
                     ar_gpu->async_unpin = NULL;
             }
+            uvm_mutex_unlock(&ar_gpu->zc_lifetime_lock);
         }
     }
 
@@ -4238,6 +4293,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             uvm_gpu_t *ar_gpu = uvm_dynzero_enable ? ariadne_gpu(parent_gpu) : NULL;
 
             if (ar_gpu) {
+                LIST_HEAD(candidates);
+                LIST_HEAD(pinned_now);
+                LIST_HEAD(returned);
                 uvm_pl_entry *entry, *next_entry;
                 struct list_head *cur;
                 NvU32 resident = 0;
@@ -4256,17 +4314,29 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
                 uvm_spin_unlock(&ar_gpu->pmm.list_lock);
 
-                // pin_lock is taken before spled_blocks is read, not after.
+                // zc_lock is taken before spled_blocks is read, not after.
                 // Theirs counts the list first and locks second, so the unpin
                 // kthread can free an entry out from under the walk.
-                uvm_mutex_lock(&ar_gpu->pin_lock);
+                //
+                // Detach then process, in three phases. Under zc_lock: drain
+                // the inbox, size the surplus, move that many candidates onto a
+                // local list. With no ARIADNE lock held: map each one, which
+                // needs mmap_lock, the va_space lock and the block lock. Under
+                // zc_lock again: file the results.
+                //
+                // Theirs holds one mutex across all of it and takes mmap_lock
+                // inside, which deadlocks against uvm_ariadne_gpu_va_space_put
+                // once that takes the same mutex from remove_gpu_va_space,
+                // where mmap_lock is already held. See the zc_lock comment on
+                // uvm_gpu_t.
+                uvm_spin_lock(&ar_gpu->zc_lock);
 
                 // Drain the inbox onto spl_blocks before anything reads it.
                 // The eviction path publishes candidates here rather than
-                // appending to spl_blocks directly, because it holds locks
-                // ordered after pin_lock; see uvm_gpu_t.spl_pending. This is
-                // the only consumer, and it runs under pin_lock, so the list
-                // below is stable for the rest of the block.
+                // appending to spl_blocks directly, because it holds locks that
+                // cannot be combined with this one; see uvm_gpu_t.spl_pending.
+                // This is the only consumer, and it runs under zc_lock, so the
+                // list below is stable for the rest of the phase.
                 //
                 // llist_del_all reverses the batch, and the order of candidates
                 // within one drain carries no meaning: to_pin takes some prefix
@@ -4298,21 +4368,37 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                     to_pin += uvm_dynzero_aggradjust;
 
                 list_for_each_entry_safe(entry, next_entry, &ar_gpu->spl_blocks, spln) {
-                    uvm_va_block_t *block = NULL;
-                    uvm_va_block_context_t *block_context;
-                    struct mm_struct *block_mm;
-                    NvU64 pintime;
-
                     if (to_pin == 0)
                         break;
 
-                    block_mm = uvm_va_space_mm_retain_lock(entry->va_space);
-                    uvm_va_space_down_read(entry->va_space);
+                    list_move_tail(&entry->spln, &candidates);
+                    to_pin--;
+                }
+
+                uvm_spin_unlock(&ar_gpu->zc_lock);
+
+                // Off the queue and owned by this walk alone, so the blocking
+                // acquisitions below are safe: no ARIADNE lock is held.
+                list_for_each_entry_safe(entry, next_entry, &candidates, spln) {
+                    uvm_va_block_t *block = NULL;
+                    uvm_va_block_context_t *block_context;
+                    struct mm_struct *block_mm;
+                    uvm_va_space_t *entry_va_space = entry->va_space;
+                    NvU64 pintime;
+                    bool mapped = false;
+
+                    // Cached above, because the not-found path frees the entry
+                    // and the unlock pair still needs the va_space. Reading
+                    // entry->va_space after the free is a use-after-free; it is
+                    // latent rather than loud, since the slab usually still
+                    // holds the old pointer, and it is theirs.
+                    block_mm = uvm_va_space_mm_retain_lock(entry_va_space);
+                    uvm_va_space_down_read(entry_va_space);
 
                     // Checked before use, unlike theirs: the range can have
                     // gone away while the block sat on this queue.
-                    if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
-                        block_context = uvm_va_space_block_context(entry->va_space, block_mm);
+                    if (uvm_va_block_find(entry_va_space, entry->start, &block) == NV_OK && block) {
+                        block_context = uvm_va_space_block_context(entry_va_space, block_mm);
 
                         // The Zero-copy mapping itself. On a CPU-resident block
                         // this builds a GPU-to-sysmem remote mapping over the
@@ -4334,22 +4420,35 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                             block->prefetch_info.last_migration_time = now;
                             block->prefetch_info.is_spled = 1;
                             entry->endtime = now + pintime;
-
-                            list_move_tail(&entry->spln, &ar_gpu->spled_blocks);
-                            ar_gpu->num_spled++;
-                            to_pin--;
+                            mapped = true;
                         }
                     }
+
+                    uvm_va_space_up_read(entry_va_space);
+                    uvm_va_space_mm_release_unlock(entry_va_space, block_mm);
+
+                    if (block)
+                        list_move_tail(&entry->spln, mapped ? &pinned_now : &returned);
                     else {
                         list_del_init(&entry->spln);
                         NV_KFREE(entry, sizeof(uvm_pl_entry));
                     }
-
-                    uvm_va_space_up_read(entry->va_space);
-                    uvm_va_space_mm_release_unlock(entry->va_space, block_mm);
                 }
 
-                uvm_mutex_unlock(&ar_gpu->pin_lock);
+                uvm_spin_lock(&ar_gpu->zc_lock);
+
+                list_for_each_entry_safe(entry, next_entry, &pinned_now, spln) {
+                    list_move_tail(&entry->spln, &ar_gpu->spled_blocks);
+                    ar_gpu->num_spled++;
+                }
+
+                // Could not be mapped this time. Back on the candidate queue so
+                // a later batch retries, rather than dropped, which would lose
+                // the candidate.
+                list_for_each_entry_safe(entry, next_entry, &returned, spln)
+                    list_move_tail(&entry->spln, &ar_gpu->spl_blocks);
+
+                uvm_spin_unlock(&ar_gpu->zc_lock);
             }
         }
 
