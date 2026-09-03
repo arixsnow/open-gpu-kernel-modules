@@ -1560,6 +1560,19 @@ static uvm_gpu_t *alloc_gpu(uvm_parent_gpu_t *parent_gpu, uvm_gpu_id_t gpu_id)
     gpu->magic = UVM_GPU_MAGIC_VALUE;
     uvm_spin_lock_init(&gpu->peer_info.peer_gpu_lock, UVM_LOCK_ORDER_LEAF);
 
+    // Zero-copy per-GPU state. Initialised unconditionally, not under
+    // uvm_dynzero_enable, because the teardown paths walk these lists whatever
+    // the knob says and an uninitialised list head is a wild pointer. The
+    // counters are left at zero, which uvm_kvmalloc_zero above already did, and
+    // man_size is recomputed from the used-chunk list once per fault batch.
+    uvm_spin_lock_init(&gpu->zc_lock, UVM_LOCK_ORDER_LEAF);
+    uvm_mutex_init(&gpu->zc_lifetime_lock, UVM_LOCK_ORDER_LEAF);
+    uvm_spin_lock_init(&gpu->used_lock, UVM_LOCK_ORDER_LEAF);
+    INIT_LIST_HEAD(&gpu->spl_blocks);
+    INIT_LIST_HEAD(&gpu->spled_blocks);
+    INIT_LIST_HEAD(&gpu->used_blocks);
+    init_llist_head(&gpu->spl_pending);
+
     sub_processor_index = uvm_id_sub_processor_index(gpu_id);
     parent_gpu->gpus[sub_processor_index] = gpu;
 
@@ -2076,6 +2089,11 @@ static void deinit_parent_gpu(uvm_parent_gpu_t *parent_gpu)
 static void deinit_gpu(uvm_gpu_t *gpu)
 {
     uvm_gpu_t *other_gpu;
+
+    // Zero-copy first, before anything else is torn down. The unpin kthread
+    // holds pointers into va_spaces and into this GPU, so it has to be gone
+    // before the structures underneath it are.
+    uvm_zc_gpu_deinit(gpu);
 
     // Remove any pointers to this GPU from other GPUs' trackers.
     for_each_gpu(other_gpu) {

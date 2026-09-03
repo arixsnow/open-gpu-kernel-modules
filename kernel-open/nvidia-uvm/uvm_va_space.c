@@ -1619,6 +1619,10 @@ static void add_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space)
     uvm_processor_mask_set(&va_space->registered_gpu_va_spaces, gpu->id);
     va_space->gpu_va_spaces[uvm_id_gpu_index(gpu->id)] = gpu_va_space;
     gpu_va_space->state = UVM_GPU_VA_SPACE_STATE_ACTIVE;
+
+    // Zero-copy: this is the only ACTIVE transition, so it is where the per-GPU
+    // unpin kthread gains a user. remove_gpu_va_space drops it again.
+    uvm_zc_gpu_va_space_get(gpu);
 }
 
 static NV_STATUS check_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space)
@@ -1789,6 +1793,21 @@ static void remove_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space,
     uvm_va_range_t *va_range;
     uvm_va_range_t *va_range_next;
     uvm_gpu_t *gpu;
+
+    // Zero-copy: give up this va_space's claim on the per-GPU unpin kthread and
+    // drop the queue entries that name it.
+    //
+    // Refcounted, so the thread stops on the last user out. ARIADNE's own tree
+    // stops its threads and empties the queues here unconditionally, which is a
+    // scoping error rather than a design choice: the thread and the queues
+    // belong to the GPU, and a va_space is one of possibly several users of it.
+    //
+    // Guarded on ACTIVE to pair one-for-one with the get in add_gpu_va_space.
+    // The state becomes DEAD further down, so a second call early-returns just
+    // below and cannot double-drop the count.
+    if (gpu_va_space && gpu_va_space->gpu && gpu_va_space->va_space &&
+        uvm_gpu_va_space_state(gpu_va_space) == UVM_GPU_VA_SPACE_STATE_ACTIVE)
+        uvm_zc_gpu_va_space_put(gpu_va_space->gpu, gpu_va_space->va_space);
 
     if (!gpu_va_space || uvm_gpu_va_space_state(gpu_va_space) != UVM_GPU_VA_SPACE_STATE_ACTIVE)
         return;

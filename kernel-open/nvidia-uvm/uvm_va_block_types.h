@@ -31,6 +31,68 @@
 
 #include <linux/migrate.h>
 #include <linux/nodemask.h>
+#include <linux/llist.h>
+
+// ----------------------------------------------------------------------------
+// Zero-copy list-node types
+// ----------------------------------------------------------------------------
+//
+// Dynamic Zero-copy is ARIADNE's mechanism, published at HPCA'26. It is carried
+// here as a PLACEMENT POLICY behind uvm_dynzero_enable, whose default in this
+// build is 0, so nothing about any other arm changes. It exists so that this
+// project's fault-servicing mechanism can be measured with placement held
+// fixed, including under the policy that produces ARIADNE's own headline
+// numbers. It is a control variable in the same sense as access-counter
+// migration, and is never a contribution of this work.
+//
+// What is carried: the host-pin loop, the unpin kthread, the working-set
+// accounting the pin decision reads, the candidate queue and its eviction hook.
+// What is not: their fault-servicing mechanisms, their Sharing Degree, their
+// eviction victim selection, and their read-duplication change. Those are
+// separate mechanisms and belong to their build alone.
+//
+// These types live here rather than in uvm_gpu.h because uvm_va_block_t needs a
+// uvm_used_entry back-pointer and uvm_gpu_t needs the list heads, so putting
+// them in uvm_gpu.h would force uvm_va_block.h to include it. This header is
+// already included by uvm_gpu.h, uvm_va_block.h and uvm_pmm_gpu.h alike, and
+// uvm_forward_decl.h above supplies both uvm_va_block_t and uvm_va_space_t.
+
+// One VA block awaiting, or currently held in, the Zero-copy ("host-pinned")
+// state. Queued on uvm_gpu_t.spl_blocks while waiting and moved to
+// spled_blocks once pinned, with endtime giving the deadline at which the
+// unpin kthread revokes the GPU mapping.
+//
+// pll is how the entry reaches spl_blocks. The eviction path that creates it
+// cannot take pin_lock, so it publishes through uvm_gpu_t.spl_pending with
+// llist_add and the fault path splices the inbox onto spl_blocks under
+// pin_lock. The two links are never live at the same time: pll is used only
+// between the producer and that splice, spln only after it.
+typedef struct
+{
+    NvU64 start;
+    uvm_va_space_t *va_space;
+    NvU64 endtime;
+    struct list_head spln;
+    struct llist_node pll;
+} uvm_pl_entry;
+
+// One VA block counted in the Working Chunk Set Size, the demand estimate the
+// pin decision is sized from. Queued on uvm_gpu_t.used_blocks; is_in_gpu
+// distinguishes blocks currently resident from ones retained speculatively
+// after eviction.
+//
+// gpu is not in their struct. They have no path that removes an entry when its
+// VA block dies, so the owning GPU is never needed on that side. Recording it
+// here lets block_kill unlink the entry and uncharge active_blocks without
+// having to search the GPUs for the list the entry sits on, and gives the
+// used_lock something to name.
+typedef struct
+{
+    uvm_va_block_t *block;
+    uvm_gpu_t *gpu;
+    NvBool is_in_gpu;
+    struct list_head spln;
+} uvm_used_entry;
 
 // UVM_VA_BLOCK_BITS is 21, meaning the maximum block size is 2MB. Rationale:
 // - 2MB matches the largest Turing GPU page size so it's a natural fit

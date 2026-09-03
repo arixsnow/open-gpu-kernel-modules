@@ -1129,6 +1129,82 @@ struct uvm_gpu_struct
     // Used to protect allocation of p2p_mem and assignment of the page
     // zone_device_data fields.
     uvm_mutex_t device_p2p_lock;
+
+    // ------------------------------------------------------------------------
+    // Zero-copy placement policy, ARIADNE's (HPCA'26)
+    // ------------------------------------------------------------------------
+    //
+    // All of this is inert unless uvm_dynzero_enable is 1, which it is not by
+    // default in this build. See uvm_va_block_types.h for why the mechanism is
+    // carried here at all and what is deliberately left behind.
+
+    // Guards spl_blocks, spled_blocks, num_spled and man_size, and NOTHING is
+    // taken under it. Every walk detaches the entries it wants onto a local
+    // list, drops this, does the sleeping work with no Zero-copy lock held, and
+    // takes it again to put survivors back.
+    //
+    // ARIADNE holds one mutex across the whole walk instead, taking mmap_lock
+    // and the va_space lock inside it. That cannot be given a consistent lock
+    // order once anything takes the same mutex from a path that already holds
+    // mmap_lock, which the per-va_space refcount does: remove_gpu_va_space
+    // reaches uvm_zc_gpu_va_space_put holding mmap_lock and the va_space write
+    // lock. One site then wants the mutex before mmap_lock and the other after,
+    // and the fault bottom half and a process teardown can face each other on
+    // the same GPU and va_space. Detach-then-process removes the question:
+    // a LEAF spinlock that is never held across a sleep cannot be half of any
+    // cycle.
+    uvm_spinlock_t zc_lock;
+
+    // Guards zc_users and async_unpin, and only those. A mutex rather than a
+    // spinlock because it is held across kthread_stop, which sleeps.
+    //
+    // LEAF, because it has to be innermost: add_gpu_va_space and
+    // remove_gpu_va_space take it holding the va_space write lock and
+    // mmap_lock, and the fault path takes it holding nothing. Nothing is ever
+    // taken under it, so innermost is both correct and free of conflict. The
+    // unpin kthread never takes it, so kthread_stop under it cannot wait on a
+    // thread that is waiting for it.
+    //
+    // Never held together with zc_lock or used_lock, which are also LEAF.
+    uvm_mutex_t zc_lifetime_lock;
+
+    // Zero-copy queues. spl_blocks holds candidates awaiting a host pin,
+    // spled_blocks those currently pinned and waiting for the unpin kthread.
+    // Both are walked and mutated only under pin_lock.
+    struct list_head spl_blocks;
+    struct list_head spled_blocks;
+
+    // Inbox for spl_blocks. The eviction path that produces candidates holds
+    // va_block->lock and pmm->lock, both ordered after pin_lock, so it cannot
+    // take pin_lock to append. An llist takes a lock-free producer, and the
+    // fault path splices the whole inbox onto spl_blocks under pin_lock before
+    // its walk.
+    struct llist_head spl_pending;
+
+    // The Working Chunk Set Size, as a list of uvm_used_entry and its
+    // cardinality. man_size is the count of resident root chunks, recounted
+    // once per fault batch. The surplus of active_blocks over man_size plus the
+    // already-pinned count is how many blocks get host-pinned this batch.
+    struct list_head used_blocks;
+    NvU32 man_size;
+    NvU32 active_blocks;
+    NvU32 num_spled;
+
+    // Guards used_blocks and active_blocks, and nothing else.
+    //
+    // Separate from pin_lock because the populate path and the eviction path
+    // reach this list holding va_block->lock, which is ordered after pin_lock,
+    // so they cannot take it. LEAF, so it is innermost and nothing is taken
+    // under it. Every allocation happens before it is taken and every free
+    // under it is kfree, which is safe in atomic context.
+    uvm_spinlock_t used_lock;
+
+    // The unpin kthread, and the number of va_spaces currently using this GPU.
+    // The thread is brought up lazily on the first fault batch that needs it
+    // and stopped when the last va_space goes away, so a GPU that no client is
+    // using is not left with a thread waking every uvm_dynzero_unpin_period.
+    struct task_struct *async_unpin;
+    NvU32 zc_users;
 };
 
 typedef struct
@@ -1722,6 +1798,35 @@ void uvm_gpu_exit(void);
 NV_STATUS uvm_gpu_init_va_space(uvm_va_space_t *va_space);
 
 void uvm_gpu_exit_va_space(uvm_va_space_t *va_space);
+
+// ----------------------------------------------------------------------------
+// Zero-copy lifetime, ARIADNE's mechanism (HPCA'26)
+// ----------------------------------------------------------------------------
+//
+// The unpin kthread outlives any single fault batch and holds pointers into a
+// va_space, so it has to be stopped before the last va_space using this GPU
+// goes away. These three are the whole of that lifetime.
+//
+// Lock order is pin_lock then the va_space lock then mmap_lock. Both the
+// host-pin walk in the fault path and the queue drains here take pin_lock in
+// that direction. The cycle is closed by the only holder that could take them
+// the other way, the unpin kthread, which uses a trylock for pin_lock and
+// trylocks for the va_space lock and mmap_lock, so it can never block while
+// holding any of them.
+
+// One more va_space is using this GPU. Call when a gpu_va_space becomes ACTIVE.
+void uvm_zc_gpu_va_space_get(uvm_gpu_t *gpu);
+
+// One fewer. Drops dying's entries from both queues, then, if it was the last
+// user, stops the unpin kthread. Call when an ACTIVE gpu_va_space is removed,
+// exactly once, to pair with the get above.
+void uvm_zc_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying);
+
+// Final sweep at GPU removal, from deinit_gpu, which holds the global lock with
+// the GPU's retained count already at zero. By then the refcount should be zero
+// and the kthread already stopped; this exists for queue entries that outlived
+// the va_space that made them.
+void uvm_zc_gpu_deinit(uvm_gpu_t *gpu);
 
 static unsigned int uvm_gpu_numa_node(uvm_gpu_t *gpu)
 {

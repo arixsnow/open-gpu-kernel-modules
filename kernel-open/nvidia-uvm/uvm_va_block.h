@@ -490,6 +490,24 @@ struct uvm_va_block_struct
         uvm_processor_id_t last_migration_proc_id;
 
         NvU16 fault_migrations_to_last_proc;
+
+        // Zero-copy state, ARIADNE's (HPCA'26), carried as a placement policy
+        // behind uvm_dynzero_enable. See uvm_va_block_types.h for what is and
+        // is not carried.
+        //
+        // last_migration_time is when the block last left GPU memory, and the
+        // reaper ages the working set from it. is_thrashed records that the
+        // block has been migrated before, which is what makes it a Zero-copy
+        // candidate when it is next evicted. used_entry is the back-pointer
+        // into gpu->used_blocks, NULL when the block is not counted. is_spled
+        // records that the block is currently host-pinned. thr_count counts how
+        // often it has been, and multiplies the pin time by five past the
+        // first.
+        NvU64 last_migration_time;
+        NvU8 is_thrashed;
+        uvm_used_entry *used_entry;
+        bool is_spled;
+        NvU8 thr_count;
     } prefetch_info;
 
     struct

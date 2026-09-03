@@ -1202,6 +1202,52 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
 
     uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_chunks, NULL);
 
+    // Zero-copy candidacy, ARIADNE's (HPCA'26), off by default in this build.
+    // The block has just left GPU memory, so decide whether it leaves the
+    // working set with it or is retained as a Zero-copy candidate. Retained
+    // when it has been migrated before, which is what is_thrashed records.
+    //
+    // used_entry is NULL-checked, which theirs does not do. Their invariant is
+    // that every block reaching eviction was counted by the populate path, and
+    // on 610 that does not hold: the populate side only counts full 2 MB
+    // non-HMM blocks, and the reaper in the fault loop can have already dropped
+    // the entry.
+    if (uvm_dynzero_enable && va_block->prefetch_info.used_entry) {
+        va_block->prefetch_info.last_migration_time = NV_GETTIME();
+        va_block->prefetch_info.used_entry->is_in_gpu = 0;
+
+        if (va_block->prefetch_info.is_thrashed) {
+            uvm_pl_entry *pl_entry;
+
+            NV_KMALLOC(pl_entry, sizeof(*pl_entry));
+            if (pl_entry) {
+                pl_entry->va_space = uvm_va_block_get_va_space(va_block);
+                pl_entry->start = va_block->start;
+                pl_entry->endtime = 0;
+                INIT_LIST_HEAD(&pl_entry->spln);
+                // Published through the lock-free inbox, not appended straight
+                // onto spl_blocks. This runs under va_block->lock and
+                // pmm->lock, both ordered after pin_lock, so it cannot take
+                // pin_lock, and appending here with no lock at all would race
+                // the fault path walking and freeing that same list.
+                llist_add(&pl_entry->pll, &gpu->spl_pending);
+            }
+        }
+        else {
+            // used_lock, for the same reason. The reaper in the fault loop
+            // walks this list freeing entries as it goes, so an unlocked delete
+            // here can unlink a node that walk is standing on.
+            uvm_spin_lock(&gpu->used_lock);
+            list_del_init(&va_block->prefetch_info.used_entry->spln);
+            if (gpu->active_blocks > 0)
+                gpu->active_blocks--;
+            uvm_spin_unlock(&gpu->used_lock);
+
+            NV_KFREE(va_block->prefetch_info.used_entry, sizeof(uvm_used_entry));
+            va_block->prefetch_info.used_entry = NULL;
+        }
+    }
+
     uvm_mutex_unlock(&va_block->lock);
 
     // The block has been retained by find_and_retain_va_block_to_evict(),

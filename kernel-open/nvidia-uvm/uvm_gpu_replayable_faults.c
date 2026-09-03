@@ -3638,6 +3638,522 @@ static void enable_disable_prefetch_faults(uvm_parent_gpu_t *parent_gpu,
     }
 }
 
+// ----------------------------------------------------------------------------
+// Dynamic Zero-copy, ARIADNE's mechanism (HPCA'26)
+// ----------------------------------------------------------------------------
+//
+// Everything below is inert unless uvm_dynzero_enable is 1, and its default in
+// this build is 0. See uvm_global.c for why the mechanism is carried here and
+// uvm_va_block_types.h for what is and is not carried.
+//
+// The shape: the eviction path decides a block that just left GPU memory is
+// worth keeping reachable and queues it; the fault path pins as many queued
+// blocks as the demand surplus calls for, giving each a GPU-to-sysmem mapping
+// with a deadline; a kthread revokes mappings whose deadline has passed so the
+// next access refaults and placement is reconsidered.
+
+// The single live sub-GPU behind a parent. The fault loop is per parent GPU on
+// 610 and has no uvm_gpu_t in scope, while the queues and counters are per
+// uvm_gpu_t. Under SMC several sub-GPUs would share the parent's fault buffer
+// and silently share that state, so this asserts there is exactly one.
+static uvm_gpu_t *zc_gpu(uvm_parent_gpu_t *parent_gpu)
+{
+    uvm_gpu_t *gpu;
+
+    UVM_ASSERT(parent_gpu);
+
+    if (parent_gpu->smc.enabled) {
+        NvU32 sub_processor_index;
+
+        UVM_ASSERT_MSG(bitmap_weight(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS) <= 1,
+                       "Zero-copy is single-GPU only; %u sub-GPUs are live\n",
+                       bitmap_weight(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS));
+
+        sub_processor_index = find_first_bit(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS);
+        gpu = (sub_processor_index < UVM_PARENT_ID_MAX_SUB_PROCESSORS) ?
+              parent_gpu->gpus[sub_processor_index] : NULL;
+    }
+    else {
+        gpu = parent_gpu->gpus[0];
+    }
+
+    return gpu;
+}
+
+// Non-blocking va_space read lock, respecting the read-acquire-write-release
+// ordering the va_space lock requires. For the unpin kthread, which must never
+// block against the teardown trying to stop it.
+static bool zc_va_space_tryread(uvm_va_space_t *va_space)
+{
+    if (!uvm_mutex_trylock(&va_space->read_acquire_write_release_lock))
+        return false;
+
+    if (!uvm_down_read_trylock(&va_space->lock)) {
+        uvm_mutex_unlock(&va_space->read_acquire_write_release_lock);
+        return false;
+    }
+
+    uvm_mutex_unlock_out_of_order(&va_space->read_acquire_write_release_lock);
+    return true;
+}
+
+// Move the lock-free inbox onto spl_blocks. Caller holds zc_lock.
+//
+// llist_del_all reverses the batch, and the order within one drain carries no
+// meaning: the pin walk takes some prefix of a queue whose entries were all
+// evicted at about the same time.
+static void zc_drain_pending(uvm_gpu_t *gpu)
+{
+    struct llist_node *pending = llist_del_all(&gpu->spl_pending);
+    struct llist_node *pnext;
+
+    while (pending) {
+        uvm_pl_entry *pe = container_of(pending, uvm_pl_entry, pll);
+
+        pnext = pending->next;
+        list_add_tail(&pe->spln, &gpu->spl_blocks);
+        pending = pnext;
+    }
+}
+
+// Zero-copy expiry. Revokes the GPU mapping of any block whose pin time has
+// passed, so the next access refaults and the driver can reconsider where the
+// block belongs.
+//
+// Detach then process. The expired entries are moved onto a local list under
+// zc_lock, the lock is dropped, and only then is anything mapped, unmapped or
+// waited on. Nothing that can sleep runs with a Zero-copy lock held, which is
+// what lets zc_lock be a LEAF spinlock with no ordering question against
+// mmap_lock or the va_space lock.
+static int uvm_zc_unpin_period(void *data)
+{
+    uvm_gpu_t *gpu = (uvm_gpu_t *)data;
+
+    while (!kthread_should_stop()) {
+        LIST_HEAD(expired);
+        uvm_pl_entry *entry, *next;
+        NvU64 now;
+        NvU32 decay;
+        NvU32 budget;
+
+        msleep_interruptible(uvm_dynzero_unpin_period);
+
+        if (kthread_should_stop())
+            break;
+
+        now = NV_GETTIME();
+
+        uvm_spin_lock(&gpu->zc_lock);
+
+        // Self-throttle. The more blocks are pinned, the fewer are released per
+        // sweep, so a large pinned set does not turn into a burst of refaults
+        // and a PCIe storm. Theirs, including the constants.
+        decay = (gpu->num_spled >> 8) + (NvU32)(((NvU64)gpu->num_spled * gpu->num_spled) >> 21);
+        budget = (decay < 99) ? (100 - decay) : 1;
+
+        list_for_each_entry_safe(entry, next, &gpu->spled_blocks, spln) {
+            if (budget == 0)
+                break;
+
+            if (entry->endtime > now)
+                continue;
+
+            list_move_tail(&entry->spln, &expired);
+
+            if (gpu->num_spled > 0)
+                gpu->num_spled--;
+
+            budget--;
+        }
+
+        uvm_spin_unlock(&gpu->zc_lock);
+
+        // Off the queue and owned by this thread alone. Blocking acquisitions
+        // are safe here precisely because no Zero-copy lock is held.
+        list_for_each_entry_safe(entry, next, &expired, spln) {
+            uvm_va_block_t *block = NULL;
+            uvm_va_block_context_t *block_context;
+            uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+            struct mm_struct *mm;
+
+            mm = uvm_va_space_mm_retain_lock(entry->va_space);
+            uvm_va_space_down_read(entry->va_space);
+
+            // Checked before the block is used. The va_space can have dropped
+            // the range while the block sat pinned.
+            if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
+                block_context = uvm_va_space_block_context(entry->va_space, mm);
+
+                block->prefetch_info.is_spled = 0;
+
+                uvm_mutex_lock(&block->lock);
+                uvm_va_block_unmap(block,
+                                   block_context,
+                                   gpu->id,
+                                   uvm_va_block_region_from_block(block),
+                                   NULL,
+                                   &local_tracker);
+                uvm_mutex_unlock(&block->lock);
+
+                uvm_tracker_wait_deinit(&local_tracker);
+            }
+
+            uvm_va_space_up_read(entry->va_space);
+            uvm_va_space_mm_release_unlock(entry->va_space, mm);
+
+            list_del_init(&entry->spln);
+            NV_KFREE(entry, sizeof(uvm_pl_entry));
+        }
+    }
+
+    return 0;
+}
+
+// Drop every queue entry belonging to one va_space, or all of them when dying
+// is NULL.
+//
+// Detach under zc_lock, free outside it. The counters come down per entry
+// rather than being zeroed, because the queues may still hold other clients'
+// entries.
+static void zc_drop_va_space_entries(uvm_gpu_t *gpu, uvm_va_space_t *dying)
+{
+    LIST_HEAD(doomed);
+    uvm_pl_entry *pl_entry, *pl_next;
+    uvm_used_entry *used_entry, *used_next;
+
+    uvm_spin_lock(&gpu->zc_lock);
+
+    // The inbox is drained first, so a candidate published by the eviction path
+    // but not yet picked up by the fault path is considered here too. Without
+    // this a va_space could go away leaving entries in the inbox, and the next
+    // fault batch would splice them onto spl_blocks and walk a dead va_space.
+    zc_drain_pending(gpu);
+
+    list_for_each_entry_safe(pl_entry, pl_next, &gpu->spl_blocks, spln) {
+        if (dying && pl_entry->va_space != dying)
+            continue;
+
+        list_move_tail(&pl_entry->spln, &doomed);
+    }
+
+    list_for_each_entry_safe(pl_entry, pl_next, &gpu->spled_blocks, spln) {
+        if (dying && pl_entry->va_space != dying)
+            continue;
+
+        list_move_tail(&pl_entry->spln, &doomed);
+
+        if (gpu->num_spled)
+            gpu->num_spled--;
+    }
+
+    uvm_spin_unlock(&gpu->zc_lock);
+
+    list_for_each_entry_safe(pl_entry, pl_next, &doomed, spln) {
+        list_del_init(&pl_entry->spln);
+        NV_KFREE(pl_entry, sizeof(uvm_pl_entry));
+    }
+
+    // block_kill already unlinks a used_entry when its block dies, and tearing
+    // down a va_space kills its blocks, so this is a safety net rather than the
+    // primary mechanism. Clearing the block back-pointer matters: a surviving
+    // block would otherwise dereference freed memory from the eviction path.
+    //
+    // used_lock is a different LEAF spinlock covering a different list, and the
+    // two are never held together.
+    uvm_spin_lock(&gpu->used_lock);
+
+    list_for_each_entry_safe(used_entry, used_next, &gpu->used_blocks, spln) {
+        // The NULL block test belongs to the filter, not to the loop. An entry
+        // with no block cannot be matched against a va_space, so it is skipped
+        // while filtering, but the unfiltered sweep still has to free it or GPU
+        // removal leaks it.
+        if (dying) {
+            if (!used_entry->block || uvm_va_block_get_va_space_maybe_dead(used_entry->block) != dying)
+                continue;
+        }
+
+        if (used_entry->block)
+            used_entry->block->prefetch_info.used_entry = NULL;
+
+        list_del_init(&used_entry->spln);
+        NV_KFREE(used_entry, sizeof(uvm_used_entry));
+
+        if (gpu->active_blocks)
+            gpu->active_blocks--;
+    }
+
+    uvm_spin_unlock(&gpu->used_lock);
+}
+
+// Stop the unpin kthread. Caller holds zc_lifetime_lock.
+//
+// kthread_stop waits for the thread to leave its loop. The thread takes only
+// zc_lock and the va_space and mm locks, never zc_lifetime_lock, so it cannot
+// be waiting on the lock this is held under. Its sleep is interruptible and
+// kthread_stop wakes it.
+static void zc_stop_thread(uvm_gpu_t *gpu)
+{
+    uvm_assert_mutex_locked(&gpu->zc_lifetime_lock);
+
+    if (gpu->async_unpin) {
+        kthread_stop(gpu->async_unpin);
+        gpu->async_unpin = NULL;
+    }
+}
+
+void uvm_zc_gpu_va_space_get(uvm_gpu_t *gpu)
+{
+    if (!gpu)
+        return;
+
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
+    gpu->zc_users++;
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
+}
+
+void uvm_zc_gpu_va_space_put(uvm_gpu_t *gpu, uvm_va_space_t *dying)
+{
+    bool last_user = false;
+
+    if (!gpu)
+        return;
+
+    // Called from remove_gpu_va_space, which already holds mmap_lock and the
+    // va_space write lock. Only zc_lifetime_lock is taken here, and nothing is
+    // taken under it, so there is no order to get wrong.
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
+
+    if (gpu->zc_users == 0) {
+        UVM_ERR_PRINT("Zero-copy: va_space put without a matching get.\n");
+    }
+    else {
+        gpu->zc_users--;
+        last_user = (gpu->zc_users == 0);
+    }
+
+    // The thread is stopped before this va_space's entries are dropped, so it
+    // cannot be holding one of them when they are freed.
+    if (last_user)
+        zc_stop_thread(gpu);
+
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
+
+    zc_drop_va_space_entries(gpu, dying);
+}
+
+void uvm_zc_gpu_deinit(uvm_gpu_t *gpu)
+{
+    if (!gpu)
+        return;
+
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
+
+    if (gpu->zc_users != 0) {
+        UVM_ERR_PRINT("Zero-copy: GPU removed with %u va_space users still counted. "
+                      "A get without its put.\n",
+                      gpu->zc_users);
+        gpu->zc_users = 0;
+    }
+
+    zc_stop_thread(gpu);
+
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
+
+    // NULL dying: take everything, whoever it belonged to.
+    zc_drop_va_space_entries(gpu, NULL);
+
+    uvm_spin_lock(&gpu->used_lock);
+    gpu->active_blocks = 0;
+    uvm_spin_unlock(&gpu->used_lock);
+
+    uvm_spin_lock(&gpu->zc_lock);
+    gpu->num_spled = 0;
+    gpu->man_size = 0;
+    uvm_spin_unlock(&gpu->zc_lock);
+}
+
+// Age the working set.
+//
+// A block that is out of GPU memory, not host-pinned, and untouched for the
+// retention window has stopped being demand, so it leaves the working set.
+// Without this the estimate only grows and every workload eventually looks
+// oversubscribed. The window is 500 ms, theirs, hardcoded.
+#define UVM_ZC_WCSS_RETAIN_NS (500ULL * 1000ULL * 1000ULL)
+
+static void zc_age_working_set(uvm_parent_gpu_t *parent_gpu)
+{
+    uvm_gpu_t *gpu = zc_gpu(parent_gpu);
+    uvm_used_entry *entry, *next;
+    NvU64 now;
+
+    if (!gpu)
+        return;
+
+    now = NV_GETTIME();
+
+    // Under used_lock. The populate path appends to this list and the eviction
+    // path deletes from it, both without any Zero-copy lock, so an unlocked
+    // reap could free an entry another thread was standing on. Nothing in the
+    // loop sleeps: the test reads fields, and NV_KFREE is kfree.
+    uvm_spin_lock(&gpu->used_lock);
+    list_for_each_entry_safe(entry, next, &gpu->used_blocks, spln) {
+        if (!entry->is_in_gpu &&
+            entry->block &&
+            !entry->block->prefetch_info.is_spled &&
+            entry->block->prefetch_info.last_migration_time + UVM_ZC_WCSS_RETAIN_NS < now) {
+            list_del_init(&entry->spln);
+            entry->block->prefetch_info.used_entry = NULL;
+            NV_KFREE(entry, sizeof(uvm_used_entry));
+
+            if (gpu->active_blocks > 0)
+                gpu->active_blocks--;
+        }
+    }
+    uvm_spin_unlock(&gpu->used_lock);
+}
+
+// Turn working-set pressure into Zero-copy.
+//
+// Demand minus what is resident minus what is already pinned is the surplus
+// that cannot fit. That many blocks are taken off the candidate queue and given
+// a GPU-to-sysmem remote mapping, so the next access reads them across PCIe
+// instead of dragging them back and evicting something else.
+//
+// Three phases, and the split is what keeps the locking honest. Under zc_lock:
+// drain the inbox, size the surplus, detach that many candidates. With no
+// Zero-copy lock held: map each one, which needs mmap_lock, the va_space lock
+// and the block lock. Under zc_lock again: put the pinned ones on spled_blocks
+// and any that could not be mapped back on spl_blocks.
+//
+// man_size is recounted rather than tracked, which is theirs.
+static void zc_pin_from_pressure(uvm_parent_gpu_t *parent_gpu)
+{
+    uvm_gpu_t *gpu = zc_gpu(parent_gpu);
+    LIST_HEAD(candidates);
+    LIST_HEAD(pinned);
+    LIST_HEAD(returned);
+    uvm_pl_entry *entry, *next_entry;
+    struct list_head *cur;
+    NvU32 resident = 0;
+    NvU32 pinned_count = 0;
+    NvU32 to_pin;
+    NvU64 now;
+
+    if (!gpu)
+        return;
+
+    now = NV_GETTIME();
+
+    uvm_spin_lock(&gpu->pmm.list_lock);
+    list_for_each(cur, &gpu->pmm.root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED])
+        resident++;
+    uvm_spin_unlock(&gpu->pmm.list_lock);
+
+    uvm_spin_lock(&gpu->zc_lock);
+
+    zc_drain_pending(gpu);
+
+    list_for_each(cur, &gpu->spled_blocks)
+        pinned_count++;
+
+    gpu->man_size = resident;
+    gpu->num_spled = pinned_count;
+
+    to_pin = (gpu->active_blocks > resident + pinned_count) ?
+             (gpu->active_blocks - resident - pinned_count) : 0;
+
+    list_for_each_entry_safe(entry, next_entry, &gpu->spl_blocks, spln) {
+        if (to_pin == 0)
+            break;
+
+        list_move_tail(&entry->spln, &candidates);
+        to_pin--;
+    }
+
+    uvm_spin_unlock(&gpu->zc_lock);
+
+    list_for_each_entry_safe(entry, next_entry, &candidates, spln) {
+        uvm_va_block_t *block = NULL;
+        uvm_va_block_context_t *block_context;
+        struct mm_struct *block_mm;
+        uvm_va_space_t *entry_va_space = entry->va_space;
+        NvU64 pintime;
+        bool mapped = false;
+
+        block_mm = uvm_va_space_mm_retain_lock(entry_va_space);
+        uvm_va_space_down_read(entry_va_space);
+
+        // Checked before use: the range can have gone away while the block sat
+        // on this queue.
+        if (uvm_va_block_find(entry_va_space, entry->start, &block) == NV_OK && block) {
+            block_context = uvm_va_space_block_context(entry_va_space, block_mm);
+
+            // The Zero-copy mapping itself. On a CPU-resident block this builds
+            // a GPU-to-sysmem remote mapping over the whole 2 MB block with no
+            // migration.
+            if (uvm_va_block_set_accessed_by(block, block_context, gpu->id) == NV_OK) {
+                // 50 us per active block, floored at the parameter, times five
+                // for a repeat offender. Theirs, and it is NvU32 nanoseconds in
+                // their code, which wraps past about 4.3 s. Widened to NvU64
+                // here, which only removes the wrap.
+                pintime = (NvU64)uvm_dynzero_pintime * 500ULL * gpu->active_blocks;
+                if (pintime < (NvU64)uvm_dynzero_pintime * 1000000ULL)
+                    pintime = (NvU64)uvm_dynzero_pintime * 1000000ULL;
+
+                block->prefetch_info.thr_count++;
+                if (block->prefetch_info.thr_count > 1)
+                    pintime *= 5;
+
+                block->prefetch_info.last_migration_time = now;
+                block->prefetch_info.is_spled = 1;
+                entry->endtime = now + pintime;
+                mapped = true;
+            }
+        }
+
+        uvm_va_space_up_read(entry_va_space);
+        uvm_va_space_mm_release_unlock(entry_va_space, block_mm);
+
+        // The block is gone, so the entry has nothing left to name. Freed here
+        // rather than requeued. entry->va_space was cached above because this
+        // free is what makes reading it afterwards a use-after-free, which is
+        // the shape ARIADNE's walk has.
+        if (block)
+            list_move_tail(&entry->spln, mapped ? &pinned : &returned);
+        else {
+            list_del_init(&entry->spln);
+            NV_KFREE(entry, sizeof(uvm_pl_entry));
+        }
+    }
+
+    uvm_spin_lock(&gpu->zc_lock);
+
+    list_for_each_entry_safe(entry, next_entry, &pinned, spln) {
+        list_move_tail(&entry->spln, &gpu->spled_blocks);
+        gpu->num_spled++;
+    }
+
+    // Could not be mapped this time. Back on the candidate queue so a later
+    // batch can retry, rather than dropped, which would lose the candidate.
+    list_for_each_entry_safe(entry, next_entry, &returned, spln)
+        list_move_tail(&entry->spln, &gpu->spl_blocks);
+
+    uvm_spin_unlock(&gpu->zc_lock);
+
+    // Brought up lazily, so a GPU nobody is faulting on has no thread waking
+    // every uvm_dynzero_unpin_period. Under zc_lifetime_lock, which is the same
+    // lock uvm_zc_gpu_va_space_put stops the thread under, so a thread cannot
+    // be started just after the last user has gone and then live until GPU
+    // teardown. ARIADNE starts it unlocked and has that race.
+    uvm_mutex_lock(&gpu->zc_lifetime_lock);
+    if (!gpu->async_unpin && gpu->zc_users > 0) {
+        gpu->async_unpin = kthread_run(uvm_zc_unpin_period, gpu, "uvm_zc_unpin");
+        if (IS_ERR(gpu->async_unpin))
+            gpu->async_unpin = NULL;
+    }
+    uvm_mutex_unlock(&gpu->zc_lifetime_lock);
+}
+
 void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 {
     NvU32 num_replays = 0;
@@ -3667,6 +4183,12 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     NvU64 fold_start_ns_batch_total       = replayable_faults->stats.ns_batch_total;
 
     uvm_tracker_init(&batch_context->tracker);
+
+    // Zero-copy, ARIADNE's (HPCA'26), off by default in this build. Age the
+    // working set and bring the unpin thread up before any batch is serviced,
+    // so the pin decision at the end of the loop reads a current estimate.
+    if (uvm_dynzero_enable)
+        zc_age_working_set(parent_gpu);
 
     // Process all faults in the buffer
     while (1) {
@@ -3765,6 +4287,13 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
             break;
         }
+
+        // Zero-copy, at the end of the batch and before the replay, which is
+        // where their tree puts it: the surplus is computed from what this
+        // batch just made resident, and any block pinned here is mapped before
+        // the faults are replayed.
+        if (uvm_dynzero_enable)
+            zc_pin_from_pressure(parent_gpu);
 
         if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
             time_stamp = NV_GETTIME();

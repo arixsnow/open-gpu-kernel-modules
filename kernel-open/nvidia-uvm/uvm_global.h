@@ -32,6 +32,14 @@
 #include "uvm_gpu.h"
 #include "uvm_lock.h"
 
+// Dynamic Zero-copy, ARIADNE's mechanism (HPCA'26), carried as a placement
+// policy so servicing can be compared with placement held fixed. Default off.
+// See uvm_global.c for the full note and uvm_va_block_types.h for what is and
+// is not carried.
+extern unsigned uvm_dynzero_enable;
+extern unsigned uvm_dynzero_pintime;
+extern unsigned uvm_dynzero_unpin_period;
+
 // Global state of the uvm driver
 struct uvm_global_struct
 {

@@ -3021,6 +3021,50 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
 
     gpu_state->chunks[chunk_index] = chunk;
 
+    // Zero-copy working set, ARIADNE's (HPCA'26), off by default in this build.
+    // Count this block in the demand estimate the host-pin decision is sized
+    // from, in units of 2 MB blocks rather than bytes. A block has to be
+    // counted from the moment it first gets GPU backing, because the decision
+    // reads the surplus of demand over what is resident.
+    //
+    // is_thrashed records that the block has been migrated before, which is
+    // what later makes it a candidate rather than a straight eviction.
+    //
+    // Restricted to full 2 MB non-HMM blocks. Theirs counts whatever reaches
+    // here, relying on an invariant that only max-size blocks do. That does not
+    // hold on 610, where HMM and sub-chunk blocks share this path, and counting
+    // them would inflate the estimate with entries the eviction side never
+    // removes.
+    if (uvm_dynzero_enable &&
+        !uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
+        if (!block->prefetch_info.used_entry) {
+            uvm_used_entry *used_entry;
+
+            // Allocated before used_lock is taken, because NV_KMALLOC uses
+            // GFP_KERNEL and can sleep. The lock covers the list surgery and
+            // the counter only.
+            NV_KMALLOC(used_entry, sizeof(*used_entry));
+            if (used_entry) {
+                block->prefetch_info.is_thrashed = (block->prefetch_info.last_migration_time != 0);
+                used_entry->block = block;
+                used_entry->gpu = gpu;
+                used_entry->is_in_gpu = 1;
+                block->prefetch_info.used_entry = used_entry;
+
+                uvm_spin_lock(&gpu->used_lock);
+                list_add_tail(&used_entry->spln, &gpu->used_blocks);
+                gpu->active_blocks++;
+                uvm_spin_unlock(&gpu->used_lock);
+            }
+
+            // A failed allocation only costs accuracy in the estimate, so it is
+            // not worth failing the populate over.
+        }
+        else {
+            block->prefetch_info.used_entry->is_in_gpu = 1;
+        }
+    }
+
     return NV_OK;
 
 chunk_unmap:
@@ -9552,6 +9596,45 @@ static void block_kill(uvm_va_block_t *block)
 
     if (uvm_va_block_is_dead(block))
         return;
+
+    // Zero-copy working set. Take this block out of the estimate before it goes
+    // away.
+    //
+    // Nothing in ARIADNE's tree does this. An entry is only ever removed by the
+    // eviction path or by the reaper in the fault loop, and neither runs when
+    // an application simply frees the allocation, so the entry outlives the
+    // block it points at. That leaves a freed uvm_va_block_t reachable from
+    // gpu->used_blocks and leaves active_blocks charged for a block that no
+    // longer exists, so the pressure signal the whole policy reads from only
+    // ever grows.
+    //
+    // Under the owning GPU's used_lock, like every other mutation of that list.
+    // The else is unreachable, since the only site that creates a used_entry
+    // sets gpu at the same time; if it ever fires, the entry sits on a list
+    // that cannot be identified and so cannot be unlinked safely, so it is left
+    // linked and not freed. That leaks one small struct, which is a far cheaper
+    // failure than unlinking without the lock.
+    if (block->prefetch_info.used_entry) {
+        uvm_used_entry *used_entry = block->prefetch_info.used_entry;
+
+        if (used_entry->gpu) {
+            uvm_spin_lock(&used_entry->gpu->used_lock);
+            list_del_init(&used_entry->spln);
+            if (used_entry->gpu->active_blocks > 0)
+                used_entry->gpu->active_blocks--;
+            used_entry->block = NULL;
+            uvm_spin_unlock(&used_entry->gpu->used_lock);
+
+            block->prefetch_info.used_entry = NULL;
+            NV_KFREE(used_entry, sizeof(uvm_used_entry));
+        }
+        else {
+            UVM_ERR_PRINT("Zero-copy: used_entry for a dying block has no owning GPU, "
+                          "so it cannot be unlinked safely. Leaked deliberately.\n");
+            used_entry->block = NULL;
+            block->prefetch_info.used_entry = NULL;
+        }
+    }
 
     va_space = uvm_va_block_get_va_space(block);
     event_data.block_destroy.block = block;

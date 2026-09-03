@@ -49,6 +49,39 @@ static bool g_ops_registered = false;
 unsigned uvm_force_conf_computing = 0;
 module_param(uvm_force_conf_computing, uint, S_IRUGO);
 
+// ----------------------------------------------------------------------------
+// Dynamic Zero-copy, ARIADNE's mechanism (HPCA'26)
+// ----------------------------------------------------------------------------
+//
+// A PLACEMENT policy: instead of migrating a host-resident block into VRAM, it
+// builds a GPU-to-sysmem mapping so the GPU reads it over PCIe, and no eviction
+// or refault loop forms. It is theirs, and it is carried here only so that this
+// project's fault-SERVICING mechanism can be measured with placement held
+// fixed, including under the policy that produces their own headline numbers.
+// A competitor with a better placement policy must not be able to gain an
+// advantage in a servicing comparison, and holding placement equal on both
+// sides is the only way to prevent that.
+//
+// It is a control variable in the same sense as access-counter migration, it is
+// credited to them in the methodology, and it is never a contribution of this
+// work.
+//
+// DEFAULT 0, unlike their build where it is on. Every other arm of this driver
+// is bit-for-bit the experiment it was before this landed, and ours:0 against
+// stock still proves the binary is stock-equivalent with everything off.
+unsigned uvm_dynzero_enable = 0;
+module_param(uvm_dynzero_enable, uint, S_IRUGO);
+
+// Base host-pin duration in milliseconds. The effective pin time is 50 us per
+// active block, floored at this value, and multiplied by five for a block that
+// has been pinned before. Theirs, including the constant.
+unsigned uvm_dynzero_pintime = 100;
+module_param(uvm_dynzero_pintime, uint, S_IRUGO);
+
+// Sleep between unpin sweeps, milliseconds. Theirs.
+unsigned uvm_dynzero_unpin_period = 40;
+module_param(uvm_dynzero_unpin_period, uint, S_IRUGO);
+
 static NV_STATUS uvm_register_callbacks(void)
 {
     NV_STATUS status = NV_OK;
@@ -86,6 +119,7 @@ NV_STATUS uvm_global_init(void)
     // (addition) of the thread context associated with the UVM module entry
     // point that is calling this function.
     UVM_ASSERT(uvm_thread_context_global_initialized());
+
 
     uvm_mutex_init(&g_uvm_global.global_lock, UVM_LOCK_ORDER_GLOBAL);
     uvm_init_rwsem(&g_uvm_global.pm.lock, UVM_LOCK_ORDER_GLOBAL_PM);

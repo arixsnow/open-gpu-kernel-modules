@@ -144,6 +144,15 @@ static inline void nv_mmap_read_lock(struct mm_struct *mm)
 #endif
 }
 
+static inline int nv_mmap_read_trylock(struct mm_struct *mm)
+{
+#if defined(NV_MM_HAS_MMAP_LOCK)
+    return mmap_read_trylock(mm);
+#else
+    return down_read_trylock(&mm->mmap_sem);
+#endif
+}
+
 static inline void nv_mmap_read_unlock(struct mm_struct *mm)
 {
 #if defined(NV_MM_HAS_MMAP_LOCK)
