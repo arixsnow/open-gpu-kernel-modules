@@ -1155,6 +1155,21 @@ struct uvm_gpu_struct
     // cycle.
     uvm_spinlock_t zc_lock;
 
+    // How many walks currently hold entries detached from the queues above.
+    // Guarded by zc_lock.
+    //
+    // Detaching restores the queue lock's freedom but loses what the single
+    // mutex also gave: mutual exclusion between a walk and teardown. An entry
+    // sitting on a walk's local list is invisible to
+    // uvm_zc_gpu_va_space_put, so the walk can put it back AFTER teardown has
+    // scanned, leaving an entry that names a va_space which is then freed. The
+    // next walk dereferences it.
+    //
+    // So teardown waits for this to reach zero before scanning. The wait is
+    // bounded and cannot deadlock, because a walk holding entries never blocks
+    // on a va_space or mm lock: it trylocks and requeues.
+    NvU32 zc_walk_busy;
+
     // Guards zc_users and async_unpin, and only those. A mutex rather than a
     // spinlock because it is held across kthread_stop, which sleeps.
     //

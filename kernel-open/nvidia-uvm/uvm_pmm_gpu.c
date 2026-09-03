@@ -1234,17 +1234,27 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
             }
         }
         else {
+            uvm_used_entry *ue = va_block->prefetch_info.used_entry;
+
             // used_lock, for the same reason. The reaper in the fault loop
             // walks this list freeing entries as it goes, so an unlocked delete
             // here can unlink a node that walk is standing on.
+            //
+            // Both back-pointers are cleared before the entry is freed, and the
+            // one into the block is cleared while still under the lock. The
+            // va_block lock already serialises this against block_kill, so the
+            // window was not reachable, but ordering the teardown so that no
+            // pointer to freed memory is ever observable is cheaper than the
+            // argument for why it could not be.
             uvm_spin_lock(&gpu->used_lock);
-            list_del_init(&va_block->prefetch_info.used_entry->spln);
+            list_del_init(&ue->spln);
             if (gpu->active_blocks > 0)
                 gpu->active_blocks--;
+            ue->block = NULL;
             uvm_spin_unlock(&gpu->used_lock);
 
-            NV_KFREE(va_block->prefetch_info.used_entry, sizeof(uvm_used_entry));
             va_block->prefetch_info.used_entry = NULL;
+            NV_KFREE(ue, sizeof(uvm_used_entry));
         }
     }
 
