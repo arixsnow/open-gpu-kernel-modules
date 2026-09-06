@@ -85,7 +85,19 @@ module_param(uvm_perf_fault_batch_count, uint, S_IRUGO);
 static uvm_perf_fault_replay_policy_t uvm_perf_fault_replay_policy = UVM_PERF_FAULT_REPLAY_POLICY_DEFAULT;
 module_param(uvm_perf_fault_replay_policy, uint, S_IRUGO);
 
-#define UVM_PERF_FAULT_SERVICE_MAX_WORKERS 15
+// Ceiling on the pinned pool width. This is a policy cap, not a structural
+// one: the worker array is allocated from it at fault buffer init and the only
+// fixed-size object that depends on it is the load array in
+// fault_service_assign_spans(), which this macro sizes.
+//
+// Raised from 15 to 23 on measured evidence. Campaign 20260904_142811 shows the
+// marginal return per worker over the 4-to-15 range is flat at 0.41 s/worker
+// across every rung of the w7 oversubscription sweep rather than decaying, so
+// fifteen was cutting the curve off while it was still paying. Twenty-three
+// plus the dispatcher is 24 threads, which is the logical CPU count of the
+// evaluation box, so anything above this cannot be co-scheduled with the
+// workload and there is no reason to express it.
+#define UVM_PERF_FAULT_SERVICE_MAX_WORKERS 23
 
 // Number of additional worker threads (beyond the bottom-half dispatcher,
 // which services its own share inline) used to service a replayable fault
@@ -174,6 +186,47 @@ module_param(uvm_perf_fault_service_min_faults, uint, S_IRUGO);
 // 0 (the default) keeps the stock synchronous wait.
 static unsigned uvm_perf_fault_service_pipeline = 0;
 module_param(uvm_perf_fault_service_pipeline, uint, S_IRUGO);
+
+#define UVM_PERF_FAULT_SERVICE_MAX_INFLIGHT_DEFAULT 4
+
+// How many batches may have un-waited replays outstanding at once when
+// pipelining is on. Without it the pipeline is unbounded and inverts the
+// eviction policy.
+//
+// The deferred wait is the only backpressure in the servicing path. Dropping
+// it entirely lets uvm_perf_fault_max_batches_per_service (20) batches of
+// uvm_perf_fault_batch_count (256) faults populate before anything completes,
+// so up to 5120 faults' worth of va_blocks are resident, unpinned, and waiting
+// on a replay that has not run.
+//
+// Why that is worse than merely using memory. Eviction is LRU: unpin appends
+// to the tail of the allocated list (chunk_update_lists_locked) and
+// pick_root_chunk_to_evict takes the head. LRU is correct only while age since
+// population tracks age since use, which is what the stock barrier guarantees
+// by replaying each batch before populating the next. Pipelined, the pages
+// populated earliest are the ones the GPU will touch soonest, because it has
+// not replayed any of them yet, and those are precisely the pages at the head
+// of the list. Eviction therefore selects the page that will be needed first.
+// The GPU re-faults on it, which makes more batches, which evict more: the
+// loop feeds itself.
+//
+// Measured on GESUMMV at 150% (campaign 20260904_142811): stock moves the
+// 4619 MB working set exactly once, and pipelined servicing with fifteen
+// workers moves it 97.8 times, 474 GB, spending 80% of wall waiting for its
+// own copies. Pipelining with zero workers already costs 13.6x, so the worker
+// pool is not required to produce this and capping width cannot fix it.
+//
+// Bounding the depth bounds how far population may run ahead of consumption,
+// which is the distance over which LRU is inverted. 1 is the stock barrier,
+// the configuration measured at 1.00 passes. 0 restores the unbounded
+// behaviour and exists to measure what this is worth.
+//
+// A free-memory clamp was considered and rejected: under oversubscription PMA
+// reports approximately zero free bytes in steady state, so it would collapse
+// to 1 on every oversubscribed cell, including the ones where pipelining wins
+// (it is worth 14% on MVT and 22% on ATAX at 150%).
+static unsigned uvm_perf_fault_service_max_inflight = UVM_PERF_FAULT_SERVICE_MAX_INFLIGHT_DEFAULT;
+module_param(uvm_perf_fault_service_max_inflight, uint, S_IRUGO);
 
 #define UVM_PERF_FAULT_REPLAY_UPDATE_PUT_RATIO_DEFAULT 50
 
@@ -4251,7 +4304,13 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     NvU64 batch_start_time = 0;
     NvU64 time_stamp;
     NV_STATUS status = NV_OK;
-    bool replay_pending = false;
+
+    // Batches whose replay has been pushed but not waited on. Was a bool, which
+    // is the same thing with no upper bound; the count is what lets
+    // uvm_perf_fault_service_max_inflight cap how far population may run ahead
+    // of consumption. One wait drains the whole replay tracker, so any wait
+    // returns this to zero rather than decrementing it.
+    NvU32 pending_replays = 0;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
 
@@ -4286,6 +4345,22 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             break;
         }
 
+        // Admission control on how far population may run ahead of the GPU.
+        //
+        // Taken before the fetch rather than after the replay push so that the
+        // wait paces the next batch's population, which is the thing being
+        // bounded. At a limit of 1 this is exactly the stock barrier: push the
+        // replay, come back here, wait, then fetch.
+        if (uvm_perf_fault_service_max_inflight != 0 &&
+            pending_replays >= uvm_perf_fault_service_max_inflight) {
+            time_stamp = NV_GETTIME();
+            status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+            replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
+            pending_replays = 0;
+            if (status != NV_OK)
+                break;
+        }
+
         atomic_set(&batch_context->num_invalid_prefetch_faults, 0);
         atomic_set(&batch_context->num_duplicate_faults, 0);
         batch_context->num_replays                 = 0;
@@ -4306,8 +4381,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             // repopulated the buffer. Take the (deferred) wait now and fetch
             // once more, preserving the stock behavior of servicing replayed
             // faults within the same bottom-half pass.
-            if (replay_pending) {
-                replay_pending = false;
+            if (pending_replays > 0) {
+                pending_replays = 0;
                 time_stamp = NV_GETTIME();
                 status = uvm_tracker_wait(&replayable_faults->replay_tracker);
                 replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
@@ -4411,10 +4486,11 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             // orders it after every migration of this batch. Pipelined mode
             // defers this CPU-side wait and overlaps the next batch's
             // fetch/service with this batch's copies and replay; the wait
-            // moves to the empty-fetch path above. Serial mode keeps the
-            // stock synchronous wait.
+            // moves to the empty-fetch path above, or to the in-flight bound
+            // at the top of the loop, whichever comes first. Serial mode keeps
+            // the stock synchronous wait.
             if (uvm_perf_fault_service_pipeline != 0) {
-                replay_pending = true;
+                ++pending_replays;
             }
             else {
                 time_stamp = NV_GETTIME();
