@@ -246,6 +246,36 @@ module_param(uvm_perf_fault_service_max_inflight, uint, S_IRUGO);
 static unsigned uvm_perf_fault_replay_update_put_ratio = UVM_PERF_FAULT_REPLAY_UPDATE_PUT_RATIO_DEFAULT;
 module_param(uvm_perf_fault_replay_update_put_ratio, uint, S_IRUGO);
 
+// The same backlog discard, triggered on redundancy the duplicate counter
+// above cannot see. 0, the default, disables it and leaves the stock heuristic
+// exactly as it was.
+//
+// The duplicate ratio is an intra-batch measure: check_fault_entry_duplicate
+// compares a fault only against the previous entry of ordered_fault_cache, and
+// that cache is rebuilt every batch. Parallel servicing produces cross-batch
+// redundancy instead - the GPU raises a fault, we map the page, and the fault
+// is fetched in a later batch, by which point it needs no service. That fault
+// is exactly what UPDATE_PUT exists to discard, and it is invisible to the
+// trigger.
+//
+// Measured on w7 at 110% oversubscription with 21 workers, against the same
+// build with the pool switched off:
+//
+//                       faults/page   authorized   serviced   authorized %
+//     pool off              1.09         218,112   3,775,341      5.5%
+//     21 workers            1.95       3,071,204   3,647,176     45.7%
+//
+// Serviced faults are the same, so the pool creates no extra real work; the
+// entire excess is redundant. Meanwhile num_duplicate_faults reads 0.61% and
+// the discard never fires.
+//
+// Expressed as a percentage of the batch's fault instances, like the ratio
+// above. Left at 0 until measured: discarding is not free, since every entry
+// dropped is re-raised by the replay if it still matters, so an aggressive
+// setting can churn.
+static unsigned uvm_perf_fault_replay_update_put_authorized_ratio = 0;
+module_param(uvm_perf_fault_replay_update_put_authorized_ratio, uint, S_IRUGO);
+
 #define UVM_PERF_FAULT_MAX_BATCHES_PER_SERVICE_DEFAULT 20
 
 #define UVM_PERF_FAULT_MAX_THROTTLE_PER_SERVICE_DEFAULT 5
@@ -1805,6 +1835,11 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             // excess ratio tracks the wall gap. Nothing else in the statistics
             // distinguishes a fault that moved data from one that did not.
             uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized);
+
+            // Not gated on the stats level: this one drives the flush-mode
+            // decision below, not a report, so it has to be counted in every
+            // build. atomic because parallel workers reach it concurrently.
+            atomic_inc(&batch_context->num_authorized_faults);
             continue;
         }
 
@@ -4390,6 +4425,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         atomic_set(&batch_context->num_invalid_prefetch_faults, 0);
         atomic_set(&batch_context->num_duplicate_faults, 0);
+        atomic_set(&batch_context->num_authorized_faults, 0);
         batch_context->num_replays                 = 0;
         batch_context->fatal_va_space              = NULL;
         batch_context->fatal_gpu                   = NULL;
@@ -4499,6 +4535,16 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
             if ((NvU32)atomic_read(&batch_context->num_duplicate_faults) * 100 >
                 batch_context->num_cached_faults * replayable_faults->replay_update_put_ratio) {
+                flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT;
+            }
+
+            // Second, independent trigger on cross-batch redundancy, which the
+            // duplicate ratio above is structurally unable to observe. Off at
+            // 0, which is the default, so the stock decision is unchanged
+            // unless this is asked for.
+            if (uvm_perf_fault_replay_update_put_authorized_ratio != 0 &&
+                (NvU32)atomic_read(&batch_context->num_authorized_faults) * 100 >
+                batch_context->num_cached_faults * uvm_perf_fault_replay_update_put_authorized_ratio) {
                 flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT;
             }
 

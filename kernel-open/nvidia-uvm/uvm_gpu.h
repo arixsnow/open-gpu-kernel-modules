@@ -369,6 +369,23 @@ struct uvm_fault_service_batch_context_struct
 
     atomic_t num_duplicate_faults;
 
+    // Fault instances in this batch whose page already had the permission
+    // asked for, so they needed no service at all.
+    //
+    // This feeds the flush-mode decision and is therefore NOT gated on
+    // uvm_perf_fault_stats_level, unlike the g_uvm_lock_contention_stats
+    // counter of the same quantity. num_duplicate_faults cannot stand in for
+    // it: check_fault_entry_duplicate compares a fault only against the
+    // previous entry of ordered_fault_cache, which is rebuilt every batch, so
+    // it sees intra-batch repeats only. The redundancy parallel servicing
+    // produces is cross-batch - the GPU raised the fault before we mapped the
+    // page and it was fetched in a later batch - and is invisible there.
+    //
+    // Measured on w7 at 110% with 21 workers: 45.7% of faults are authorized
+    // while num_duplicate_faults reads 0.61%, so the UPDATE_PUT backlog
+    // discard never fires on precisely the case that needs it.
+    atomic_t num_authorized_faults;
+
     NvU32 num_replays;
 
     uvm_ats_fault_context_t ats_context;
