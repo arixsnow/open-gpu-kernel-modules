@@ -1604,6 +1604,36 @@ typedef struct
     atomic64_t ns_va_block_service;
     atomic64_t n_va_block_service;
 
+    // Fault disposition inside service_fault_batch_block_locked, counted per
+    // fault instance rather than per block.
+    //
+    // These exist to explain a gap that nothing else in this struct can see.
+    // On w7 at 110% oversubscription all three builds deliver the same pages
+    // (3.32-3.42M) but need very different fault counts to do it: stock 1.09
+    // faults per page, ARIADNE 1.51, ours 1.95. The excess is redundant work by
+    // definition - the pages arrive either way - and the ratio tracks the wall
+    // gap (1.29x excess for an 11.1% gap at 110%, 1.05x for 2.1% at 150%).
+    // faults_per_page is also invariant in worker count, so it is structural
+    // rather than a tuning artefact.
+    //
+    //   n_fault_authorized  the page already had the requested permission, so
+    //                       the fault needed no service at all. A fault the GPU
+    //                       raised on work we had already done.
+    //   n_fault_upgrade     the page was resident but lacked the permission, so
+    //                       this is a genuine read-to-write upgrade rather than
+    //                       redundant work.
+    //   n_fault_serviced    everything else: the fault caused real servicing.
+    //
+    // The three sum to the fault instances that reach the disposition test.
+    // Which one carries the excess names the cause: authorized means the GPU is
+    // retrying before our mappings are visible, which is a replay-ordering or
+    // TLB problem and therefore ours to fix; upgrade means we split a
+    // permission change stock does once; serviced means the extra faults are
+    // real demand and the mechanism genuinely costs more work.
+    atomic64_t n_fault_authorized;
+    atomic64_t n_fault_upgrade;
+    atomic64_t n_fault_serviced;
+
     // va_block->lock in uvm_va_block_cpu_fault: how long CPU faults stall
     // behind GPU servicing. Strictly the acquisition, not the servicing that
     // follows it, which is why the CPU fault path uses the probed variant of

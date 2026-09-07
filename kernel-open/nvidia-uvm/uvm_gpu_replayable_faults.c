@@ -187,44 +187,45 @@ module_param(uvm_perf_fault_service_min_faults, uint, S_IRUGO);
 static unsigned uvm_perf_fault_service_pipeline = 0;
 module_param(uvm_perf_fault_service_pipeline, uint, S_IRUGO);
 
-#define UVM_PERF_FAULT_SERVICE_MAX_INFLIGHT_DEFAULT 4
+#define UVM_PERF_FAULT_SERVICE_MAX_INFLIGHT_DEFAULT 1
 
 // How many batches may have un-waited replays outstanding at once when
-// pipelining is on. Without it the pipeline is unbounded and inverts the
-// eviction policy.
+// pipelining is on. 1, the default, is exactly the stock barrier: push the
+// replay, wait for it, then fetch the next batch. 0 removes the bound
+// entirely, which is the original pipelined behaviour and is kept only so the
+// cost of the bound can be measured.
 //
-// The deferred wait is the only backpressure in the servicing path. Dropping
-// it entirely lets uvm_perf_fault_max_batches_per_service (20) batches of
-// uvm_perf_fault_batch_count (256) faults populate before anything completes,
-// so up to 5120 faults' worth of va_blocks are resident, unpinned, and waiting
-// on a replay that has not run.
+// Why the default is 1. The deferred wait is the only backpressure in the
+// servicing path, and without it uvm_perf_fault_max_batches_per_service (20)
+// batches of uvm_perf_fault_batch_count (256) faults can populate before
+// anything completes. Under oversubscription those pages are evicted before
+// the replay that would have let the GPU consume them, the GPU re-faults, and
+// the loop feeds itself.
 //
-// Why that is worse than merely using memory. Eviction is LRU: unpin appends
-// to the tail of the allocated list (chunk_update_lists_locked) and
-// pick_root_chunk_to_evict takes the head. LRU is correct only while age since
-// population tracks age since use, which is what the stock barrier guarantees
-// by replaying each batch before populating the next. Pipelined, the pages
-// populated earliest are the ones the GPU will touch soonest, because it has
-// not replayed any of them yet, and those are precisely the pages at the head
-// of the list. Eviction therefore selects the page that will be needed first.
-// The GPU re-faults on it, which makes more batches, which evict more: the
-// loop feeds itself.
+// Measured, GESUMMV at 150% oversubscription, five repetitions per point,
+// fifteen workers, GPU pass time in seconds and median fault count
+// (campaign 20260907_153843):
 //
-// Measured on GESUMMV at 150% (campaign 20260904_142811): stock moves the
-// 4619 MB working set exactly once, and pipelined servicing with fifteen
-// workers moves it 97.8 times, 474 GB, spending 80% of wall waiting for its
-// own copies. Pipelining with zero workers already costs 13.6x, so the worker
-// pool is not required to produce this and capping width cannot fix it.
+//     bound      min    median      max        faults
+//     stock     0.812    1.745    21.163      276,826
+//     1         0.525    1.557     4.171      339,624
+//     4         3.264   30.808   205.675    7,123,225
+//     16       14.051   63.501   118.946   14,411,062
+//     unbounded 37.807  69.729   120.402   16,190,040
 //
-// Bounding the depth bounds how far population may run ahead of consumption,
-// which is the distance over which LRU is inverted. 1 is the stock barrier,
-// the configuration measured at 1.00 passes. 0 restores the unbounded
-// behaviour and exists to measure what this is worth.
+// Monotone in the bound, in both time and fault count, and at 1 the worker
+// pool is better than stock on this cell rather than merely safe.
 //
-// A free-memory clamp was considered and rejected: under oversubscription PMA
-// reports approximately zero free bytes in steady state, so it would collapse
-// to 1 on every oversubscribed cell, including the ones where pipelining wins
-// (it is worth 14% on MVT and 22% on ATAX at 150%).
+// The cost is small and is paid on a workload that cannot thrash. On the
+// fault_storm oversubscription sweep, which reproduces to 0.3% across four
+// campaigns, bound 1 costs 1.3% at 150% (37.27 s against 36.79 s) and 0.9% at
+// 110%. Its fault count barely moves with the bound (8.47M at 1 against 8.69M
+// unbounded), which is why the bound is nearly free there.
+//
+// Note that the dose-response only appears once the worker pool is running. An
+// earlier sweep of this same parameter with zero workers showed no ordering at
+// all, because a batch serviced by one thread populates too little for the
+// in-flight footprint to matter.
 static unsigned uvm_perf_fault_service_max_inflight = UVM_PERF_FAULT_SERVICE_MAX_INFLIGHT_DEFAULT;
 module_param(uvm_perf_fault_service_max_inflight, uint, S_IRUGO);
 
@@ -1796,8 +1797,34 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
         if (uvm_va_block_page_is_gpu_authorized(va_block,
                                                 page_index,
                                                 gpu->id,
-                                                uvm_fault_access_type_to_prot(service_access_type)))
+                                                uvm_fault_access_type_to_prot(service_access_type))) {
+            // A fault the GPU raised on work already done. Counted because the
+            // whole measured gap against ARIADNE is these: on w7 at 110% all
+            // three builds deliver the same pages but need 1.09 (stock), 1.51
+            // (ARIADNE) and 1.95 (ours) faults per page to do it, and the
+            // excess ratio tracks the wall gap. Nothing else in the statistics
+            // distinguishes a fault that moved data from one that did not.
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized);
             continue;
+        }
+
+        // Not authorized for what this fault wants. Separate the case where the
+        // page is already readable, which is an ordinary read-to-write upgrade
+        // and would be counted once by stock too, from the case where the GPU
+        // has no access at all, which is genuine new demand. Which of the three
+        // carries our excess is what names the cause: authorized means the GPU
+        // retried before our mappings were visible and the defect is ours,
+        // upgrade means we split a permission change stock does once, and
+        // serviced means the extra faults are real work the mechanism creates.
+        //
+        // Same predicate as above, so it is a second cheap region test under a
+        // lock already held, not a new kind of query.
+        if (uvm_lock_probes_enabled()) {
+            if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
+                atomic64_inc(&g_uvm_lock_contention_stats.n_fault_upgrade);
+            else
+                atomic64_inc(&g_uvm_lock_contention_stats.n_fault_serviced);
+        }
 
         thrashing_hint = uvm_perf_thrashing_get_hint(va_block,
                                                      block_context->block_context,
