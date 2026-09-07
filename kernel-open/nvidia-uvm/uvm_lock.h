@@ -1666,12 +1666,58 @@ typedef struct
     atomic64_t n_adapt_narrow;
 } uvm_lock_contention_stats_t;
 
+// The address base. Every call site names a field of THIS object, and every
+// field is reached through uvm_lock_stat_local() below, which re-bases the
+// pointer onto the calling CPU's private copy. This object is also the bank
+// that is used directly when the per-CPU allocation is unavailable, so a
+// failed allocation costs accuracy under contention and nothing else.
 extern uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
+
+// One private copy of the whole struct per CPU. Allocated in uvm_global_init
+// and freed in uvm_global_exit; NULL means "use the base object".
+//
+// Why this exists. Every probe is a read-modify-write on a field of one global
+// struct, so with a worker pool servicing a fault batch the same handful of
+// cache lines is written from every CPU in the pool. That is a serialising
+// cost the probes impose on the thing they measure, and it falls only on the
+// multi-threaded configurations: measured on w7 at 110% oversubscription, the
+// per-call cost of six unrelated phases fits solo + b * workers, including
+// ns_svc_populate, which bottoms out in the Linux page allocator and shares no
+// UVM lock with any of the others. A single-threaded arm keeps the lines in
+// one cache and pays none of it, so every cross-arm comparison taken at
+// stats_level 2 was biased against the pool.
+extern uvm_lock_contention_stats_t __percpu *g_uvm_lock_stats_pcpu;
 
 static inline bool uvm_lock_probes_enabled(void)
 {
     return uvm_perf_fault_stats_level >= 2;
 }
+
+// Re-base a field pointer from the base object onto this CPU's copy.
+//
+// raw_cpu_ptr rather than this_cpu_ptr because the probes run with preemption
+// enabled and the CPU identity is a sharding hint, not a correctness
+// requirement: the counters stay atomic64, so a thread migrating between the
+// pointer computation and the add lands the sample on another CPU's bank
+// instead of losing or corrupting it. uvm_lock_stat_sum() adds every bank, so
+// where a sample landed does not affect any reported total.
+static inline atomic64_t *uvm_lock_stat_local(atomic64_t *field)
+{
+    size_t off;
+
+    if (!g_uvm_lock_stats_pcpu)
+        return field;
+
+    off = (size_t)((char *)field - (char *)&g_uvm_lock_contention_stats);
+    UVM_ASSERT(off + sizeof(*field) <= sizeof(g_uvm_lock_contention_stats));
+
+    return (atomic64_t *)((char *)raw_cpu_ptr(g_uvm_lock_stats_pcpu) + off);
+}
+
+// Total of one counter across the base object and every CPU bank. This is the
+// only correct way to read these fields; a bare atomic64_read on the base sees
+// one bank out of many.
+NvU64 uvm_lock_stat_sum(atomic64_t *field);
 
 static inline NvU64 uvm_lock_probe_begin(void)
 {
@@ -1688,10 +1734,10 @@ static inline void uvm_lock_probe_end(NvU64 t0, atomic64_t *ns, atomic64_t *acqs
     if (!ns || !uvm_lock_probes_enabled())
         return;
 
-    atomic64_add(NV_GETTIME() - t0, ns);
+    atomic64_add(NV_GETTIME() - t0, uvm_lock_stat_local(ns));
 
     if (acqs)
-        atomic64_inc(acqs);
+        atomic64_inc(uvm_lock_stat_local(acqs));
 }
 
 // Count an event that has no duration, under the same level gate as the timed
@@ -1700,7 +1746,7 @@ static inline void uvm_lock_probe_end(NvU64 t0, atomic64_t *ns, atomic64_t *acqs
 static inline void uvm_lock_probe_count(atomic64_t *n)
 {
     if (uvm_lock_probes_enabled())
-        atomic64_inc(n);
+        atomic64_inc(uvm_lock_stat_local(n));
 }
 
 // Add a tally accumulated in a local, for loops where one atomic per iteration
@@ -1710,7 +1756,20 @@ static inline void uvm_lock_probe_count(atomic64_t *n)
 static inline void uvm_lock_probe_add(atomic64_t *n, NvU64 count)
 {
     if (count && uvm_lock_probes_enabled())
-        atomic64_add(count, n);
+        atomic64_add(count, uvm_lock_stat_local(n));
+}
+
+// Ungated counters, for the sites that must record regardless of the probe
+// level (the top-half trylock failure, the adaptive controller's own actions,
+// the fault disposition tallies). Same sharding as the gated probes.
+static inline void uvm_lock_stat_inc(atomic64_t *n)
+{
+    atomic64_inc(uvm_lock_stat_local(n));
+}
+
+static inline void uvm_lock_stat_add(atomic64_t *n, NvU64 count)
+{
+    atomic64_add(count, uvm_lock_stat_local(n));
 }
 
 #endif // __UVM_LOCK_H__

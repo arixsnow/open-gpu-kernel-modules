@@ -352,7 +352,7 @@ static NV_STATUS fault_service_pool_init(uvm_parent_gpu_t *parent_gpu)
     // on the first epoch. Invisible in a campaign, where each config reloads
     // the module, and wrong everywhere else.
     replayable_faults->service_pool.adapt_last_evictions =
-        (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_calls);
+        uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_calls);
     replayable_faults->service_pool.adapt_last_batches = replayable_faults->stats.num_batches;
     replayable_faults->service_pool.adapt_ewma_milli = 0;
     replayable_faults->service_pool.adapt_narrow_ticks = 0;
@@ -1856,9 +1856,9 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
         // lock already held, not a new kind of query.
         if (uvm_lock_probes_enabled()) {
             if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
-                atomic64_inc(&g_uvm_lock_contention_stats.n_fault_upgrade);
+                uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_fault_upgrade);
             else
-                atomic64_inc(&g_uvm_lock_contention_stats.n_fault_serviced);
+                uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_fault_serviced);
         }
 
         thrashing_hint = uvm_perf_thrashing_get_hint(va_block,
@@ -2859,25 +2859,12 @@ static NvU32 fault_service_build_spans(uvm_parent_gpu_t *parent_gpu,
 
         spans[num_spans].begin = i;
         spans[num_spans].end = i + 1;
-        spans[num_spans].owner = 0;
         num_spans++;
     }
 
     return num_spans;
 }
 
-// Sort comparator: spans by weight (fault count), heaviest first
-static int cmp_sort_span_by_weight_desc(const void *_a, const void *_b)
-{
-    const uvm_fault_service_span_t *a = (const uvm_fault_service_span_t *)_a;
-    const uvm_fault_service_span_t *b = (const uvm_fault_service_span_t *)_b;
-
-    return UVM_CMP_DEFAULT(b->end - b->begin, a->end - a->begin);
-}
-
-// LPT (longest processing time first) greedy assignment of spans to num_bins
-// worker slots: heaviest span goes to the least-loaded bin. Bounds the
-// makespan at 4/3 of optimal; span weights (fault counts) are exact.
 // One control decision. Called by the dispatcher at batch boundaries, which
 // the ISR service_lock serialises per GPU, so this needs no locking and
 // touches only dispatcher-private state plus one integer the dispatcher also
@@ -2913,7 +2900,7 @@ static void fault_service_adapt_tick(uvm_replayable_fault_buffer_t *replayable_f
     // genuine memory pressure and is exactly what should widen the pool, and it
     // is moot in practice: the 07-22 campaign measured n_pma_evict_cbs = 0 on
     // every cell. Worth knowing if that ever stops being true.
-    evictions = (NvU64)atomic64_read(&g_uvm_lock_contention_stats.n_evict_calls);
+    evictions = uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_calls);
     d_evict = evictions - replayable_faults->service_pool.adapt_last_evictions;
 
     replayable_faults->service_pool.adapt_last_batches = batches;
@@ -2986,70 +2973,167 @@ static void fault_service_adapt_tick(uvm_replayable_fault_buffer_t *replayable_f
     // sum/decisions is the mean width the workload actually ran at, and the
     // widen/narrow counts show how much the controller moved to get there.
     if (width > replayable_faults->service_pool.active_workers)
-        atomic64_inc(&g_uvm_lock_contention_stats.n_adapt_widen);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_adapt_widen);
     else if (width < replayable_faults->service_pool.active_workers)
-        atomic64_inc(&g_uvm_lock_contention_stats.n_adapt_narrow);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_adapt_narrow);
 
-    atomic64_inc(&g_uvm_lock_contention_stats.n_adapt_decisions);
-    atomic64_add(width, &g_uvm_lock_contention_stats.sum_adapt_width);
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_adapt_decisions);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_adapt_width, width);
 
     replayable_faults->service_pool.active_workers = width;
 }
 
-static void fault_service_assign_spans(uvm_fault_service_span_t *spans, NvU32 num_spans, NvU32 num_bins)
+// Cut the span array into num_bins CONTIGUOUS ranges of approximately equal
+// fault weight and hand one to each worker slot.
+//
+// Contiguous rather than a scatter, for three reasons that all follow from the
+// span array being in ascending (va_space, gpu, address) order:
+//
+//   - A worker's whole share is one service_fault_batch_range() call, so the
+//     va_space and mmap locks are taken once per worker per batch instead of
+//     once per va_block.
+//   - Servicing walks ascending addresses, which is the order
+//     preprocess_fault_batch() established and which the prefetch predictor
+//     and the copy path are both built around. The previous shape sorted this
+//     array by weight in place and destroyed that order.
+//   - A worker finds its work in O(1) instead of scanning every span looking
+//     for the ones it owns, which was O(spans * workers) per batch.
+//
+// The cut points are chosen to minimise the heaviest bin exactly, not
+// greedily. A span is one va_block and cannot be split, so the makespan can
+// never beat the heaviest single span, but between that floor and an even
+// share there is real room: measured against the optimum over 200,000 random
+// partitions, filling each bin to a running even-share target is 1.21x worse
+// on average and up to 1.97x worse when the weight distribution has a heavy
+// tail. On w7 the mean span is 1.08 faults and the two agree, but the
+// real-application workloads fault whole tensors into one va_block and are
+// exactly the heavy-tail case.
+//
+// Ranges are half-open indices into ordered_fault_cache, not into the span
+// array, because that is what service_fault_batch_range() takes. Slots that
+// get nothing are given an empty range rather than left stale.
+
+// Smallest per-bin weight that still admits a partition into at most num_bins
+// contiguous parts. Binary search on the capacity, with the feasibility test
+// being one first-fit walk: standard linear partitioning, O(num_spans * log
+// total_weight). At about 170 spans and 180 faults per batch that is roughly
+// 1,400 integer operations once per batch on the dispatcher, against the
+// 0.285 ms of CPU a batch costs it.
+static NvU32 fault_service_span_capacity(const uvm_fault_service_span_t *spans,
+                                         NvU32 num_spans,
+                                         NvU32 num_bins)
 {
-    NvU32 loads[UVM_PERF_FAULT_SERVICE_MAX_WORKERS + 1] = {0};
+    NvU32 lo = 0;
+    NvU32 hi = 0;
     NvU32 i;
 
-    UVM_ASSERT(num_bins <= ARRAY_SIZE(loads));
-
-    sort(spans, num_spans, sizeof(*spans), cmp_sort_span_by_weight_desc, NULL);
-
+    // The search range: no bin can hold less than the heaviest single span,
+    // and one bin holding everything is always feasible.
     for (i = 0; i < num_spans; i++) {
-        NvU32 bin;
-        NvU32 min_bin = 0;
+        NvU32 weight = spans[i].end - spans[i].begin;
 
-        for (bin = 1; bin < num_bins; bin++) {
-            if (loads[bin] < loads[min_bin])
-                min_bin = bin;
+        hi += weight;
+        if (weight > lo)
+            lo = weight;
+    }
+
+    while (lo < hi) {
+        NvU32 cap = lo + (hi - lo) / 2;
+        NvU32 bins = 1;
+        NvU32 load = 0;
+
+        for (i = 0; i < num_spans; i++) {
+            NvU32 weight = spans[i].end - spans[i].begin;
+
+            // cap >= lo >= the heaviest span, so a fresh bin always admits the
+            // span that overflowed the previous one and this cannot loop.
+            if (load + weight > cap) {
+                if (++bins > num_bins)
+                    break;
+                load = weight;
+            }
+            else {
+                load += weight;
+            }
         }
 
-        spans[i].owner = (NvU8)min_bin;
-        loads[min_bin] += spans[i].end - spans[i].begin;
+        if (bins <= num_bins)
+            hi = cap;
+        else
+            lo = cap + 1;
+    }
+
+    return lo;
+}
+
+static void fault_service_assign_spans(uvm_replayable_fault_buffer_t *replayable_faults,
+                                       NvU32 num_spans,
+                                       NvU32 num_bins)
+{
+    const uvm_fault_service_span_t *spans = replayable_faults->service_pool.spans;
+    uvm_fault_service_worker_t *workers = replayable_faults->service_pool.workers;
+    NvU32 cap;
+    NvU32 load = 0;
+    NvU32 bin = 0;
+    NvU32 i;
+
+    UVM_ASSERT(num_spans > 0);
+    UVM_ASSERT(num_bins > 0);
+    UVM_ASSERT(num_bins <= replayable_faults->service_pool.num_workers + 1);
+
+    cap = fault_service_span_capacity(spans, num_spans, num_bins);
+
+    // Emit the cuts with the same first-fit walk the capacity was chosen for,
+    // so the partition it produces is the one proved feasible above.
+    workers[0].range_begin = spans[0].begin;
+
+    for (i = 0; i < num_spans; i++) {
+        NvU32 weight = spans[i].end - spans[i].begin;
+
+        if (load > 0 && load + weight > cap) {
+            workers[bin].range_end = spans[i].begin;
+            bin++;
+            UVM_ASSERT(bin < num_bins);
+            workers[bin].range_begin = spans[i].begin;
+            load = 0;
+        }
+
+        load += weight;
+    }
+
+    workers[bin].range_end = spans[num_spans - 1].end;
+
+    // Fewer parts than bins, which happens whenever the heaviest span alone
+    // sets the capacity. Those slots are scheduled but return immediately.
+    for (bin++; bin < num_bins; bin++) {
+        workers[bin].range_begin = 0;
+        workers[bin].range_end = 0;
     }
 }
 
-// Service every span owned by this worker. Runs inline on the bottom-half
+// Service this worker's range of the batch. Runs inline on the bottom-half
 // thread for slot 0 and on a service_pool queue for the other slots. An error
-// stops this worker's remaining spans but not the other workers; the first
-// error wins at join.
+// is recorded for this worker but does not stop the others; the first error
+// wins at join.
+//
+// One call, not one per va_block: the range is contiguous and cut on span
+// boundaries, so service_fault_batch_range() groups it by va_block internally
+// exactly as the serial path groups the whole batch, and takes the va_space
+// and mmap locks once for the whole range.
 static void fault_service_worker_run(uvm_fault_service_worker_t *worker)
 {
-    uvm_parent_gpu_t *parent_gpu = worker->parent_gpu;
-    uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
-    NvU32 s;
+    if (worker->range_begin == worker->range_end)
+        return;
 
-    for (s = 0; s < replayable_faults->service_pool.num_spans; s++) {
-        uvm_fault_service_span_t *span = &replayable_faults->service_pool.spans[s];
-        NV_STATUS status;
-
-        if (span->owner != worker->slot)
-            continue;
-
-        status = service_fault_batch_range(parent_gpu,
-                                           FAULT_SERVICE_MODE_REGULAR,
-                                           worker->batch_context,
-                                           &worker->block_service_context,
-                                           &worker->ats_context,
-                                           &worker->ats_invalidate,
-                                           &worker->tracker,
-                                           span->begin,
-                                           span->end);
-        if (status != NV_OK) {
-            worker->status = status;
-            break;
-        }
-    }
+    worker->status = service_fault_batch_range(worker->parent_gpu,
+                                               FAULT_SERVICE_MODE_REGULAR,
+                                               worker->batch_context,
+                                               &worker->block_service_context,
+                                               &worker->ats_context,
+                                               &worker->ats_invalidate,
+                                               &worker->tracker,
+                                               worker->range_begin,
+                                               worker->range_end);
 }
 
 static void fault_service_worker_entry_internal(void *args)
@@ -3154,19 +3238,23 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
     replayable_faults->service_pool.num_spans = num_spans;
 
-    fault_service_assign_spans(replayable_faults->service_pool.spans, num_spans, num_workers + 1);
-
-    // Reset the WHOLE pool, not just the active part. A slot the controller
-    // has narrowed away gets no spans and is never scheduled, but resetting it
+    // Reset the WHOLE pool, not just the active part, and do it BEFORE the
+    // assignment so the assignment is what survives. A slot the controller has
+    // narrowed away gets no range and is never scheduled, but resetting it
     // anyway means a later widening finds it clean rather than carrying a
-    // status from whenever it last ran. The loop is a handful of stores.
+    // status, or a range, from whenever it last ran. The loop is a handful of
+    // stores.
     for (k = 0; k < pool_workers + 1; k++) {
         uvm_fault_service_worker_t *worker = &replayable_faults->service_pool.workers[k];
 
         worker->status = NV_OK;
         worker->batch_context = batch_context;
+        worker->range_begin = 0;
+        worker->range_end = 0;
         UVM_ASSERT(uvm_tracker_is_empty(&worker->tracker));
     }
+
+    fault_service_assign_spans(replayable_faults, num_spans, num_workers + 1);
 
     // outstanding must account for every worker before the first one is
     // queued: a worker can run to completion and decrement it while this loop

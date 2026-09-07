@@ -416,16 +416,20 @@ struct uvm_ats_fault_invalidate_struct
 
 // A span is a maximal run of ordered_fault_cache entries sharing the same
 // (va_space, gpu, UVM_VA_BLOCK_SIZE-aligned address) key: exactly the entries
-// one service_fault_batch_dispatch() call consumes. Partitioning by spans
-// guarantees a va_block (and every duplicate of a fault, since duplicates
-// share the address) is serviced by exactly one worker.
+// one service_fault_batch_dispatch() call consumes. Spans are the legal cut
+// points of the batch: cutting only on a span boundary guarantees a va_block
+// (and every duplicate of a fault, since duplicates share the address) is
+// serviced by exactly one worker.
+//
+// Spans are built in ordered_fault_cache order, which preprocess_fault_batch()
+// sorted by (va_space, gpu, address), and they are never reordered. Workers
+// receive contiguous RANGES of this array rather than a scatter of individual
+// spans, so servicing walks ascending addresses exactly as the serial path
+// does.
 typedef struct
 {
     NvU32 begin;
     NvU32 end;
-
-    // Worker slot this span is assigned to; 0 = the dispatcher
-    NvU8 owner;
 } uvm_fault_service_span_t;
 
 // Per-worker state for parallel servicing of a replayable fault batch. Slot 0
@@ -448,8 +452,23 @@ typedef struct uvm_fault_service_worker_struct
     uvm_tracker_t tracker;
 
     // This worker's slot: 0 for the dispatcher, 1..num_workers for queued
-    // workers. Spans with owner == slot belong to this worker.
+    // workers.
     NvU32 slot;
+
+    // The half-open range of ordered_fault_cache this worker services in the
+    // current batch, assigned by fault_service_assign_spans(). Both zero means
+    // nothing to do, which is the case for a slot the adaptive controller has
+    // narrowed away and for any slot left over when there are fewer spans than
+    // workers.
+    //
+    // One contiguous range rather than a set of spans, so a worker makes a
+    // single service_fault_batch_range() call per batch. That call takes the
+    // va_space and mmap locks once for the whole range; the previous
+    // one-call-per-span shape re-took them for every va_block, which measured
+    // as 4.30M va_space acquisitions against stock's 16.8K on w7 at 110%
+    // oversubscription.
+    NvU32 range_begin;
+    NvU32 range_end;
 
     // First failure observed by this worker; NV_OK otherwise
     NV_STATUS status;

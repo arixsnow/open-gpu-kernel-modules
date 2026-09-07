@@ -103,7 +103,7 @@ static unsigned schedule_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
         // IRQ context with interrupts_lock held and fires on every contended
         // interrupt, and a failed trylock has no wait to measure anyway.
         if (uvm_lock_probes_enabled())
-            atomic64_inc(&g_uvm_lock_contention_stats.n_top_half_trylock_fail);
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_top_half_trylock_fail);
 
         return 0;
     }
