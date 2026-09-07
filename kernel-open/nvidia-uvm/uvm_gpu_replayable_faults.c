@@ -1535,6 +1535,13 @@ static void mark_fault_invalid_prefetch(uvm_fault_service_batch_context_t *batch
     atomic_add(fault_entry->num_instances, &batch_context->num_invalid_prefetch_faults);
 }
 
+// The batch-wide flag is a plain store under parallel servicing, unlike the
+// atomics and the fatal_lock that guard the other shared batch_context fields.
+// That is deliberate rather than an omission. Two workers can reach this at
+// once, but both store the same value, and the dispatcher does not read the
+// flag until after the join, whose atomic_dec_and_test and smp_rmb order every
+// worker's stores ahead of it. An atomic here would add a contended write to
+// the service path and change nothing that is observable.
 static void mark_fault_throttled(uvm_fault_service_batch_context_t *batch_context,
                                  uvm_fault_buffer_entry_t *fault_entry)
 {
@@ -2744,6 +2751,12 @@ static NV_STATUS service_fault_batch_range(uvm_parent_gpu_t *parent_gpu,
             ++i;
             fault_batch_publish_fatal_va_space(batch_context, va_space, current_entry->gpu);
 
+            // Same reasoning as mark_fault_throttled: a plain store of a fixed
+            // value that only the dispatcher reads, and only after the join.
+            // Two workers can share a uTLB, so they can both land here, and
+            // both write true. num_pending_faults is set during the fetch and
+            // is not modified by any worker, so reading it here is a read of
+            // dispatcher-written state.
             utlb->has_fatal_faults = true;
             UVM_ASSERT(utlb->num_pending_faults > 0);
             continue;
@@ -3235,8 +3248,6 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                                          0,
                                          batch_context->num_coalesced_faults);
     }
-
-    replayable_faults->service_pool.num_spans = num_spans;
 
     // Reset the WHOLE pool, not just the active part, and do it BEFORE the
     // assignment so the assignment is what survives. A slot the controller has

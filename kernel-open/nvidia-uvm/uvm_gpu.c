@@ -2383,18 +2383,9 @@ NV_STATUS uvm_gpu_init(void)
 
     uvm_param_conf();
 
-    // Not fatal if it fails. Every probe falls back to the base object, which
-    // is the behaviour this driver had before the banks existed, so the only
-    // loss is measurement fidelity under a worker pool.
-    g_uvm_lock_stats_pcpu = alloc_percpu(uvm_lock_contention_stats_t);
-    if (!g_uvm_lock_stats_pcpu)
-        UVM_INFO_PRINT("alloc_percpu for the lock probe banks failed, falling back to one shared bank\n");
-
     status = uvm_hal_init_table();
     if (status != NV_OK) {
         UVM_ERR_PRINT("uvm_hal_init_table() failed: %s\n", nvstatusToString(status));
-        free_percpu(g_uvm_lock_stats_pcpu);
-        g_uvm_lock_stats_pcpu = NULL;
         return status;
     }
 
@@ -2410,17 +2401,38 @@ void uvm_gpu_exit(void)
 
     // CPU should never be in the retained GPUs mask
     UVM_ASSERT(!uvm_processor_mask_test(&g_uvm_global.retained_gpus, UVM_ID_CPU));
+}
 
-    // Every GPU is gone, so nothing can be servicing faults and no probe can
-    // be in flight. Clearing the pointer first means a late probe from any
-    // path this assertion does not cover degrades to the base object rather
-    // than touching freed memory.
-    if (g_uvm_lock_stats_pcpu) {
-        uvm_lock_contention_stats_t __percpu *banks = g_uvm_lock_stats_pcpu;
+// The probe banks are bracketed around the cpu/lock_stats procfs node rather
+// than around the GPUs, because the node is what reads them: it is created by
+// uvm_procfs_init() and removed by uvm_procfs_exit(), so the banks must exist
+// before the first and survive past the second. Allocating them with the GPUs
+// instead left a window at each end where a read of the node returned the base
+// bank alone, which is very nearly zero, and reported it as the truth.
+//
+// Not fatal if the allocation fails. Every probe falls back to the base object,
+// which is what this driver did before the banks existed, so the cost is
+// measurement fidelity under a worker pool and nothing else.
+void uvm_lock_stats_init(void)
+{
+    UVM_ASSERT(!g_uvm_lock_stats_pcpu);
 
-        g_uvm_lock_stats_pcpu = NULL;
-        free_percpu(banks);
-    }
+    g_uvm_lock_stats_pcpu = alloc_percpu(uvm_lock_contention_stats_t);
+    if (!g_uvm_lock_stats_pcpu)
+        UVM_INFO_PRINT("alloc_percpu for the lock probe banks failed, falling back to one shared bank\n");
+}
+
+void uvm_lock_stats_exit(void)
+{
+    uvm_lock_contention_stats_t __percpu *banks = g_uvm_lock_stats_pcpu;
+
+    // Clear the pointer before freeing, so a probe that somehow still runs
+    // degrades to the base object rather than writing through freed memory.
+    // Nothing should: every GPU is gone by here, so no fault service thread
+    // exists, and the procfs node that reads the banks was removed by
+    // uvm_procfs_exit() before this call.
+    g_uvm_lock_stats_pcpu = NULL;
+    free_percpu(banks);
 }
 
 NV_STATUS uvm_gpu_init_va_space(uvm_va_space_t *va_space)

@@ -142,6 +142,10 @@ NV_STATUS uvm_global_init(void)
         goto error;
     }
 
+    // Before uvm_procfs_init, and torn down after uvm_procfs_exit: the
+    // cpu/lock_stats node reads these banks, so they have to bracket it.
+    uvm_lock_stats_init();
+
     status = uvm_procfs_init();
     if (status != NV_OK) {
         UVM_ERR_PRINT("uvm_procfs_init() failed: %s\n", nvstatusToString(status));
@@ -291,6 +295,9 @@ void uvm_global_exit(void)
         uvm_rm_locked_call_void(nvUvmInterfaceSessionDestroy(g_uvm_global.rm_session_handle));
 
     uvm_procfs_exit();
+
+    // After uvm_procfs_exit, so the node that reads the banks is gone first.
+    uvm_lock_stats_exit();
 
     nv_kthread_q_stop(&g_uvm_global.global_q);
 

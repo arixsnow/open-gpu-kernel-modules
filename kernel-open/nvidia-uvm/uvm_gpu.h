@@ -641,9 +641,6 @@ typedef struct
             // while they run
             uvm_fault_service_span_t *spans;
 
-            // Number of valid entries in spans for the current batch
-            NvU32 num_spans;
-
             // Worker items not yet finished in the current dispatch
             atomic_t outstanding;
 

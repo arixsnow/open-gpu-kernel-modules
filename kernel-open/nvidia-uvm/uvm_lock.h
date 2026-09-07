@@ -1673,8 +1673,10 @@ typedef struct
 // failed allocation costs accuracy under contention and nothing else.
 extern uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
 
-// One private copy of the whole struct per CPU. Allocated in uvm_global_init
-// and freed in uvm_global_exit; NULL means "use the base object".
+// One private copy of the whole struct per CPU. Allocated by
+// uvm_lock_stats_init() just before the cpu/lock_stats procfs node is created
+// and freed by uvm_lock_stats_exit() just after it is removed, so the banks
+// always outlive the only reader. NULL means "use the base object".
 //
 // Why this exists. Every probe is a read-modify-write on a field of one global
 // struct, so with a worker pool servicing a fault batch the same handful of
@@ -1718,6 +1720,12 @@ static inline atomic64_t *uvm_lock_stat_local(atomic64_t *field)
 // only correct way to read these fields; a bare atomic64_read on the base sees
 // one bank out of many.
 NvU64 uvm_lock_stat_sum(atomic64_t *field);
+
+// Bank lifetime. Called from uvm_global_init/uvm_global_exit, bracketing
+// uvm_procfs_init/uvm_procfs_exit. Both are safe to call when the allocation
+// failed or never happened.
+void uvm_lock_stats_init(void);
+void uvm_lock_stats_exit(void);
 
 static inline NvU64 uvm_lock_probe_begin(void)
 {
