@@ -2815,7 +2815,11 @@ static NV_STATUS service_fault_batch_range(uvm_parent_gpu_t *parent_gpu,
         // stops at the end of a va_block, so this holds for a span as it does
         // for the whole batch. If it ever fires under the worker pool, two
         // workers are servicing the same faults.
-        UVM_ASSERT(i <= outer_index);
+        //
+        // RELEASE, because that is the case it exists to catch and the
+        // campaign build is a release build, where a plain UVM_ASSERT is not
+        // in the binary at all.
+        UVM_ASSERT_RELEASE(i <= outer_index);
 
         // Don't issue replays in cancel mode
         if (replay_per_va_block && !batch_context->fatal_va_space) {
@@ -3106,7 +3110,17 @@ static void fault_service_assign_spans(uvm_replayable_fault_buffer_t *replayable
         if (load > 0 && load + weight > cap) {
             workers[bin].range_end = spans[i].begin;
             bin++;
-            UVM_ASSERT(bin < num_bins);
+
+            // RELEASE, not debug. The campaign build is a release build, so a
+            // plain UVM_ASSERT here is absent from the binary that actually
+            // runs, and this one guards a write into the workers array. The
+            // capacity search proves it cannot fire, and the partition is
+            // fuzzed over 500,000 random inputs, but a silent overrun here
+            // would corrupt an adjacent worker's state and surface as a
+            // performance anomaly rather than as an error. One predictable
+            // integer compare per span.
+            UVM_ASSERT_RELEASE(bin < num_bins);
+
             workers[bin].range_begin = spans[i].begin;
             load = 0;
         }
@@ -3122,6 +3136,36 @@ static void fault_service_assign_spans(uvm_replayable_fault_buffer_t *replayable
         workers[bin].range_begin = 0;
         workers[bin].range_end = 0;
     }
+}
+
+// Check the partition the workers are about to consume: the non-empty ranges
+// must tile [0, outer) with no gap and no overlap.
+//
+// RELEASE, because the campaign build is a release build and this is the
+// invariant whose violation is invisible. A gap means faults that no worker
+// services, and the replay simply raises them again, so it reads as a fault
+// count anomaly. An overlap means two workers on one va_block, which the block
+// lock makes safe but which does the work twice. Neither reports an error.
+// At most num_workers + 1 comparisons per batch, against the 0.285 ms of CPU a
+// batch costs the dispatcher.
+static void fault_service_check_partition(const uvm_fault_service_worker_t *workers,
+                                          NvU32 num_bins,
+                                          NvU32 outer)
+{
+    NvU32 covered = 0;
+    NvU32 bin;
+
+    for (bin = 0; bin < num_bins; bin++) {
+        if (workers[bin].range_begin == workers[bin].range_end)
+            continue;
+
+        UVM_ASSERT_RELEASE(workers[bin].range_begin == covered);
+        UVM_ASSERT_RELEASE(workers[bin].range_end > workers[bin].range_begin);
+
+        covered = workers[bin].range_end;
+    }
+
+    UVM_ASSERT_RELEASE(covered == outer);
 }
 
 // Service this worker's range of the batch. Runs inline on the bottom-half
@@ -3266,6 +3310,10 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     }
 
     fault_service_assign_spans(replayable_faults, num_spans, num_workers + 1);
+
+    fault_service_check_partition(replayable_faults->service_pool.workers,
+                                  num_workers + 1,
+                                  batch_context->num_coalesced_faults);
 
     // outstanding must account for every worker before the first one is
     // queued: a worker can run to completion and decrement it while this loop
