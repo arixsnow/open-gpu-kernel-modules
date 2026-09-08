@@ -80,10 +80,33 @@ static char *uvm_channel_gpput_loc = UVM_CHANNEL_GPPUT_LOC_DEFAULT;
 
 static char *uvm_channel_pushbuffer_loc = UVM_CHANNEL_PUSHBUFFER_LOC_DEFAULT;
 
+// Channels per CE pool. NVIDIA ships 2 and leaves a TODO on it (Bug 1764958,
+// "Tweak this number after benchmarking real workloads"), which is what this
+// exposes. The default is unchanged, so the shipped geometry is the shipped
+// geometry unless a run asks otherwise.
+//
+// Why it is worth sweeping. Campaign 20260908_015942 showed the fault service
+// loop is GPU-bound: cutting the CPU-side service phase by 0.29 s moved wall
+// by 0.035 s because the saving went into tracker wait. Against ARIADNE we
+// then issue the same 7.02M pushes for the same pages at the same batch count
+// and take 8.4% longer per round trip. One explanation left standing is the
+// shape of the issue stream. A worker pool spreads fault-in copies across
+// every channel of the CPU_TO_GPU pool, so the copy engine sees several
+// interleaved streams from distant addresses, where a single-threaded driver
+// hands it one ascending run. This number is how many streams there are.
+#define UVM_CHANNEL_CE_NUM_CHANNELS_DEFAULT 2
+
+static unsigned uvm_channel_ce_num_channels = UVM_CHANNEL_CE_NUM_CHANNELS_DEFAULT;
+
 module_param(uvm_channel_num_gpfifo_entries, uint, S_IRUGO);
+module_param(uvm_channel_ce_num_channels, uint, S_IRUGO);
 module_param(uvm_channel_gpfifo_loc, charp, S_IRUGO);
 module_param(uvm_channel_gpput_loc, charp, S_IRUGO);
 module_param(uvm_channel_pushbuffer_loc, charp, S_IRUGO);
+MODULE_PARM_DESC(uvm_channel_ce_num_channels,
+                 "Channels per copy-engine pool [default 2]. Sets how many concurrent "
+                 "issue streams a copy engine sees. Clamped to [1, "
+                 __stringify(UVM_CHANNEL_MAX_NUM_CHANNELS_PER_POOL) "].");
 
 static NV_STATUS manager_create_procfs_dirs(uvm_channel_manager_t *manager);
 static NV_STATUS manager_create_procfs(uvm_channel_manager_t *manager);
@@ -2602,7 +2625,25 @@ static unsigned channel_manager_num_channels(uvm_channel_manager_t *manager, uvm
     // In the common case, create two channels per pool.
     //
     // TODO: Bug 1764958: Tweak this number after benchmarking real workloads.
-    const unsigned channel_pool_type_ce_num_channels = 2;
+    //
+    // Clamped here rather than in the parameter itself, so the value read back
+    // from sysfs is always the value that was requested. A harness that
+    // verifies its own module parameters would otherwise see 16 where it asked
+    // for 17 and report the load as failed. Zero would create a pool with no
+    // channels and every reservation would spin forever.
+    const unsigned channel_pool_type_ce_num_channels =
+        clamp(uvm_channel_ce_num_channels, 1u, (unsigned)UVM_CHANNEL_MAX_NUM_CHANNELS_PER_POOL);
+
+    // Say so when the request is not what is used, which is what
+    // uvm_perf_fault_batch_count and uvm_perf_fault_service_num_workers both
+    // do for the same situation. A silently ignored geometry parameter would
+    // mislabel every measurement taken from that load.
+    if (channel_pool_type_ce_num_channels != uvm_channel_ce_num_channels) {
+        UVM_INFO_PRINT("Invalid uvm_channel_ce_num_channels value: %u. Valid range [1:%u] Using %u instead\n",
+                       uvm_channel_ce_num_channels,
+                       (unsigned)UVM_CHANNEL_MAX_NUM_CHANNELS_PER_POOL,
+                       channel_pool_type_ce_num_channels);
+    }
 
     UVM_ASSERT(uvm_pool_type_is_valid(pool_type));
 
