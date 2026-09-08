@@ -1804,15 +1804,53 @@ static int uvm_gpu_unpin_period(void *data)
                 if (uvm_va_block_find(entry->va_space, entry->start, &block) == NV_OK && block) {
                     block_context = uvm_va_space_block_context(entry->va_space, mm);
 
-                    block->prefetch_info.is_spled = 0;
-
+                    // The entry names its block by ADDRESS, and nothing removes
+                    // entries when a block dies: block_kill unlinks the WCSS
+                    // used_entry (uvm_va_block.c) but leaves spled_blocks
+                    // alone, and the only other removals are this sweep and the
+                    // teardown drain. So the block found here need not be the
+                    // block this entry pinned. Free an allocation, allocate
+                    // again at the same address, and the lookup returns a live
+                    // block that was never pinned.
+                    //
+                    // Unmapping that block is wrong on its own terms, and it
+                    // crashes. A block that was never pinned has no reason to
+                    // carry the page tables this unmap path derives, and
+                    // campaign 20260908_213729 oopsed at
+                    // block_gpu_pte_clear_4k+0x125 with a NULL
+                    // page_table_range_4k.table, reached through
+                    // block_gpu_pte_big_split_write_4k and block_unmap_gpu.
+                    // Release builds compile out the UVM_ASSERTs that guard
+                    // that field, and ARIADNE has no develop build, so nothing
+                    // upstream of the fault catches it.
+                    //
+                    // is_spled is set only on the block an entry pinned, so it
+                    // identifies the right one. A stale entry finds the flag
+                    // clear, skips the unmap, and is still freed below, so it
+                    // does not accumulate.
+                    //
+                    // Tested and cleared under the block lock. Their code, and
+                    // the port until now, cleared it outside.
+                    //
+                    // Not fixed in block_kill the way used_entry was: an entry
+                    // can still be on the gpu->spl_pending llist when its block
+                    // dies, llist has no removal, and the entry carries neither
+                    // a gpu nor a block back-pointer to unlink through. Adding
+                    // both to reach a case this test already covers is more
+                    // surgery on their allocator than the crash warrants.
                     uvm_mutex_lock(&block->lock);
-                    uvm_va_block_unmap(block,
-                                       block_context,
-                                       gpu->id,
-                                       uvm_va_block_region_from_block(block),
-                                       NULL,
-                                       &local_tracker);
+
+                    if (block->prefetch_info.is_spled) {
+                        block->prefetch_info.is_spled = 0;
+
+                        uvm_va_block_unmap(block,
+                                           block_context,
+                                           gpu->id,
+                                           uvm_va_block_region_from_block(block),
+                                           NULL,
+                                           &local_tracker);
+                    }
+
                     uvm_mutex_unlock(&block->lock);
 
                     uvm_tracker_wait_deinit(&local_tracker);
