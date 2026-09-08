@@ -1566,6 +1566,40 @@ typedef struct
     atomic64_t ns_svc_copy;
     atomic64_t n_svc_mkres;
 
+    // How many pages each servicing COPY EPISODE actually migrates, where an
+    // episode is one call to block_copy_resident_pages.
+    //
+    // Campaign 20260908_151710 split the gap against this build at w7@110 into
+    // two factors: cost per make_resident is nearly equal (9.94 us against
+    // 9.78) and the observability build simply performs 8.3% more of them for
+    // the same pages, 0.96 pages each against 1.04 here. A mean below 1 is
+    // consistent with two situations that call for opposite responses - mostly
+    // 1-page calls plus some that move nothing, which is removable overhead,
+    // or genuine coalescing of 2+ pages - and the mean cannot tell them apart.
+    //
+    // EPISODES, not make_residents, and on THIS branch the distinction is the
+    // whole reason the counter sits where it does. Servicing here is split in
+    // two: uvm_va_block_make_resident_copy does the populate half, and
+    // uvm_va_block_service_copy_finish does the copy on the copy kthread.
+    // Both reach block_copy_resident_pages, and only the first increments
+    // n_svc_mkres, so instrumenting the caller would have recorded this
+    // build's pages as arriving nowhere. These counters pair with ns_svc_copy,
+    // which is accumulated at exactly the same granularity for the same
+    // reason.
+    //
+    // sum_svc_copy_pages is a CHECK, not decoration. It must equal
+    // g_uvm_fault_pipeline_stats.num_pages_in, fed independently by the
+    // migration event callback in uvm_gpu.c. Both sides are gated on
+    // UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT exactly so the identity is over
+    // the same set. If it fails, the histogram is counting something other
+    // than migration and nothing derived from it stands.
+    atomic64_t n_svc_copy_pages_0;
+    atomic64_t n_svc_copy_pages_1;
+    atomic64_t n_svc_copy_pages_2_3;
+    atomic64_t n_svc_copy_pages_4_15;
+    atomic64_t n_svc_copy_pages_16up;
+    atomic64_t sum_svc_copy_pages;
+
     // How each eviction attempt ended. pick_and_evict_root_chunk returns
     // NV_ERR_NO_MEMORY when no candidate exists and
     // NV_ERR_MORE_PROCESSING_REQUIRED when chunks are in flight elsewhere;
