@@ -1566,6 +1566,51 @@ typedef struct
     atomic64_t ns_svc_copy;
     atomic64_t n_svc_mkres;
 
+    // How many pages each servicing COPY EPISODE actually migrates, where an
+    // episode is one call to block_copy_resident_pages.
+    //
+    // Why a distribution and not the mean we already have. Campaign
+    // 20260908_151710 split the ARIADNE gap at w7@110 into two factors: cost
+    // per make_resident is nearly equal (9.94 us against 9.78, +1.6%) and we
+    // simply perform 8.3% more of them for the same 3.38M pages, because ours
+    // move 0.96 pages each against their 1.04. A mean below 1 is consistent
+    // with two situations that call for opposite responses, and the mean
+    // cannot tell them apart:
+    //
+    //   mostly 1-page calls plus some that move NOTHING - a block lock, a VA
+    //   space lock, an unmap and a populate for zero pages, which is pure
+    //   overhead and can simply be skipped;
+    //
+    //   or they coalesce 2+ pages where we never do, which is a granularity
+    //   difference and lives in how the page mask is built.
+    //
+    // Read from make_resident.pages_migrated, which block_copy_resident_pages
+    // zeroes on entry, so it holds that call and nothing prior.
+    //
+    // EPISODES, not make_residents, and the distinction is load-bearing. The
+    // ARIADNE branch splits servicing in two: make_resident_copy does the
+    // populate half, and uvm_va_block_service_copy_finish does the copy on
+    // their kthread. Both reach block_copy_resident_pages, and only the first
+    // increments n_svc_mkres, so episodes and make_residents are 1:1 on stock
+    // and on ours but need not be on theirs. These counters pair with
+    // ns_svc_copy, which is accumulated at exactly the same granularity.
+    //
+    // sum_svc_copy_pages is a CHECK, not decoration. It must equal
+    // g_uvm_fault_pipeline_stats.num_pages_in, which is fed independently by
+    // the migration event callback in uvm_gpu.c. Both sides are gated on
+    // UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT exactly, so the identity is
+    // over the same set; gating the histogram on "anything but eviction"
+    // instead would admit non-replayable faults, access counters, CPU faults
+    // and user migrations, and the check would fail for a reason unrelated to
+    // the histogram. If the identity does fail, the histogram is counting
+    // something other than migration and nothing derived from it stands.
+    atomic64_t n_svc_copy_pages_0;
+    atomic64_t n_svc_copy_pages_1;
+    atomic64_t n_svc_copy_pages_2_3;
+    atomic64_t n_svc_copy_pages_4_15;
+    atomic64_t n_svc_copy_pages_16up;
+    atomic64_t sum_svc_copy_pages;
+
     // How each eviction attempt ended. pick_and_evict_root_chunk returns
     // NV_ERR_NO_MEMORY when no candidate exists and
     // NV_ERR_MORE_PROCESSING_REQUIRED when chunks are in flight elsewhere;
@@ -1694,6 +1739,15 @@ typedef struct
     // interval itself stays honest at any bound, because uvm_tracker_wait on
     // the replay tracker drains everything outstanding, so the GPU really is
     // quiet when a window opens.
+    //
+    // Expect gpu_idle_windows_per_batch WELL under 1, and do not read that as
+    // a fault. The last window of every bottom-half pass is cancelled rather
+    // than closed, so the ratio is about (N-1)/N for a pass of N batches, and
+    // N tracks the fault arrival rate. Measured on 20260908_151710: 0.233 for
+    // the serial control at 110% (N about 1.3), 0.737 at 21 workers (N about
+    // 3.8), 0.91 at 150% (N about 11). Cancelling is the correct behaviour and
+    // not a lost sample: that window would otherwise span the gap between
+    // passes, where the GPU is running the application rather than idling.
     //
     // Time the bottom half spends descheduled inside a window counts as idle,
     // and that is correct rather than noise: nothing is queued for the GPU

@@ -4795,6 +4795,49 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
     UVM_ASSERT(pages_copied == pages_copied_to_cpu);
 
 out:
+    // How many pages this copy episode actually moved. See the histogram
+    // comment in uvm_lock.h for why the mean is not enough to answer the
+    // question it exists for.
+    //
+    // HERE and not in uvm_va_block_make_resident_copy, which is the obvious
+    // place and is wrong. This function is the single point every migration
+    // passes through, and the ARIADNE branch reaches it twice: once from
+    // make_resident_copy and again from uvm_va_block_service_copy_finish on
+    // their copy kthread, which closes ns_svc_copy with a NULL count and so
+    // never touches n_svc_mkres. Instrumenting the caller would have recorded
+    // their pages as arriving nowhere, and the histogram would have read as
+    // all-zeros for the one arm it exists to explain.
+    //
+    // BEFORE the discard fold below, deliberately. Discarded pages are not
+    // copied and raise no migration event, so counting them would break the
+    // identity against num_pages_in that makes this histogram checkable.
+    //
+    // Gated on REPLAYABLE_FAULT exactly, not on "anything but eviction". The
+    // check this exists for compares sum_svc_copy_pages against
+    // g_uvm_fault_pipeline_stats.num_pages_in, and uvm_gpu.c increments that
+    // one only for this cause. A looser gate would also admit non-replayable
+    // faults, access counters, CPU faults and user migrations, so the two
+    // sides would count different sets and the identity would fail for a
+    // reason that has nothing to do with the histogram being wrong - which is
+    // the worst kind of check, one that cries wolf.
+    if (block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT &&
+        uvm_lock_probes_enabled()) {
+        NvU32 moved = uvm_page_mask_weight(migrated_pages);
+
+        if (moved == 0)
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_0);
+        else if (moved == 1)
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_1);
+        else if (moved <= 3)
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_2_3);
+        else if (moved <= 15)
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_4_15);
+        else
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_16up);
+
+        uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_svc_copy_pages, moved);
+    }
+
     // Add the discarded pages to the migrated pages.
     uvm_page_mask_or(migrated_pages, migrated_pages, &block_context->discard.scratch_page_mask);
 

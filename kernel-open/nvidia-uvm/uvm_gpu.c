@@ -1226,6 +1226,18 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_svc_copy));
     UVM_SEQ_OR_DBG_PRINT(s, "n_svc_mkres               %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_mkres));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_0       %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_pages_0));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_1       %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_pages_1));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_2_3     %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_pages_2_3));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_4_15    %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_pages_4_15));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_16up    %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_pages_16up));
+    UVM_SEQ_OR_DBG_PRINT(s, "sum_svc_copy_pages       %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_svc_copy_pages));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_no_candidate      %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_no_candidate));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_in_flight         %llu\n",
