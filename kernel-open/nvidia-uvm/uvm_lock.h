@@ -1664,6 +1664,42 @@ typedef struct
     atomic64_t sum_adapt_width;
     atomic64_t n_adapt_widen;
     atomic64_t n_adapt_narrow;
+
+    // How long the GPU has nothing queued at a batch boundary.
+    //
+    // At an in-flight bound of 1 the loop is a synchronous round trip: the
+    // replay completes, the bottom half returns from uvm_tracker_wait, and
+    // from that instant until the batch's first migration work reaches the
+    // GPU there is nothing for it to execute. That window is fetch and
+    // preprocess, then span building, the partition, waking the worker
+    // kthreads, and the first worker's VA space and block locks.
+    //
+    // Why it is worth a counter. Campaign 20260908_015942 showed the loop is
+    // GPU-bound: removing 3.8M VA space acquisitions cut the service phase by
+    // 0.29 s and 83% of that went straight into tracker wait, so wall moved
+    // 0.09%. Against ARIADNE we then issue the same 7.02M pushes for the same
+    // pages at the same batch count and take 8.4% longer per round trip. Two
+    // explanations remain and they need opposite responses: the GPU idles
+    // while the pool spins up, or the GPU executes our copies more slowly.
+    // This separates them.
+    //
+    // It is a LOWER BOUND on the idle. The window closes at the top of
+    // uvm_va_block_make_resident_copy, which precedes the unmap and the
+    // populate, so the true first push is at or after that point.
+    //
+    // One window per WAIT, which is one per batch only at an in-flight bound
+    // of 1 (and in serial mode). At a deeper bound the wait runs once every N
+    // batches, so divide by n_gpu_idle_windows and read
+    // gpu_idle_windows_per_batch beside it rather than assuming a batch. The
+    // interval itself stays honest at any bound, because uvm_tracker_wait on
+    // the replay tracker drains everything outstanding, so the GPU really is
+    // quiet when a window opens.
+    //
+    // Time the bottom half spends descheduled inside a window counts as idle,
+    // and that is correct rather than noise: nothing is queued for the GPU
+    // while the thread that would queue it is off CPU.
+    atomic64_t ns_gpu_idle;
+    atomic64_t n_gpu_idle_windows;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every
@@ -1778,6 +1814,68 @@ static inline void uvm_lock_stat_inc(atomic64_t *n)
 static inline void uvm_lock_stat_add(atomic64_t *n, NvU64 count)
 {
     atomic64_add(count, uvm_lock_stat_local(n));
+}
+
+// Open timestamp for the GPU idle window described on ns_gpu_idle above. One
+// shared word rather than a per-CPU bank, because the point is precisely that
+// one thread opens the window and a different thread closes it. Zero means no
+// window is open.
+//
+// Scope: this is a single-GPU diagnostic. Two parent GPUs servicing faults at
+// once would overwrite each other's window rather than keep one apiece, and
+// the counter would undercount. The detector is gpu_idle_windows_per_batch,
+// which is at or just under 1 when the measurement is sound and well under it
+// when windows are being lost. Every campaign cell runs one GPU
+// (SEL_GPUS[0], --device 0), which is what makes the simple form legitimate
+// here rather than merely convenient.
+extern atomic64_t g_uvm_gpu_idle_start_ns;
+
+// Called by the bottom half at each point where a replay wait returns and the
+// GPU has nothing left queued. There are three such points in the service
+// loop, and they are mutually exclusive per batch rather than alternatives to
+// each other: the in-flight bound at the top, the deferred wait on an empty
+// fetch, and the synchronous wait at the bottom that serial mode uses. Serial
+// mode is the DEFAULT (uvm_perf_fault_service_pipeline is 0), so covering only
+// the in-flight bound would leave stock and the mechanism-off control with no
+// windows at all, and those are exactly the arms that validate the probe.
+static inline void uvm_gpu_idle_window_open(void)
+{
+    if (uvm_lock_probes_enabled())
+        atomic64_set(&g_uvm_gpu_idle_start_ns, (long long)NV_GETTIME());
+}
+
+// Discard an open window without recording it. Called when the service loop
+// exits, so a window can never outlive the bottom-half pass that opened it.
+// Without this, a pass that ends between the replay completing and the next
+// migration leaves the timestamp live, and the next unrelated make_resident -
+// a user migration or a CPU fault, arriving milliseconds later - closes it and
+// books that whole interval as GPU idle.
+static inline void uvm_gpu_idle_window_cancel(void)
+{
+    atomic64_set(&g_uvm_gpu_idle_start_ns, 0);
+}
+
+// Called on the migration path, from whichever worker gets there first.
+//
+// The plain read guards the exchange, and that ordering is the whole design:
+// after the first close of a batch the word is zero, so the millions of later
+// calls read a clean shared line and return, instead of each issuing a locked
+// write that would bounce the line across every worker. Only about one
+// exchange per batch actually happens. Whichever thread wins the exchange gets
+// the timestamp and the rest get zero, so the window is recorded exactly once
+// however many workers arrive together.
+static inline void uvm_gpu_idle_window_close(void)
+{
+    NvU64 t0;
+
+    if (!uvm_lock_probes_enabled() || !atomic64_read(&g_uvm_gpu_idle_start_ns))
+        return;
+
+    t0 = (NvU64)atomic64_xchg(&g_uvm_gpu_idle_start_ns, 0);
+    if (t0) {
+        uvm_lock_stat_add(&g_uvm_lock_contention_stats.ns_gpu_idle, NV_GETTIME() - t0);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_gpu_idle_windows);
+    }
 }
 
 #endif // __UVM_LOCK_H__

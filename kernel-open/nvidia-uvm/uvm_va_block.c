@@ -4866,6 +4866,14 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
     atomic64_t *n_mkres = is_evict ? &g_uvm_lock_contention_stats.n_evict_mkres
                                    : &g_uvm_lock_contention_stats.n_svc_mkres;
 
+    // Earliest point on the migration path, and so the close of the GPU idle
+    // window the fault bottom half opened when its replay wait returned. It
+    // sits ahead of the unmap and the populate, both of which can push, which
+    // is why ns_gpu_idle is documented as a lower bound: the true first push
+    // is at or after here. Both causes close it, since an eviction copy ends
+    // the idle exactly as a service copy does.
+    uvm_gpu_idle_window_close();
+
     va_block_context->make_resident.dest_id = dest_id;
     va_block_context->make_resident.cause = cause;
     nodes_clear(va_block_context->make_resident.cpu_pages_used.nodes);

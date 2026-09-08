@@ -79,6 +79,11 @@ uvm_lock_contention_stats_t g_uvm_lock_contention_stats;
 // measured to cost.
 uvm_lock_contention_stats_t __percpu *g_uvm_lock_stats_pcpu;
 
+// Open timestamp for the GPU idle window. Shared rather than per-CPU on
+// purpose: the bottom half opens it and a worker closes it. See ns_gpu_idle in
+// uvm_lock.h.
+atomic64_t g_uvm_gpu_idle_start_ns;
+
 NvU64 uvm_lock_stat_sum(atomic64_t *field)
 {
     size_t off = (size_t)((char *)field - (char *)&g_uvm_lock_contention_stats);
@@ -1263,6 +1268,10 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_adapt_widen));
     UVM_SEQ_OR_DBG_PRINT(s, "n_adapt_narrow            %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_adapt_narrow));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_gpu_idle               %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_gpu_idle));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_gpu_idle_windows        %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gpu_idle_windows));
 
     uvm_up_read(&g_uvm_global.pm.lock);
 

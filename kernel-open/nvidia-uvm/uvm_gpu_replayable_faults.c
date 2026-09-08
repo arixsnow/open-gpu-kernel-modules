@@ -4568,6 +4568,11 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             pending_replays = 0;
             if (status != NV_OK)
                 break;
+
+            // The replay has completed, so the GPU has nothing queued from
+            // here until this batch's first migration reaches it. Diagnostic
+            // only: see ns_gpu_idle in uvm_lock.h for what it is separating.
+            uvm_gpu_idle_window_open();
         }
 
         atomic_set(&batch_context->num_invalid_prefetch_faults, 0);
@@ -4598,6 +4603,10 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
                 if (status != NV_OK)
                     break;
+
+                // Second of the three points where a replay wait returns and
+                // the GPU goes quiet. See uvm_gpu_idle_window_open().
+                uvm_gpu_idle_window_open();
 
                 continue;
             }
@@ -4718,6 +4727,11 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
                 if (status != NV_OK)
                     break;
+
+                // Third and, since uvm_perf_fault_service_pipeline defaults to
+                // 0, the one the stock path and the mechanism-off control
+                // actually take. See uvm_gpu_idle_window_open().
+                uvm_gpu_idle_window_open();
             }
         }
 
@@ -4731,6 +4745,13 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
     if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
         status = NV_OK;
+
+    // A window must never outlive the pass that opened it. The loop can exit
+    // with one open - on an error, or on the batch or throttle caps, or simply
+    // because the last batch serviced nothing - and the next migration to come
+    // along from anywhere would otherwise close it and book the whole gap as
+    // GPU idle.
+    uvm_gpu_idle_window_cancel();
 
     // Make sure that we issue at least one replay if no replay has been
     // issued yet to avoid dropping faults that do not show up in the buffer
