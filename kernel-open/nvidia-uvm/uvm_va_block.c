@@ -4731,6 +4731,38 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
     UVM_ASSERT(pages_copied == pages_copied_to_cpu);
 
 out:
+    // How many pages this copy episode actually moved. See the histogram
+    // comment in uvm_lock.h for why the mean is not enough.
+    //
+    // Inside this function rather than at a caller, so the counter measures
+    // the same quantity on all three branches. It is unambiguous here, where
+    // servicing reaches the copy from one place, and it is not on the ARIADNE
+    // branch, where a second path on their copy kthread also lands here.
+    //
+    // BEFORE the discard fold below, deliberately: discarded pages are not
+    // copied and raise no migration event, so counting them would break the
+    // identity against num_pages_in that makes this histogram checkable.
+    //
+    // Gated on REPLAYABLE_FAULT exactly, matching the condition uvm_gpu.c uses
+    // for num_pages_in, so both sides of that identity count the same set.
+    if (block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_REPLAYABLE_FAULT &&
+        uvm_lock_probes_enabled()) {
+        NvU32 moved = uvm_page_mask_weight(migrated_pages);
+
+        if (moved == 0)
+            atomic64_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_0);
+        else if (moved == 1)
+            atomic64_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_1);
+        else if (moved <= 3)
+            atomic64_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_2_3);
+        else if (moved <= 15)
+            atomic64_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_4_15);
+        else
+            atomic64_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_16up);
+
+        atomic64_add(moved, &g_uvm_lock_contention_stats.sum_svc_copy_pages);
+    }
+
     // Add the discarded pages to the migrated pages.
     uvm_page_mask_or(migrated_pages, migrated_pages, &block_context->discard.scratch_page_mask);
 
