@@ -308,6 +308,32 @@ typedef struct uvm_gpu_root_chunk_struct
     //
     // Protected by the corresponding root chunk bit lock.
     uvm_tracker_t tracker;
+
+    // Value of the fault buffer's replay_epoch when this root chunk was last
+    // TOUCHED - populated or mapped. See replay_epoch in uvm_gpu.h.
+    //
+    // Mapped matters as much as populated, and that is the whole point of
+    // Bug 1765193, the TODO sitting on pick_root_chunk_to_evict: "Move the
+    // chunks to the tail of the used list whenever they get mapped." The used
+    // list is POPULATION ordered. A chunk populated long ago and mapped
+    // constantly since sits at the head and is evicted while in active use,
+    // and stamping only on population would never see that.
+    //
+    // This carries the use ordering the list itself lacks, without the
+    // list_move_tail on the mapping path that the TODO literally asks for -
+    // that would take list_lock on every map, which is presumably why it is
+    // still a TODO.
+    //
+    // Written with no lock anywhere, read with no lock by the eviction victim
+    // walk. Deliberate: list_lock is UVM_LOCK_ORDER_LEAF and the checker
+    // rejects taking an equivalent-or-deeper lock, so the walk cannot acquire
+    // anything, and the mapping path holds no PMM lock at all. A torn or stale
+    // read is harmless both ways - too old leaves a chunk evictable, which is
+    // today's behaviour, and too new protects one chunk for one pass.
+    //
+    // Zero for a chunk never touched, which is below every real epoch and so
+    // never protects.
+    NvU64 touch_epoch;
 } uvm_gpu_root_chunk_t;
 
 typedef struct uvm_pmm_gpu_struct
@@ -567,6 +593,14 @@ void uvm_pmm_gpu_root_chunk_unlock(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *roo
 // chunk can be pinned when it's being initially populated by the VA block.
 // Allow that state to make this API easy to use for the caller.
 void uvm_pmm_gpu_mark_root_chunk_used(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
+
+// Record that this root chunk has just been touched - populated or mapped - so
+// the eviction victim walk will pass over it until a fault replay has been
+// issued. See touch_epoch above.
+//
+// Takes no lock and may be called from any context that holds a reference to
+// the chunk, including the mapping path, which holds no PMM lock.
+void uvm_pmm_gpu_mark_root_chunk_touched(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 
 // Mark an allocated user chunk as unused
 void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);

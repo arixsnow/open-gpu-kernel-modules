@@ -188,6 +188,43 @@ MODULE_PARM_DESC(uvm_global_oversubscription, "Enable (1) or disable (0) global 
 static unsigned uvm_perf_pma_batch_nonpinned_order = UVM_PERF_PMA_BATCH_NONPINNED_ORDER_DEFAULT;
 module_param(uvm_perf_pma_batch_nonpinned_order, uint, S_IRUGO);
 
+// Skip root chunks whose fault replay has not been issued when picking an
+// eviction victim. 0, the default, is stock behaviour: the head of the used
+// list is taken whatever it is.
+//
+// Stock picks the head of the used list, which is POPULATION ordered against
+// an unimplemented NVIDIA TODO sitting right above the pick site (Bug 1765193:
+// "Move the chunks to the tail of the used list whenever they get mapped").
+// Population ordering is not use ordering, and it goes wrong two ways: the
+// head can be a chunk this batch has just faulted in whose replay has not run,
+// and it can equally be a chunk populated long ago that has been mapped and
+// used ever since. Evicting either guarantees the fault comes straight back.
+//
+// Every populate AND every map stamps the root chunk with the current replay
+// epoch, and this knob makes the victim walk skip chunks stamped since the
+// last replay. That is the use ordering the TODO asks for, carried in a field
+// rather than in the list order.
+//
+// This is a preference and never a constraint. If every candidate in the scan
+// is protected the walk falls back to the true head, which is byte-for-byte
+// today's victim, so allocation can never newly fail and no required check is
+// bypassed - stock performs no per-candidate test at all here, list membership
+// is the test.
+static unsigned uvm_perf_evict_skip_pending_replay = 0;
+module_param(uvm_perf_evict_skip_pending_replay, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_skip_pending_replay,
+                 "Skip eviction candidates whose fault replay has not been issued (0 = off, stock).");
+
+#define UVM_PERF_EVICT_SCAN_LIMIT_DEFAULT 32
+
+// How many candidates the victim walk may examine before giving up and taking
+// the head. alloc_list[USED] holds root_chunks.count entries, which is 12288 on
+// a 24 GB part, so the scan has to be bounded: it runs under list_lock, which
+// is a spinlock on the allocation path. ns_evict_pick already times this walk
+// and will show if the cap is too generous.
+static unsigned uvm_perf_evict_scan_limit = UVM_PERF_EVICT_SCAN_LIMIT_DEFAULT;
+module_param(uvm_perf_evict_scan_limit, uint, S_IRUGO);
+
 // Helper type for refcounting cache
 typedef struct
 {
@@ -372,6 +409,25 @@ static uvm_gpu_root_chunk_t *root_chunk_from_address(uvm_pmm_gpu_t *pmm, NvU64 a
 static uvm_gpu_root_chunk_t *root_chunk_from_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     return root_chunk_from_address(pmm, chunk->address);
+}
+
+// Record that this root chunk has just been touched - populated or mapped.
+// See touch_epoch in uvm_pmm_gpu.h.
+//
+// Deliberately takes NO lock. Two of the three callers happen to hold
+// pmm->list_lock and the third, the mapping path, holds no PMM lock at all,
+// which is the case that decides it: a plain store of a value whose reader
+// tolerates any result needs no more than this, and requiring list_lock on
+// every map is exactly the cost that has kept Bug 1765193 a TODO.
+//
+// Defined here rather than beside the walk that reads it, because the first
+// caller is uvm_pmm_gpu_unpin_allocated, which comes well before.
+void uvm_pmm_gpu_mark_root_chunk_touched(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+{
+    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+
+    root_chunk_from_chunk(pmm, chunk)->touch_epoch =
+        (NvU64)atomic64_read(&gpu->parent->fault_buffer.replayable.replay_epoch);
 }
 
 static bool chunk_is_root_chunk(uvm_gpu_chunk_t *chunk)
@@ -673,6 +729,16 @@ void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm
 
     chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
     chunk_update_lists_locked(pmm, chunk);
+
+    // First population of this chunk, any size, HMM included. The other stamp
+    // site catches in-place re-population, which never reaches here: a fault
+    // on a block whose chunk already exists returns early in
+    // block_populate_gpu_chunk and never unpins.
+    //
+    // Stamped here and not in chunk_update_lists_locked, which has five
+    // callers and also fires on frees and on the eviction-failure re-arm -
+    // that last one would freshly protect a chunk that just failed to evict.
+    uvm_pmm_gpu_mark_root_chunk_touched(pmm, chunk);
 
     uvm_spin_unlock(&pmm->list_lock);
 }
@@ -1520,6 +1586,22 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t 
         list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
     }
 
+    // The second population stamp. USED only: this helper also serves
+    // mark_root_chunk_unused and mark_root_chunk_discarded, and neither of
+    // those is a population.
+    //
+    // Reached from uvm_va_block_make_resident_finish on every make-resident
+    // that leaves the GPU resident, not only on the 0->1 transition, which is
+    // what catches in-place re-population of a chunk that already exists and
+    // so never passes through uvm_pmm_gpu_unpin_allocated.
+    //
+    // Outside the pinned/in-eviction test above on purpose. A chunk that is
+    // pinned or already being evicted did not move list, but it was still just
+    // populated, and the stamp is what decides whether a LATER pass may take
+    // it.
+    if (alloc_list == UVM_PMM_ALLOC_LIST_USED)
+        uvm_pmm_gpu_mark_root_chunk_touched(pmm, chunk);
+
     uvm_spin_unlock(&pmm->list_lock);
 }
 
@@ -1553,6 +1635,58 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
     }
 
     return UVM_PMM_ALLOC_LIST_COUNT;
+}
+
+// True while no replay has been issued since this root chunk was touched by
+// fault servicing, which is the window in which evicting it guarantees an
+// immediate re-fault.
+//
+// Reads two values that can move under it and needs neither to be stable. The
+// epoch only ever grows, so a stale read of either side can only mis-classify
+// one chunk on one pass: too old leaves it evictable, which is stock
+// behaviour, and too new protects it until the next replay.
+static bool root_chunk_replay_pending(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+{
+    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+    NvU64 now = (NvU64)atomic64_read(&gpu->parent->fault_buffer.replayable.replay_epoch);
+
+    return root_chunk_from_chunk(pmm, chunk)->touch_epoch >= now;
+}
+
+// The victim walk. Returns the first candidate whose replay has been issued,
+// or the true head of the first non-empty list if the scan finds none within
+// its budget.
+//
+// The fallback is the HEAD and not the last candidate examined. Taking the
+// last one instead would quietly change stock victim selection whenever the
+// scan came up empty, which is exactly the case where this wants to change
+// nothing.
+static uvm_gpu_chunk_t *get_first_evictable_chunk(uvm_pmm_gpu_t *pmm)
+{
+    uvm_pmm_alloc_list_t alloc_list;
+    uvm_gpu_chunk_t *head = NULL;
+    unsigned examined = 0;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
+        uvm_gpu_chunk_t *chunk;
+
+        list_for_each_entry(chunk, &pmm->root_chunks.alloc_list[alloc_list], list) {
+            // The head of the first non-empty list, which is precisely what
+            // get_first_allocated_chunk would have returned.
+            if (!head)
+                head = chunk;
+
+            if (examined++ >= uvm_perf_evict_scan_limit)
+                return head;
+
+            if (!root_chunk_replay_pending(pmm, chunk))
+                return chunk;
+        }
+    }
+
+    return head;
 }
 
 static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
@@ -1596,8 +1730,21 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
 
     // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
     // they get mapped.
-    if (!chunk)
-        chunk = get_first_allocated_chunk(pmm);
+    //
+    // uvm_perf_evict_skip_pending_replay implements that TODO's intent. It
+    // does not reorder the list, which is what the TODO literally asks for and
+    // what would take list_lock on every map; instead every map stamps the
+    // root chunk (uvm_pmm_gpu_mark_root_chunk_touched) and this walk skips the
+    // entries at the head that have been touched since the last replay. Same
+    // use-ordering, one unsynchronised store on the mapping path instead of a
+    // lock, and it falls back to the head so the worst case is the behaviour
+    // below.
+    if (!chunk) {
+        if (uvm_perf_evict_skip_pending_replay)
+            chunk = get_first_evictable_chunk(pmm);
+        else
+            chunk = get_first_allocated_chunk(pmm);
+    }
 
     if (chunk)
         chunk_start_eviction(pmm, chunk);

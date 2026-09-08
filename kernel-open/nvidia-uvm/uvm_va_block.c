@@ -8593,6 +8593,27 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
 
     uvm_processor_mask_set(&va_block->mapped, gpu->id);
 
+    // Bug 1765193: "Move the chunks to the tail of the used list whenever they
+    // get mapped." The used list that pick_root_chunk_to_evict walks is
+    // POPULATION ordered, so a chunk populated long ago and mapped constantly
+    // since sits at its head and is chosen as the victim while in active use.
+    //
+    // Stamping the root chunk here carries that use ordering to the victim
+    // walk without the list_move_tail the TODO literally asks for, which would
+    // take pmm->list_lock on every mapping and is presumably why this is still
+    // a TODO. The stamp is one unsynchronised NvU64 store; see touch_epoch in
+    // uvm_pmm_gpu.h for why no lock is needed.
+    //
+    // Same guard as the discard bookkeeping below: root chunks are tracked for
+    // eviction only for full 2 MB non-HMM blocks, and HMM always allocates
+    // PAGE_SIZE GPU chunks.
+    if (!uvm_va_block_is_hmm(va_block) && uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX) {
+        uvm_va_block_gpu_state_t *map_gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+
+        if (map_gpu_state && map_gpu_state->chunks[0])
+            uvm_pmm_gpu_mark_root_chunk_touched(&gpu->pmm, map_gpu_state->chunks[0]);
+    }
+
     if (uvm_page_mask_and(&block_context->discard.scratch_page_mask, &va_block->discarded_pages, pages_to_map) &&
         !uvm_va_block_is_hmm(va_block) &&
         uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX) {

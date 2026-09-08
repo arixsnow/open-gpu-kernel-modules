@@ -510,6 +510,37 @@ typedef struct
         // and GPU removal
         uvm_tracker_t replay_tracker;
 
+        // Monotonic count of replays pushed for this fault buffer, bumped once
+        // per successful push_replay_on_gpu. A root chunk records the value it
+        // sees whenever it is touched - populated or mapped
+        // (uvm_gpu_root_chunk_t.touch_epoch) - and the eviction victim walk
+        // skips a chunk whose recorded value has not been passed yet.
+        //
+        // The window that protects is touch -> replay issued. Evicting inside
+        // it guarantees a re-fault: the page was brought in or mapped for a
+        // fault whose replay has not run, so the GPU has not yet had the
+        // chance to use it.
+        //
+        // Mapping counts as a touch, not just population, and that is what
+        // makes this an answer to Bug 1765193 rather than a narrower fix. The
+        // used list is population ordered, so without the mapping stamp a
+        // chunk populated long ago and mapped constantly since sits at the
+        // head of the list and is picked while in active use.
+        //
+        // Issue rather than retirement, deliberately. Retirement is the
+        // tighter bound and section 23 of notes/46 prefers it, but answering
+        // "has replay N retired" needs the {channel, value} of that specific
+        // push kept per epoch, and replays are not ordered across channels, so
+        // the bookkeeping is real. Issue is strictly weaker, cannot protect a
+        // chunk forever - any later replay releases it - and covers the window
+        // where eviction is provably wasted. If the counters say the residual
+        // re-faults are in the issued-but-not-retired gap, tighten it then.
+        //
+        // On the fault buffer rather than uvm_pmm_gpu_t: SMC shares one fault
+        // buffer across several PMMs, and it is the replay that matters, not
+        // the allocator.
+        atomic64_t replay_epoch;
+
         // If there is a ratio larger than replay_update_put_ratio of duplicate
         // faults in a batch, PUT pointer is updated before flushing the buffer
         // that comes before the replay method.

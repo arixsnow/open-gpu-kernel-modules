@@ -492,6 +492,11 @@ static NV_STATUS fault_buffer_init_replayable_faults(uvm_parent_gpu_t *parent_gp
     // fault_cache is used to signal that the tracker was initialized.
     uvm_tracker_init(&replayable_faults->replay_tracker);
 
+    // Starts at 1 so that it is above the populate_epoch of every root chunk
+    // in a freshly allocated array, which is zeroed. A chunk that fault
+    // servicing has never populated must never be protected.
+    atomic64_set(&replayable_faults->replay_epoch, 1);
+
     batch_context->ordered_fault_cache = uvm_kvmalloc_zero(replayable_faults->max_faults *
                                                            sizeof(*batch_context->ordered_fault_cache));
     if (!batch_context->ordered_fault_cache)
@@ -846,6 +851,19 @@ static NV_STATUS push_replay_on_gpu(uvm_gpu_t *gpu,
     }
 
     uvm_push_end(&push);
+
+    // A replay has been issued, so every root chunk populated before this
+    // point has now had its chance to be used and stops being protected from
+    // eviction. See replay_epoch in uvm_gpu.h and the victim walk in
+    // uvm_pmm_gpu.c.
+    //
+    // After uvm_push_end and unconditionally, including for
+    // REPLAY_TYPE_START_ACK_ALL. The cancel path deliberately excludes those
+    // from batch_context->num_replays because its algorithm counts START
+    // replays, but for this purpose any replay serves: the GPU re-runs either
+    // way, which is the whole of what the epoch records. Counting them cannot
+    // protect a chunk for longer, only release it sooner.
+    atomic64_inc(&replayable_faults->replay_epoch);
 
     // Add this push to the GPU's replay_tracker so cancel can wait on it.
     status = uvm_tracker_add_push_safe(&replayable_faults->replay_tracker, &push);
