@@ -4129,7 +4129,22 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
 
         if (block_copy_should_use_push(block, &copy_state)) {
             if (!copying_gpu) {
+                // Splits ns_svc_copy, so it carries ns_svc_copy's bank rule:
+                // servicing only. Eviction reaches this function too, and
+                // folding both causes into one bank would leave the parts
+                // unaddable to the total they are splitting. NULL disables the
+                // probe outright, which is the contract on uvm_lock_probe_end.
+                const bool is_evict = block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION;
+                NvU64 t_copy_begin = uvm_lock_probe_begin();
+
                 status = block_copy_begin_push(block, &copy_state, &push);
+
+                // Closed before the error check, like ns_mkres_copy, so a push
+                // that failed to begin still reports what it spent failing.
+                uvm_lock_probe_end(t_copy_begin,
+                                   is_evict ? NULL : &g_uvm_lock_contention_stats.ns_svc_copy_begin,
+                                   is_evict ? NULL : &g_uvm_lock_contention_stats.n_svc_copy_begin);
+
                 if (status != NV_OK)
                     break;
 
@@ -4293,8 +4308,19 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                                 &block_context->make_resident);
         }
 
-        if (block_copy_should_use_push(block, &copy_state) && copying_gpu)
+        if (block_copy_should_use_push(block, &copy_state) && copying_gpu) {
+            // The other half of the ns_svc_copy split. No count beside it: this
+            // runs exactly once per block_copy_begin_push that succeeded, so
+            // n_svc_copy_begin is the denominator for both.
+            const bool is_evict = block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION;
+            NvU64 t_copy_end = uvm_lock_probe_begin();
+
             status = block_copy_end_push(block, &copy_state, copy_tracker, status, &push);
+
+            uvm_lock_probe_end(t_copy_end,
+                               is_evict ? NULL : &g_uvm_lock_contention_stats.ns_svc_copy_end,
+                               NULL);
+        }
     }
 
     // Update VA block status bits

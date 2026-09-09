@@ -1228,6 +1228,12 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_svc_copy));
     UVM_SEQ_OR_DBG_PRINT(s, "n_svc_mkres               %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_mkres));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_svc_copy_begin         %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_svc_copy_begin));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_begin          %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_begin));
+    UVM_SEQ_OR_DBG_PRINT(s, "ns_svc_copy_end           %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_svc_copy_end));
     UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_0       %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_svc_copy_pages_0));
     UVM_SEQ_OR_DBG_PRINT(s, "n_svc_copy_pages_1       %llu\n",

@@ -1580,6 +1580,39 @@ typedef struct
     atomic64_t ns_svc_copy;
     atomic64_t n_svc_mkres;
 
+    // ns_svc_copy split three ways. This is the largest unattributed quantity
+    // in the project: per BLOCK at w7@110 the copy costs 10.264 us for a 21
+    // worker pool against stock's 0.794 and ARIADNE's 1.506, and
+    // push_reserve_us_per_acq accounts for only 4.190 of the excess. Roughly
+    // 5.3 us has never been attributed to anything, and every campaign that
+    // proposed a copy-side fix was guessing at it.
+    //
+    // Per-block latency is the metric these serve, not wall time.
+    // ns_va_block_service / n_va_block_service is a true latency - one sample
+    // per block, one worker per block - so unlike every share_*_wall_pct it does
+    // not inflate with worker count, and unlike hw_faults_per_sec it is not
+    // derived from wall. It is the only cross-build cost that survived the
+    // 20260909_193646 audit.
+    //
+    // The split follows the two natural boundaries inside
+    // block_copy_resident_pages, which is exactly what ns_svc_copy wraps:
+    //
+    //   begin  block_copy_begin_push. Contains the channel reservation, which
+    //          ns_push_reserve already times separately, plus the acquire of
+    //          va_block->tracker and the pushbuffer allocation. The tracker
+    //          acquire emits one semaphore acquire method per tracker entry, and
+    //          a worker pool leaves more entries outstanding, so this is the
+    //          leading hypothesis for the missing 5.3 us.
+    //   end    block_copy_end_push. uvm_push_end plus the tracker add.
+    //   the remainder, which needs no counter: ns_svc_copy minus the two is the
+    //          per-page method emission and the mask arithmetic around it.
+    //
+    // Counted as well as timed, because a per-episode cost that is flat while
+    // the episode count rises is a different finding from one that grows.
+    atomic64_t ns_svc_copy_begin;
+    atomic64_t n_svc_copy_begin;
+    atomic64_t ns_svc_copy_end;
+
     // How many pages each servicing COPY EPISODE actually migrates, where an
     // episode is one call to block_copy_resident_pages.
     //
