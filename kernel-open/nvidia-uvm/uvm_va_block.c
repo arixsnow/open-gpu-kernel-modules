@@ -3899,7 +3899,25 @@ static NV_STATUS block_copy_end_push(uvm_va_block_t *block,
     if ((push_status == NV_OK) && is_cc_sysmem_copy(copy_state))
         push_status = conf_computing_copy_pages_finish(block, copy_state, push);
 
-    tracker_status = uvm_tracker_add_push_safe(copy_tracker, push);
+    // The other half of block_copy_end_push, separated from uvm_push_end above
+    // (ns_push_end) so the 2.951 us/mig that ns_svc_copy_end measures splits
+    // into the doorbell and the bookkeeping. uvm_tracker_add_push_safe can grow
+    // the tracker array, so a pool with more work outstanding may pay here in a
+    // way a single servicing thread does not.
+    //
+    // Counted as well as timed, unlike the three push probes: this sits on the
+    // copy path rather than the generic push path, so n_push_reserve is not its
+    // denominator.
+    {
+        NvU64 t0 = uvm_lock_probe_begin();
+
+        tracker_status = uvm_tracker_add_push_safe(copy_tracker, push);
+
+        uvm_lock_probe_end(t0,
+                           &g_uvm_lock_contention_stats.ns_copy_tracker_add,
+                           &g_uvm_lock_contention_stats.n_copy_tracker_add);
+    }
+
     if (push_status == NV_OK)
         push_status = tracker_status;
 

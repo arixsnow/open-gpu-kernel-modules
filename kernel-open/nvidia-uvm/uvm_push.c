@@ -222,6 +222,7 @@ static NV_STATUS push_begin_acquire_with_info(uvm_channel_t *channel,
                                               va_list args)
 {
     NV_STATUS status;
+    NvU64 t0;
 
     memset(push, 0, sizeof(*push));
 
@@ -233,7 +234,21 @@ static NV_STATUS push_begin_acquire_with_info(uvm_channel_t *channel,
 
     push_fill_info(push, filename, function, line, format, args);
 
+    // The fourth push-path probe. uvm_push_acquire_tracker walks the tracker
+    // and emits one semaphore acquire method per entry, so its cost scales with
+    // how much work is outstanding rather than with the push itself. A worker
+    // pool leaves far more outstanding than a single servicing thread, which
+    // makes this the leading candidate for the ~2.7 us that campaign
+    // 20260909_214512 could not account for inside block_copy_begin_push once
+    // the channel reservation was subtracted.
+    //
+    // No count: one acquire per reserved push, so n_push_reserve is already the
+    // denominator.
+    t0 = uvm_lock_probe_begin();
+
     uvm_push_acquire_tracker(push, tracker);
+
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_push_acq_tracker, NULL);
 
     return NV_OK;
 }
@@ -259,7 +274,17 @@ NV_STATUS __uvm_push_begin_acquire_with_info(uvm_channel_manager_t *manager,
         UVM_ASSERT(dst_gpu != manager->gpu);
     }
 
+    // Timed because it can BLOCK: uvm_tracker_wait_for_other_gpus waits on
+    // another GPU's work before this push may start. It runs ahead of the
+    // reservation, so until now a wait here landed inside no probe at all and
+    // showed up only as unexplained ns_svc_copy. Free on single-GPU runs, where
+    // the callee returns immediately.
+    t0 = uvm_lock_probe_begin();
+
     status = wait_for_other_gpus_if_needed(tracker, manager->gpu);
+
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_push_wait_other_gpus, NULL);
+
     if (status != NV_OK)
         return status;
 
@@ -354,7 +379,18 @@ void uvm_push_end(uvm_push_t *push)
 {
     uvm_push_flag_t flag;
 
+    // uvm_channel_end_push holds the channel lock across the GPFIFO entry fill
+    // and an uncached MMIO doorbell write, so this is the second-hottest thing
+    // a push does after the reservation. It is 27% of the servicing copy
+    // (2.951 us/mig at w7@110) against stock's 1.056 us for the entire copy,
+    // and it has never been separated from the tracker add that follows it in
+    // block_copy_end_push. No count: one end per reserved push, so
+    // n_push_reserve is the denominator.
+    NvU64 t0 = uvm_lock_probe_begin();
+
     uvm_channel_end_push(push);
+
+    uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_push_end, NULL);
 
     flag = find_first_bit(push->flags, UVM_PUSH_FLAG_COUNT);
 

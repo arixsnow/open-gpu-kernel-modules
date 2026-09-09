@@ -225,6 +225,26 @@ MODULE_PARM_DESC(uvm_perf_evict_skip_pending_replay,
 static unsigned uvm_perf_evict_scan_limit = UVM_PERF_EVICT_SCAN_LIMIT_DEFAULT;
 module_param(uvm_perf_evict_scan_limit, uint, S_IRUGO);
 
+// How many free root chunks the proactive evictor keeps in reserve. 0 is off
+// and is stock behaviour exactly: no thread is created and no call site changes.
+//
+// This is the policy half of the comparison against ARIADNE. Theirs takes 54
+// demand-path eviction calls at w7@110 while evicting 279,807 blocks; ours takes
+// 274,999 calls at 19.90 us for the same volume, because stock only evicts once
+// an allocation has already failed. Same work, on the fault path instead of
+// beside it.
+//
+// A reserve rather than a watermark on PMA's free counters, which is what theirs
+// keys on. Their gate is free_2mb == 0, so their evictor only wakes once PMA is
+// ALREADY out, and they need a drift correction every iteration because the
+// counter desynchronises. Counting our own free root chunks is the quantity the
+// allocation path actually consumes, it needs no correction, and it does not
+// drag in their 2MB charge accounting.
+static unsigned uvm_perf_evict_proactive = 0;
+module_param(uvm_perf_evict_proactive, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive,
+                 "Free root chunks to keep in reserve on a background thread (0 = off, stock).");
+
 // Helper type for refcounting cache
 typedef struct
 {
@@ -355,6 +375,7 @@ static struct list_head *find_free_list(uvm_pmm_gpu_t *pmm,
 static bool check_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static struct list_head *find_free_list_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
+static void proactive_evict_wake(uvm_pmm_gpu_t *pmm);
 
 static size_t root_chunk_index(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk)
 {
@@ -1978,8 +1999,15 @@ static NV_STATUS alloc_or_evict_root_chunk(uvm_pmm_gpu_t *pmm,
 
     status = alloc_root_chunk(pmm, type, flags, &chunk);
     if (status != NV_OK) {
-        if (flags & UVM_PMM_ALLOC_FLAGS_EVICT)
+        if (flags & UVM_PMM_ALLOC_FLAGS_EVICT) {
+            // The reserve is empty or we would not be here. Ring the doorbell
+            // before evicting, so the thread rebuilds it while this caller pays
+            // for its own eviction: the wake costs an atomic store and cannot
+            // help the caller in front of it, only the ones behind.
+            proactive_evict_wake(pmm);
+
             status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
+        }
 
         return status;
     }
@@ -2000,6 +2028,10 @@ static NV_STATUS alloc_or_evict_root_chunk_unlocked(uvm_pmm_gpu_t *pmm,
     status = alloc_root_chunk(pmm, type, flags, &chunk);
     if (status != NV_OK) {
         if (flags & UVM_PMM_ALLOC_FLAGS_EVICT) {
+            // Same doorbell as alloc_or_evict_root_chunk, and rung BEFORE
+            // pmm->lock is taken so the wake never sits inside that hold.
+            proactive_evict_wake(pmm);
+
             pmm_lock(pmm);
             status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
             uvm_mutex_unlock(&pmm->lock);
@@ -2768,6 +2800,183 @@ struct list_head *find_free_list(uvm_pmm_gpu_t *pmm,
     return &pmm->free_list[type][idx][zero_type];
 }
 
+// How many root chunks are sitting free for the allocation path to take. This
+// is the quantity alloc_root_chunk consumes, which is why the reserve is keyed
+// on it rather than on PMA's free counters the way ARIADNE's watermark is.
+//
+// Bounded by the reserve: the walk runs under list_lock, a leaf spinlock also
+// taken by every allocation and free, so counting the whole list would put an
+// O(free chunks) walk in the way of the fault path. Stopping at the target is
+// enough, since the only question asked is "are we at or below the reserve".
+static NvU32 free_root_chunks_upto(uvm_pmm_gpu_t *pmm, NvU32 target)
+{
+    uvm_pmm_list_zero_t zero_type;
+    NvU32 n = 0;
+
+    uvm_spin_lock(&pmm->list_lock);
+
+    for (zero_type = 0; zero_type < UVM_PMM_LIST_ZERO_COUNT && n < target; ++zero_type) {
+        struct list_head *cur;
+
+        list_for_each(cur, find_free_list(pmm,
+                                          UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                          UVM_CHUNK_SIZE_MAX,
+                                          zero_type)) {
+            if (++n >= target)
+                break;
+        }
+    }
+
+    uvm_spin_unlock(&pmm->list_lock);
+
+    return n;
+}
+
+// Wake the proactive evictor. Called from the allocation path when it is about
+// to evict, which is the moment we know the reserve is empty.
+//
+// Deliberately cheap and non-blocking: this runs on the fault path, so it sets
+// a flag and returns. Everything expensive happens on the thread.
+static void proactive_evict_wake(uvm_pmm_gpu_t *pmm)
+{
+    if (!pmm->proactive_evict.thread)
+        return;
+
+    atomic_set(&pmm->proactive_evict.wake, 1);
+    wake_up(&pmm->proactive_evict.wq);
+}
+
+static int proactive_evict_thread(void *arg)
+{
+    uvm_pmm_gpu_t *pmm = (uvm_pmm_gpu_t *)arg;
+
+    while (!kthread_should_stop()) {
+        NvU32 target = uvm_perf_evict_proactive;
+        NvU32 budget;
+        NvU64 t0;
+
+        // A timeout as well as a wake, so the reserve is rebuilt even in a lull
+        // where nothing is allocating and nothing rings the doorbell. Without it
+        // the thread would only ever run just after a demand eviction, which is
+        // the case it exists to prevent.
+        wait_event_interruptible_timeout(pmm->proactive_evict.wq,
+                                         kthread_should_stop() ||
+                                             atomic_read(&pmm->proactive_evict.wake),
+                                         msecs_to_jiffies(10));
+
+        if (kthread_should_stop())
+            break;
+
+        atomic_set(&pmm->proactive_evict.wake, 0);
+
+        t0 = uvm_lock_probe_begin();
+
+        // BOUNDED at the reserve size, and the bound is not cosmetic. free_chunk
+        // calls free_next_available_root_chunk on every root-chunk free, which
+        // hands one back to PMA - so ordinary frees drain the reserve while this
+        // thread builds it. Without a bound the two can chase each other and the
+        // thread evicts continuously, which would thrash the very working set it
+        // exists to protect. One wake tops the reserve up once; if it is still
+        // short, the next wake or the 10 ms timeout handles it.
+        //
+        // It also keeps kthread_should_stop responsive, since the loop cannot
+        // run long between checks.
+        budget = target;
+
+        while (budget-- > 0 && !kthread_should_stop() &&
+               free_root_chunks_upto(pmm, target) < target) {
+            uvm_gpu_chunk_t *chunk;
+            NV_STATUS status;
+
+            // The same call the fault path makes, so these evictions are inside
+            // n_evict_calls and ns_evict_call. n_evict_proactive is what
+            // separates them; demand-path evictions are the subtraction.
+            //
+            // uvm_mutex_lock and not pmm_lock: pmm_lock records
+            // ns_pmm_lock_wait, which exists to say whether the FAULT PATH
+            // serialises on PMM. Folding a background thread into it would
+            // corrupt the one counter used to answer that question - it is how
+            // we established that eviction parallelises rather than serialising.
+            uvm_mutex_lock(&pmm->lock);
+            status = pick_and_evict_root_chunk_retry(pmm,
+                                                     UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                                     PMM_CONTEXT_DEFAULT,
+                                                     &chunk);
+            uvm_mutex_unlock(&pmm->lock);
+
+            // Nothing evictable, or a transient failure. Either way stop and
+            // wait rather than spin: the allocation path still has its own
+            // eviction and remains correct with an empty reserve.
+            if (status != NV_OK)
+                break;
+
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive);
+
+            // try_chunk_free, NOT free_chunk. free_chunk sets try_free for a
+            // root chunk and calls free_next_available_root_chunk, which hands
+            // one straight back to PMA - it would undo the reserve on every
+            // iteration. try_chunk_free lands it on pmm->free_list and stops
+            // there, which is the whole point.
+            //
+            // It takes list_lock itself and not pmm->lock, so it is safe here
+            // with pmm->lock dropped. The merge fallback needs pmm->lock, and a
+            // freshly evicted root chunk has no allocated children so it should
+            // never be taken; it is handled rather than asserted because a
+            // deadlock is the cost of being wrong.
+            if (!try_chunk_free(pmm, chunk)) {
+                uvm_mutex_lock(&pmm->lock);
+                free_chunk_with_merges(pmm, chunk);
+                uvm_mutex_unlock(&pmm->lock);
+            }
+        }
+
+        uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_proactive, NULL);
+    }
+
+    return 0;
+}
+
+static NV_STATUS proactive_evict_start(uvm_pmm_gpu_t *pmm)
+{
+    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+
+    // The wait queue and the wake flag are initialised in uvm_pmm_gpu_init
+    // before pmm->initialized is set, not here, so that a failure between the
+    // two does not leave deinit stopping a thread pointer nobody wrote.
+
+    // Off means no thread at all, so the stock path carries nothing, not even a
+    // sleeping task.
+    if (uvm_perf_evict_proactive == 0)
+        return NV_OK;
+
+    pmm->proactive_evict.thread = kthread_run(proactive_evict_thread,
+                                              pmm,
+                                              "uvm_evict_%s",
+                                              uvm_gpu_name(gpu));
+    if (IS_ERR(pmm->proactive_evict.thread)) {
+        NV_STATUS status = errno_to_nv_status(PTR_ERR(pmm->proactive_evict.thread));
+
+        pmm->proactive_evict.thread = NULL;
+        return status;
+    }
+
+    return NV_OK;
+}
+
+static void proactive_evict_stop(uvm_pmm_gpu_t *pmm)
+{
+    if (!pmm->proactive_evict.thread)
+        return;
+
+    // kthread_stop waits for the thread to leave, and the loop tests
+    // kthread_should_stop() both at the top and inside the eviction loop, so it
+    // cannot be mid-eviction when this returns. Called FIRST in deinit, before
+    // any chunk state is torn down, which is the ordering that keeps this clear
+    // of the lifetime class of bug we had to repair three times in ARIADNE.
+    kthread_stop(pmm->proactive_evict.thread);
+    pmm->proactive_evict.thread = NULL;
+}
+
 struct list_head *find_free_list_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     return find_free_list(pmm,
@@ -3310,6 +3519,18 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     uvm_init_rwsem(&pmm->pma_lock, UVM_LOCK_ORDER_PMM_PMA);
     uvm_spin_lock_init(&pmm->list_lock, UVM_LOCK_ORDER_LEAF);
 
+    // BEFORE pmm->initialized, and this ordering is load-bearing. Every failure
+    // below jumps to cleanup, which calls uvm_pmm_gpu_deinit, which runs only
+    // when initialized is set and then calls proactive_evict_stop. The thread is
+    // not started until the very end of this function, so between here and there
+    // every one of those paths would hand kthread_stop a pointer this function
+    // never wrote. It happens to be NULL today because uvm_gpu_t comes from
+    // uvm_kvmalloc_zero, but that is an invariant three files away; setting it
+    // here makes it local to the code that depends on it.
+    pmm->proactive_evict.thread = NULL;
+    init_waitqueue_head(&pmm->proactive_evict.wq);
+    atomic_set(&pmm->proactive_evict.wake, 0);
+
     pmm->initialized = true;
 
     for (i = 0; i < UVM_PMM_GPU_MEMORY_TYPE_COUNT; i++) {
@@ -3382,6 +3603,14 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
         }
     }
 
+    // LAST, so the thread never observes a half-built pmm. It evicts and frees
+    // root chunks from the moment it starts, and everything it touches -
+    // root_chunks.array, the bitlocks, the free lists, the PMA handle - is set
+    // up above. On failure the goto runs deinit, which stops it again.
+    status = proactive_evict_start(pmm);
+    if (status != NV_OK)
+        goto cleanup;
+
     return NV_OK;
 cleanup:
     uvm_pmm_gpu_deinit(pmm);
@@ -3416,6 +3645,12 @@ void uvm_pmm_gpu_deinit(uvm_pmm_gpu_t *pmm)
         return;
 
     gpu = uvm_pmm_to_gpu(pmm);
+
+    // FIRST, before any chunk state is torn down. The thread evicts and frees
+    // root chunks, so it must be gone before release_free_root_chunks runs or it
+    // would be racing the teardown for the same lists. kthread_stop blocks until
+    // it has left.
+    proactive_evict_stop(pmm);
 
     nv_kthread_q_flush(&gpu->parent->lazy_free_q);
     UVM_ASSERT(list_empty(&pmm->root_chunks.va_block_lazy_free));

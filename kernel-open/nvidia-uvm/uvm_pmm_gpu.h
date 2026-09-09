@@ -408,6 +408,34 @@ typedef struct uvm_pmm_gpu_struct
     bool initialized;
 
     bool pma_address_cache_initialized;
+
+    // Proactive eviction, off unless uvm_perf_evict_proactive is non-zero.
+    //
+    // Stock evicts only when an allocation has already failed, so eviction sits
+    // on the fault path and every fault that triggers one waits for it. At
+    // w7@110 that is 274,999 demand-path evictions at 19.90 us each, against
+    // ARIADNE's 54 for the same 280k blocks evicted, because theirs runs on a
+    // kthread. That difference is why every comparison in this project has been
+    // our servicing plus STOCK policy against their servicing plus THEIR policy.
+    //
+    // This thread keeps a small reserve of free root chunks so the allocation
+    // succeeds outright and the fault path never enters the evict branch.
+    //
+    // Created and destroyed with the GPU rather than lazily on first fault.
+    // ARIADNE brings theirs up lazily, and that is precisely where their
+    // lost-wakeup and use-after-free bugs lived (repaired in f33465c9 and
+    // b3f3498d); there is no reason to inherit the hazard when pmm init and
+    // deinit already give us a clean lifetime.
+    struct
+    {
+        struct task_struct *thread;
+        wait_queue_head_t wq;
+
+        // Set by the allocation path when it is about to evict, cleared by the
+        // thread when it wakes. An atomic rather than a lock because the writer
+        // is the fault path and must not block on the evictor.
+        atomic_t wake;
+    } proactive_evict;
 } uvm_pmm_gpu_t;
 
 // Return containing GPU

@@ -1540,6 +1540,48 @@ typedef struct
     // than re-scope the lock.
     atomic64_t n_channel_pool_lock_acqs;
 
+    // The rest of the push path, so that every microsecond of a copy is
+    // attributed. Campaign 20260909_214512 split ns_svc_copy at the two
+    // block_copy_resident_pages boundaries and found the channel reservation is
+    // only 3.479 us of a 6.518 us begin: 68% of a 10.843 us/mig copy is NOT the
+    // reservation, against stock's 1.056 us for the whole thing. These four
+    // cover what is left, and they close the account.
+    //
+    // Driver-wide like ns_push_reserve rather than split by cause, because they
+    // sit in the generic push path where the migration cause is not in scope.
+    // Divide by n_push_reserve, the same denominator ns_push_reserve uses.
+    //
+    // wait_other_gpus is the one that can BLOCK: uvm_tracker_wait_for_other_gpus
+    // runs before the reservation and has never been timed, so a wait there has
+    // been landing inside nothing at all.
+    //
+    // acq_tracker is the leading hypothesis for the ~2.7 us unaccounted inside
+    // begin. uvm_push_acquire_tracker walks the tracker and emits one semaphore
+    // acquire per entry, and a worker pool leaves more entries outstanding than
+    // a single servicing thread does, so it should scale with worker count in a
+    // way the reservation does not.
+    atomic64_t ns_push_wait_other_gpus;
+    atomic64_t ns_push_acq_tracker;
+    atomic64_t ns_push_end;
+    atomic64_t ns_copy_tracker_add;
+    atomic64_t n_copy_tracker_add;
+
+    // Evictions taken by the proactive thread rather than by a faulting worker.
+    //
+    // NOT a separate bank: the thread calls the same
+    // pick_and_evict_root_chunk_retry, so these are also inside n_evict_calls
+    // and ns_evict_call. Demand-path evictions are the SUBTRACTION,
+    // n_evict_calls - n_evict_proactive, and that is the number to compare
+    // against ARIADNE's 54 and our 274,999. Splitting the probe instead would
+    // have meant touching the hot demand path to measure a thread that is off by
+    // default.
+    //
+    // ns_evict_proactive is the thread's own time and is NOT wall-relevant: it
+    // runs beside the fault path, so it is reported to show the work happened,
+    // never subtracted from anything.
+    atomic64_t n_evict_proactive;
+    atomic64_t ns_evict_proactive;
+
     // Sub-phases of uvm_va_block_make_resident_copy, in TWO BANKS chosen by the
     // cause argument. That function is shared: eviction reaches it through
     // uvm_va_block_evict_chunks, and fault servicing reaches it through
