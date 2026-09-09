@@ -313,7 +313,20 @@ struct uvm_channel_struct
     // Number of currently on-going gpfifo entries on this channel
     // A new push or control GPFIFO is only allowed to begin on the channel if
     // there is a free GPFIFO entry for it.
-    NvU32 current_gpfifo_count;
+    //
+    // atomic_t rather than NvU32 so the reservation fast path can claim an
+    // entry without taking channel_pool_lock. Every access goes through
+    // atomic_* even on the paths that still hold the lock: mixing a plain
+    // store with a lockless atomic read is what would make the fast path
+    // unsound. See try_claim_channel_atomic() in uvm_channel.c.
+    //
+    // Measured reason: with 21 fault-service workers, push reservation costs
+    // 3.734 us per acquisition against stock's 0.039 and ARIADNE's 0.065, on
+    // an identical 7.02 M pushes. The cost is this pool spinlock, taken once
+    // per channel examined on the "fast" sweep, and it is the largest single
+    // component of the gap. w7 at 110% oversubscription, campaign
+    // 20260909_011427.
+    atomic_t current_gpfifo_count;
 
     // Array of uvm_push_info_t for all pending pushes on the channel
     uvm_push_info_t *push_infos;

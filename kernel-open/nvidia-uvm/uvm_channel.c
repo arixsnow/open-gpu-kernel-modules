@@ -98,8 +98,38 @@ static char *uvm_channel_pushbuffer_loc = UVM_CHANNEL_PUSHBUFFER_LOC_DEFAULT;
 
 static unsigned uvm_channel_ce_num_channels = UVM_CHANNEL_CE_NUM_CHANNELS_DEFAULT;
 
+// Claim a GPFIFO entry with an atomic compare-and-swap instead of taking
+// channel_pool_lock. 0, the default, is stock behaviour.
+//
+// The lock is per POOL, not per channel, and channel_reserve_in_pool's "fast"
+// sweep takes it once per channel examined. With 21 fault-service workers that
+// is the dominant cost in the driver: push reservation measures 3.734 us per
+// acquisition against stock's 0.039 and ARIADNE's 0.065, on an identical
+// 7.02 M pushes and 4.56 M unmapped pages (w7@110, campaign 20260909_011427).
+// Nothing reaches the spin loop - push_reserve_slow_pct is 11.1 against
+// stock's 11.7 - so the whole cost is the fast path's lock.
+//
+// It also explains uvm_channel_ce_num_channels, which we measured and could
+// not account for: more channels means more lock acquisitions per reservation,
+// not more parallelism, so c1 (35.85) beat c2 (36.20) beat c4 (36.51) at
+// w7@150. The knob was never about the copy engine.
+//
+// A false negative here is free: the reservation falls through to the spin
+// loop, which uses the locked claim and succeeds. So every way this can be
+// wrong degrades to today's behaviour rather than to an over-claim.
+static unsigned uvm_channel_lockless_claim = 0;
+
+// How many times the CAS may lose before giving up and letting the locked path
+// handle it. Losing means another thread claimed concurrently, which is the
+// case this exists to serve, so a couple of retries is generous; beyond that
+// the contention is better absorbed by the slow path than by spinning here.
+#define UVM_CHANNEL_LOCKLESS_CLAIM_RETRIES 3
+
 module_param(uvm_channel_num_gpfifo_entries, uint, S_IRUGO);
 module_param(uvm_channel_ce_num_channels, uint, S_IRUGO);
+module_param(uvm_channel_lockless_claim, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_channel_lockless_claim,
+                 "Claim GPFIFO entries with a CAS instead of the pool lock (0 = off, stock).");
 module_param(uvm_channel_gpfifo_loc, charp, S_IRUGO);
 module_param(uvm_channel_gpput_loc, charp, S_IRUGO);
 module_param(uvm_channel_pushbuffer_loc, charp, S_IRUGO);
@@ -188,8 +218,38 @@ static void channel_pool_lock_init(uvm_channel_pool_t *pool)
         uvm_spin_lock_init(&pool->spinlock, order);
 }
 
+// The probe that was missing, and the one the whole lockless-claim change is
+// judged on.
+//
+// ns_push_reserve already times push_reserve_channel end to end - and that IS
+// the channel reservation, since the sema and claim probes sit later in
+// uvm_pushbuffer_begin_push, not inside it. What it could not say is how much
+// of that time is waiting for THIS lock rather than sweeping channels. With
+// the CAS enabled the sweep no longer takes it at all, so this counter is the
+// direct before/after: 7.02 M acquisitions at w7@110 today.
+//
+// COUNTED, NOT TIMED, and the difference is the whole point.
+//
+// Timing it would put an NV_GETTIME and a counter update INSIDE the lock hold,
+// on the hottest lock in the driver, roughly 30-50 ns on a critical section of
+// order 100 ns, 7 M times. That does not merely add overhead: it lengthens the
+// serialised region, so it inflates the arm that takes the lock constantly far
+// more than the arm that barely takes it. Timing this lock would bias the
+// measurement in favour of the lockless claim - the change being tested.
+//
+// The count is also the better signal. ns_push_reserve already times the whole
+// channel reservation, so how much the lock costs is visible there; what it
+// cannot say is whether the CAS path engaged. The acquisition count answers
+// that directly and unambiguously, and a per-CPU counter increment is small
+// enough not to move what it measures.
+//
+// This is the same trap the lock probes hit before, when every one of them was
+// an atomic on a single global struct and the measurement serialised what it
+// measured. The per-CPU banks fixed the sharing; this fixes the placement.
 static void channel_pool_lock(uvm_channel_pool_t *pool)
 {
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_channel_pool_lock_acqs);
+
     if (uvm_channel_pool_uses_mutex(pool))
         uvm_mutex_lock(&pool->mutex);
     else
@@ -308,7 +368,7 @@ static NvU32 channel_get_available_gpfifo_entries(uvm_channel_t *channel)
     available -= 1;
 
     // Remove entries of ongoing pushes
-    available -= channel->current_gpfifo_count;
+    available -= (NvU32)atomic_read(&channel->current_gpfifo_count);
 
     // Remove pending entries
     if (channel->cpu_put >= channel->gpu_get)
@@ -332,6 +392,11 @@ NvU32 uvm_channel_get_available_gpfifo_entries(uvm_channel_t *channel)
     return available;
 }
 
+static bool try_claim_channel_atomic(uvm_channel_t *channel,
+                                     NvU32 num_gpfifo_entries,
+                                     uvm_channel_reserve_type_t reserve_type,
+                                     unsigned max_attempts);
+
 static bool try_claim_channel_locked(uvm_channel_t *channel,
                                      NvU32 num_gpfifo_entries,
                                      uvm_channel_reserve_type_t reserve_type)
@@ -346,8 +411,45 @@ static bool try_claim_channel_locked(uvm_channel_t *channel,
     if (reserve_type == UVM_CHANNEL_RESERVE_WITH_P2P && channel->suspended_p2p)
         return false;
 
+    // With the lockless claim enabled this path MUST claim the same way, and
+    // it is a correctness requirement rather than a tidiness one.
+    //
+    // The sequence below is read-available-then-add, which is atomic against
+    // other lock holders and NOT against a CAS claimer: a lockless claim can
+    // land between the read and the add, and both would take the same entry.
+    // Under stock every claimer held this lock so the window did not exist.
+    // Delegating keeps every claimer on one compare-and-swap, where two
+    // claimers cannot both win - the loser re-reads, recomputes availability
+    // and declines.
+    //
+    // Callers that reach here still hold the pool lock, which is harmless: the
+    // CAS does not need it, and the lock still protects everything else it
+    // protected before.
+    // Not under confidential computing. That path reserves through
+    // channel_reserve_and_lock_in_pool, which holds the channel locked for the
+    // push and carries invariants this change has not audited, and the
+    // lockless sweep never runs there either - channel_reserve_in_pool returns
+    // before it. Leaving both halves on the stock claim keeps that
+    // configuration byte-for-byte unchanged.
+    // UNBOUNDED retries here, unlike the fast sweep. Callers that arrive
+    // through this path treat false as a hard failure: the WLC and LCIC
+    // bring-up turn it into NV_ERR_INVALID_STATE and abort channel manager
+    // creation, and channel_suspend_p2p reserves the entire ring through it.
+    // A bounded CAS would hand them a SPURIOUS false whenever they lost a few
+    // races, which for those callers is a failed GPU initialisation rather
+    // than a retry.
+    //
+    // Unbounded is safe because losing the CAS means another claimer won, so
+    // the system makes progress on every iteration, and the loop still exits
+    // the moment availability genuinely falls short. The fast sweep keeps its
+    // bound because there a false costs nothing - it falls through to the spin
+    // loop, which is the fallback.
+    if (uvm_channel_lockless_claim && !g_uvm_global.conf_computing_enabled)
+        return try_claim_channel_atomic(channel, num_gpfifo_entries, reserve_type, 0);
+
     if (channel_get_available_gpfifo_entries(channel) >= num_gpfifo_entries) {
-        channel->current_gpfifo_count += num_gpfifo_entries;
+        atomic_add(num_gpfifo_entries, &channel->current_gpfifo_count);
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_push_claim_locked);
         claimed = true;
     }
 
@@ -365,6 +467,121 @@ static bool try_claim_channel(uvm_channel_t *channel,
     channel_pool_unlock(channel->pool);
 
     return claimed;
+}
+
+// Claim num_gpfifo_entries without taking channel_pool_lock.
+//
+// Correctness rests on one property, established by the store ordering in
+// uvm_channel_end_push and submit_ctrl_gpfifo: a push is accounted in
+// current_gpfifo_count, or in (cpu_put - gpu_get), or BRIEFLY IN BOTH, but
+// never in neither. So every value this function computes for `available` is
+// less than or equal to the truth, and a claim it grants was really free.
+//
+// The three reads and why each is safe when stale:
+//
+//   current_gpfifo_count  read first, then smp_rmb(). Pairs with the smp_wmb()
+//                         on the release side so that observing the decrement
+//                         implies observing the matching cpu_put advance. This
+//                         is the pairing that rules out the neither-bucket
+//                         window.
+//   cpu_put               stale means SMALLER, which with the ordering above
+//                         can only coincide with an un-decremented count, so
+//                         the push is still counted once.
+//   gpu_get               stale means SMALLER, so `pending` is larger and
+//                         `available` smaller. Conservative on its own.
+//
+// Anything that cannot be true is treated as "not free" rather than reasoned
+// about: a negative count, or the two accountings summing past the ring. That
+// converts any error in the reasoning above into a fallback to the locked
+// path, which is why this is safe to land before it is safe to trust.
+// max_attempts of 0 means retry until the claim either succeeds or fails on
+// genuine availability. See the call in try_claim_channel_locked for why the
+// two callers need different answers to "what does losing a CAS mean".
+static bool try_claim_channel_atomic(uvm_channel_t *channel,
+                                     NvU32 num_gpfifo_entries,
+                                     uvm_channel_reserve_type_t reserve_type,
+                                     unsigned max_attempts)
+{
+    NvU32 num_entries = channel->num_gpfifo_entries;
+    unsigned attempt;
+
+    UVM_ASSERT(num_gpfifo_entries > 0);
+    UVM_ASSERT(num_gpfifo_entries < num_entries);
+
+    for (attempt = 0; max_attempts == 0 || attempt < max_attempts; attempt++) {
+        int cur = atomic_read(&channel->current_gpfifo_count);
+        NvU32 cpu_put, gpu_get, pending, available;
+
+        smp_rmb();
+
+        // Read AFTER the barrier, not before the loop, and this is not
+        // cosmetic. channel_suspend_p2p reserves the whole ring, sets the
+        // flag, then releases:
+        //
+        //     uvm_channel_reserve(channel, num_gpfifo_entries - 1);
+        //     channel->suspended_p2p = true;
+        //     uvm_channel_release(channel, num_gpfifo_entries - 1);
+        //
+        // The mutual exclusion is the full reservation, not the pool lock, and
+        // this function honours it for free: availability comes from the same
+        // counter, so it reads zero while the ring is held and the claim
+        // declines. What the pool lock did provide is ORDERING for the flag
+        // afterwards - a locked claimer that takes the lock after the release
+        // is guaranteed to see the store. A lockless claimer has no such
+        // acquire, so the read is placed after the smp_rmb() that pairs with
+        // the release side, and re-read on every attempt rather than hoisted.
+        if (reserve_type == UVM_CHANNEL_RESERVE_WITH_P2P && READ_ONCE(channel->suspended_p2p))
+            return false;
+
+        cpu_put = READ_ONCE(channel->cpu_put);
+        gpu_get = READ_ONCE(channel->gpu_get);
+
+        if (cpu_put >= gpu_get)
+            pending = cpu_put - gpu_get;
+        else
+            pending = cpu_put + num_entries - gpu_get;
+
+        // The sanity gate. Under the pool lock these cannot happen and the
+        // stock code carries a UVM_ASSERT for the second, which release builds
+        // compile out - the reason this is a live test and not an assert.
+        // UVM_ASSERT_RELEASE is compiled IN, so a develop or an assert-enabled
+        // release build reports it rather than silently falling back forever.
+        // A negative count is genuinely impossible - every push adds before it
+        // decrements - so it is worth reporting. UVM_ASSERT_RELEASE is
+        // compiled into release builds, unlike UVM_ASSERT.
+        UVM_ASSERT_RELEASE(cur >= 0);
+
+        // The two accountings summing past the ring is NOT an error and must
+        // NOT assert. It is the over-counting window this design deliberately
+        // creates: between `cpu_put = new_cpu_put` and the atomic_dec, a push
+        // is in BOTH buckets, and with several threads in that window at once
+        // the sum legitimately exceeds the ring. Asserting here would fire
+        // under ordinary load, and UVM_ASSERT_RELEASE can call
+        // uvm_global_set_fatal_error, which would take the driver down for
+        // the mechanism working as intended.
+        //
+        // Bailing is the correct response either way: too many entries look
+        // taken, so nothing is free, so decline. That is the conservative
+        // direction, and it is also what a genuine corruption would produce,
+        // which is why this stays a live test rather than an assertion.
+        if (cur < 0 || (NvU32)cur + pending + 1 > num_entries)
+            return false;
+
+        available = num_entries - 1 - (NvU32)cur - pending;
+
+        if (available < num_gpfifo_entries)
+            return false;
+
+        if (atomic_cmpxchg(&channel->current_gpfifo_count, cur, cur + (int)num_gpfifo_entries) == cur) {
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_push_claim_atomic);
+            return true;
+        }
+
+        // Lost the race. Someone else claimed, so re-read and try again.
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_push_claim_cas_retry);
+    }
+
+    return false;
 }
 
 static void unlock_channel_for_push(uvm_channel_t *channel)
@@ -624,7 +841,20 @@ static NV_STATUS channel_reserve_in_pool(uvm_channel_pool_t *pool,
 
     uvm_for_each_channel_in_pool(channel, pool) {
         // TODO: Bug 1764953: Prefer idle/less busy channels
-        if (try_claim_channel(channel, 1, reserve_type)) {
+        //
+        // The lockless claim replaces the locked one here rather than being
+        // tried before it. Trying both would take the pool lock on exactly the
+        // reservations the CAS failed to serve, which is the contended case
+        // this exists to avoid. A false negative instead falls through to the
+        // spin loop below, where try_claim_channel still holds the lock, so
+        // the locked path remains the fallback for everything.
+        if (uvm_channel_lockless_claim) {
+            if (try_claim_channel_atomic(channel, 1, reserve_type, UVM_CHANNEL_LOCKLESS_CLAIM_RETRIES)) {
+                *channel_out = channel;
+                return NV_OK;
+            }
+        }
+        else if (try_claim_channel(channel, 1, reserve_type)) {
             *channel_out = channel;
             return NV_OK;
         }
@@ -1594,8 +1824,7 @@ void uvm_channel_end_push(uvm_push_t *push)
     entry->push_info = &channel->push_infos[push->push_info_index];
     entry->type = UVM_GPFIFO_ENTRY_TYPE_NORMAL;
 
-    UVM_ASSERT(channel->current_gpfifo_count > 0);
-    --channel->current_gpfifo_count;
+    UVM_ASSERT(atomic_read(&channel->current_gpfifo_count) > 0);
 
     if (uvm_channel_is_proxy(channel)) {
         proxy_channel_submit_work(push, push_size);
@@ -1617,7 +1846,36 @@ void uvm_channel_end_push(uvm_push_t *push)
         internal_channel_submit_work(push, push_size, new_cpu_put);
     }
 
+    // ORDER IS LOAD-BEARING, and it is the whole reason the reservation fast
+    // path may run without channel_pool_lock.
+    //
+    // A push is accounted in exactly one of two places: current_gpfifo_count
+    // while it is claimed but not submitted, and (cpu_put - gpu_get) once it
+    // is submitted. channel_get_available_gpfifo_entries subtracts both. This
+    // is the moment the push moves from the first to the second, and stock did
+    // it in the opposite order - decrement first, then advance cpu_put - which
+    // leaves a window where the push is in NEITHER. No reader could observe
+    // that window because every reader held the pool lock this function also
+    // holds. A lockless reader can, and it would see too many entries free and
+    // over-claim the ring.
+    //
+    // Advancing cpu_put FIRST makes the window over-count instead: the push is
+    // briefly in both, so a lockless reader sees FEWER entries free than there
+    // really are. Conservative in the only direction that matters.
+    //
+    // smp_wmb() pairs with the smp_rmb() in try_claim_channel_atomic(). It
+    // orders the cpu_put store before the decrement so that a reader which
+    // sees the decremented count is guaranteed to see the advanced cpu_put.
+    // Without it the compiler or the CPU may expose the decrement first and
+    // reopen exactly the window this reordering closes.
+    //
+    // Both stores are still made under the pool lock, so nothing about the
+    // locked paths changes.
     channel->cpu_put = new_cpu_put;
+
+    smp_wmb();
+
+    atomic_dec(&channel->current_gpfifo_count);
 
     uvm_pushbuffer_end_push(pushbuffer, push, entry);
 
@@ -1755,12 +2013,18 @@ static void write_ctrl_gpfifo(uvm_channel_t *channel, NvU64 ctrl_fifo_entry_valu
     // GPFIFO entry has been processed is accomplished.
     entry->tracking_semaphore_value = channel->tracking_sem.queued_value + 1;
 
-    UVM_ASSERT(channel->current_gpfifo_count > 1);
-    --channel->current_gpfifo_count;
+    UVM_ASSERT(atomic_read(&channel->current_gpfifo_count) > 1);
 
     submit_ctrl_gpfifo(channel, entry, new_cpu_put);
 
+    // Same ordering as uvm_channel_end_push, for the same reason: advance
+    // cpu_put before releasing the claim so the window over-counts rather than
+    // under-counts for a lockless reader. See the comment there.
     channel->cpu_put = new_cpu_put;
+
+    smp_wmb();
+
+    atomic_dec(&channel->current_gpfifo_count);
 
     // The moment the channel is unlocked uvm_channel_update_progress_with_max()
     // may notice the GPU work to be completed and hence all state tracking the
@@ -1936,9 +2200,12 @@ void uvm_channel_release(uvm_channel_t *channel, NvU32 num_gpfifo_entries)
 
     unlock_channel_for_push(channel);
 
-    UVM_ASSERT(channel->current_gpfifo_count >= num_gpfifo_entries);
+    UVM_ASSERT(atomic_read(&channel->current_gpfifo_count) >= (int)num_gpfifo_entries);
 
-    channel->current_gpfifo_count -= num_gpfifo_entries;
+    // No cpu_put transition here - this is a claim abandoned without being
+    // submitted, so it leaves the accounting entirely. A lockless reader that
+    // sees the decrement sees MORE entries free, which is exactly true.
+    atomic_sub(num_gpfifo_entries, &channel->current_gpfifo_count);
     channel_pool_unlock(channel->pool);
 }
 
