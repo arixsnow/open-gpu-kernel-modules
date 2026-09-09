@@ -2846,31 +2846,26 @@ static void proactive_evict_wake(uvm_pmm_gpu_t *pmm)
     wake_up(&pmm->proactive_evict.wq);
 }
 
-static int proactive_evict_thread(void *arg)
+// One wake's worth of work. Split out from the thread loop so the caller can
+// wrap it in UVM_ENTRY_VOID: everything below takes pmm->lock, and UVM's lock
+// tracking resolves the CURRENT THREAD's context to record the acquisition. A
+// kthread has no context until one is registered, so an unwrapped version of
+// this function dereferenced NULL inside thread_context_lock_of and oopsed the
+// box (2026-09-10). uvm_thread_context() documents the rule on its assertion:
+// an entry point into the module that is not wrapped with a UVM_ENTRY_X macro.
+//
+// This is also the correction to a claim made while writing this thread. The
+// PMA eviction callback was cited as proof that the eviction path is safe from
+// a non-fault thread; it is, but only because uvm_pmm_gpu_pma_evict_range is
+// itself wrapped in UVM_ENTRY_RET at line 3289. The call site was read and the
+// wrapper was not.
+static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
 {
-    uvm_pmm_gpu_t *pmm = (uvm_pmm_gpu_t *)arg;
+    NvU32 target = uvm_perf_evict_proactive;
+    NvU32 budget;
+    NvU64 t0 = uvm_lock_probe_begin();
 
-    while (!kthread_should_stop()) {
-        NvU32 target = uvm_perf_evict_proactive;
-        NvU32 budget;
-        NvU64 t0;
-
-        // A timeout as well as a wake, so the reserve is rebuilt even in a lull
-        // where nothing is allocating and nothing rings the doorbell. Without it
-        // the thread would only ever run just after a demand eviction, which is
-        // the case it exists to prevent.
-        wait_event_interruptible_timeout(pmm->proactive_evict.wq,
-                                         kthread_should_stop() ||
-                                             atomic_read(&pmm->proactive_evict.wake),
-                                         msecs_to_jiffies(10));
-
-        if (kthread_should_stop())
-            break;
-
-        atomic_set(&pmm->proactive_evict.wake, 0);
-
-        t0 = uvm_lock_probe_begin();
-
+    {
         // BOUNDED at the reserve size, and the bound is not cosmetic. free_chunk
         // calls free_next_available_root_chunk on every root-chunk free, which
         // hands one back to PMA - so ordinary frees drain the reserve while this
@@ -2892,11 +2887,20 @@ static int proactive_evict_thread(void *arg)
             // n_evict_calls and ns_evict_call. n_evict_proactive is what
             // separates them; demand-path evictions are the subtraction.
             //
-            // uvm_mutex_lock and not pmm_lock: pmm_lock records
+            // uvm_mutex_lock and not pmm_lock, so this acquisition stays out of
             // ns_pmm_lock_wait, which exists to say whether the FAULT PATH
-            // serialises on PMM. Folding a background thread into it would
-            // corrupt the one counter used to answer that question - it is how
-            // we established that eviction parallelises rather than serialising.
+            // serialises on PMM.
+            //
+            // That only half works and the limit is worth stating. Inside,
+            // evict_root_chunk_from_va_block drops pmm->lock to take the block
+            // lock and re-takes it with pmm_lock(), which IS probed. So on a v
+            // arm ns_pmm_lock_wait and n_pmm_lock_acqs do carry some of this
+            // thread. The contamination is bounded and identifiable -
+            // n_evict_proactive counts exactly how many such re-acquisitions
+            // happened - but share_pmm_wait_pct is no longer a pure fault-path
+            // reading once the reserve thread is running, and the comparison
+            // that established eviction parallelises has to be made against a
+            // v=0 arm.
             uvm_mutex_lock(&pmm->lock);
             status = pick_and_evict_root_chunk_retry(pmm,
                                                      UVM_PMM_GPU_MEMORY_TYPE_USER,
@@ -2931,6 +2935,36 @@ static int proactive_evict_thread(void *arg)
         }
 
         uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_proactive, NULL);
+    }
+}
+
+static int proactive_evict_thread(void *arg)
+{
+    uvm_pmm_gpu_t *pmm = (uvm_pmm_gpu_t *)arg;
+
+    while (!kthread_should_stop()) {
+        // A timeout as well as a wake, so the reserve is rebuilt even in a lull
+        // where nothing is allocating and nothing rings the doorbell. Without it
+        // the thread would only ever run just after a demand eviction, which is
+        // the case it exists to prevent.
+        //
+        // The wait sits OUTSIDE the UVM_ENTRY_VOID below on purpose: the thread
+        // context is a stack wrapper registered in a fixed-size table, so it is
+        // held only while there is work to do and never across a sleep.
+        wait_event_interruptible_timeout(pmm->proactive_evict.wq,
+                                         kthread_should_stop() ||
+                                             atomic_read(&pmm->proactive_evict.wake),
+                                         msecs_to_jiffies(10));
+
+        if (kthread_should_stop())
+            break;
+
+        atomic_set(&pmm->proactive_evict.wake, 0);
+
+        // The wrapper that was missing. Same shape as process_lazy_free_entry
+        // and the two PMA eviction callbacks, which are the other places UVM is
+        // entered from a thread it did not create.
+        UVM_ENTRY_VOID(proactive_evict_work(pmm));
     }
 
     return 0;
