@@ -1210,12 +1210,6 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_push_reserve_slow));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_push_reserve_spins     %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_push_reserve_spins));
-    UVM_SEQ_OR_DBG_PRINT(s, "n_push_claim_locked       %llu\n",
-                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_push_claim_locked));
-    UVM_SEQ_OR_DBG_PRINT(s, "n_push_claim_atomic       %llu\n",
-                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_push_claim_atomic));
-    UVM_SEQ_OR_DBG_PRINT(s, "n_push_claim_cas_retry    %llu\n",
-                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_push_claim_cas_retry));
     UVM_SEQ_OR_DBG_PRINT(s, "n_channel_pool_lock_acqs  %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_channel_pool_lock_acqs));
     UVM_SEQ_OR_DBG_PRINT(s, "ns_evict_unmap            %llu\n",

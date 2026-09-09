@@ -1526,59 +1526,18 @@ typedef struct
     atomic64_t n_push_reserve_slow;
     atomic64_t ns_push_reserve_spins;
 
-    // Which claim served each reservation, and what the lockless one cost.
-    // uvm_channel_lockless_claim replaces the pool lock on the fast sweep with
-    // a CAS; these say whether it engaged and whether the contention simply
-    // moved from a spinlock to a CAS loop.
+    // How often a channel lock is taken - the pool's, or the channel's own
+    // when uvm_channel_per_channel_lock is set. COUNTED, NEVER TIMED: an
+    // NV_GETTIME inside the hold of the hottest lock in the driver would
+    // lengthen the serialised region and inflate whichever arm takes the lock
+    // most, biasing the comparison. The increment sits before the acquisition
+    // so it adds nothing to the hold.
     //
-    //   n_push_claim_locked     served by try_claim_channel, holding
-    //                           channel_pool_lock. This is every reservation
-    //                           when the knob is off.
-    //   n_push_claim_atomic     served by try_claim_channel_atomic with no
-    //                           lock. Against n_push_reserve this is the hit
-    //                           rate, and a low one means the change did not
-    //                           engage rather than did not help - the
-    //                           distinction the eviction policy shipped
-    //                           without and could only be recovered from
-    //                           ns_evict_pick by inference.
-    //   n_push_claim_cas_retry  CAS attempts lost to a concurrent claimer.
-    //                           Per atomic claim this is the new contention.
-    //                           If it tracks worker count the way the pool
-    //                           lock did, the cost changed shape and did not
-    //                           go away.
-    //
-    // Counted by PRIMITIVE, at the point the claim succeeds, not by the path
-    // that reached it. That distinction matters because with the knob on
-    // try_claim_channel_locked delegates to the CAS, so a claim can arrive
-    // through the locked path and still be atomic; counting at the call site
-    // would label those "locked" and make the ratio a lie.
-    //
-    // The consequence is that the sum is every successful claim in the driver,
-    // not only the push path: uvm_channel_reserve and the WLC and LCIC
-    // bring-up are included. So atomic + locked >= n_push_reserve, and the
-    // ratio answers "which primitive served claims", which is the question.
-    // A declined claim is counted nowhere and simply falls to the spin loop.
-    atomic64_t n_push_claim_locked;
-    atomic64_t n_push_claim_atomic;
-    atomic64_t n_push_claim_cas_retry;
-
-    // How often channel_pool_lock is taken. COUNTED, NEVER TIMED.
-    //
-    // Timing it would place an NV_GETTIME inside the hold of the hottest lock
-    // in the driver, lengthening the serialised region, which inflates the arm
-    // that takes the lock constantly far more than the arm that avoids it -
-    // biasing the measurement toward the lockless claim it is meant to judge.
-    // See the comment on channel_pool_lock().
-    //
-    // ns_push_reserve already carries the time, at 3.734 us per acquisition
-    // against stock's 0.039. What it cannot say is whether the CAS path
-    // engaged, and this count answers that directly: with the knob on, the
-    // reservation sweep stops taking the lock and the count drops.
-    //
-    // Every pool lock is counted, not only the reservation path, so the count
-    // exceeds n_push_reserve. Deliberate: uvm_channel_end_push and
-    // uvm_channel_update_progress take it too, and if the reservation stops
-    // contending while those still do, this is where that shows.
+    // Under the per-channel lock this count is the CONTROL, not the result.
+    // The same number of acquisitions happen, spread over more locks, so it
+    // should NOT move; what moves is push_reserve_us_per_acq, which is the
+    // waiting. A count that falls would mean the change did something other
+    // than re-scope the lock.
     atomic64_t n_channel_pool_lock_acqs;
 
     // Sub-phases of uvm_va_block_make_resident_copy, in TWO BANKS chosen by the

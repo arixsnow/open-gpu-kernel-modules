@@ -631,7 +631,11 @@ void uvm_pushbuffer_end_push(uvm_pushbuffer_t *pushbuffer, uvm_push_t *push, uvm
 
     chunk = gpfifo_to_chunk(pushbuffer, gpfifo);
 
-    uvm_channel_pool_assert_locked(push->channel->pool);
+    // The lock that guards this channel's state, which is the channel's own
+    // when uvm_channel_per_channel_lock is set and the pool's otherwise.
+    // Naming the pool here would assert on a lock nobody holds in the
+    // per-channel regime - this is the only such assert outside uvm_channel.c.
+    uvm_channel_assert_locked(push->channel);
 
     uvm_spin_lock(&pushbuffer->lock);
 

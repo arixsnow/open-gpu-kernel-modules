@@ -72,6 +72,23 @@
         uvm_assert_spinlock_locked(&(pool)->spinlock);  \
 })
 
+// Whichever lock actually guards this channel's state, per
+// uvm_channel_per_channel_lock. Every site that previously asserted the pool
+// lock while touching only one channel uses this instead, so the assertion
+// follows the lock rather than naming one of the two regimes.
+#define uvm_channel_assert_locked(channel) (                        \
+{                                                                   \
+    if (uvm_channel_uses_per_channel_lock(channel)) {               \
+        if (uvm_channel_pool_uses_mutex((channel)->pool))           \
+            uvm_assert_mutex_locked(&(channel)->chan_lock.mutex);   \
+        else                                                        \
+            uvm_assert_spinlock_locked(&(channel)->chan_lock.spinlock); \
+    }                                                               \
+    else {                                                          \
+        uvm_channel_pool_assert_locked((channel)->pool);            \
+    }                                                               \
+})
+
 // Channel types
 typedef enum
 {
@@ -290,6 +307,34 @@ struct uvm_channel_struct
     // Owning pool
     uvm_channel_pool_t *pool;
 
+    // Per-channel lock, used instead of the pool lock when
+    // uvm_channel_per_channel_lock is set. Same union shape as the pool's, for
+    // the same reason: proxy channels submit through an RM API that takes a
+    // mutex, so they cannot use a spinlock.
+    //
+    // The pool lock is per POOL but almost everything it guards is per CHANNEL.
+    // Of its fourteen call sites, ELEVEN pass channel->pool and touch exactly
+    // one channel's state - cpu_put, gpu_get, current_gpfifo_count,
+    // gpfifo_entries, push_infos. Only three need pool scope, and both of those
+    // functions assert g_uvm_global.conf_computing_enabled.
+    //
+    // So one lock serialises every channel in the pool for no reason the data
+    // requires. With 21 fault-service workers that lock IS the cost: push
+    // reservation measures 3.734 us per acquisition against stock's 0.039 and
+    // ARIADNE's 0.065, on an identical 7.02 M pushes (w7@110, campaign
+    // 20260909_011427).
+    //
+    // It also explains uvm_channel_ce_num_channels, which we measured and could
+    // not account for: more channels means more acquisitions of the SAME lock,
+    // not more parallelism, so fewer was better - c1 35.85, c2 36.20, c4 36.51
+    // at w7@150. With a per-channel lock that ordering should invert, which is
+    // how this change gets falsified.
+    union
+    {
+        uvm_spinlock_t spinlock;
+        uvm_mutex_t mutex;
+    } chan_lock;
+
     // The channel name contains the CE index, and (for UVM internal channels)
     // the HW runlist and channel IDs.
     char name[64];
@@ -313,20 +358,7 @@ struct uvm_channel_struct
     // Number of currently on-going gpfifo entries on this channel
     // A new push or control GPFIFO is only allowed to begin on the channel if
     // there is a free GPFIFO entry for it.
-    //
-    // atomic_t rather than NvU32 so the reservation fast path can claim an
-    // entry without taking channel_pool_lock. Every access goes through
-    // atomic_* even on the paths that still hold the lock: mixing a plain
-    // store with a lockless atomic read is what would make the fast path
-    // unsound. See try_claim_channel_atomic() in uvm_channel.c.
-    //
-    // Measured reason: with 21 fault-service workers, push reservation costs
-    // 3.734 us per acquisition against stock's 0.039 and ARIADNE's 0.065, on
-    // an identical 7.02 M pushes. The cost is this pool spinlock, taken once
-    // per channel examined on the "fast" sweep, and it is the largest single
-    // component of the gap. w7 at 110% oversubscription, campaign
-    // 20260909_011427.
-    atomic_t current_gpfifo_count;
+    NvU32 current_gpfifo_count;
 
     // Array of uvm_push_info_t for all pending pushes on the channel
     uvm_push_info_t *push_infos;
@@ -579,6 +611,15 @@ static bool uvm_channel_is_ce(uvm_channel_t *channel)
 }
 
 bool uvm_channel_pool_uses_mutex(uvm_channel_pool_t *pool);
+
+// True when this channel's own lock guards its state, rather than the pool's.
+//
+// Never true under confidential computing: channel_reserve_and_lock_in_pool and
+// channel_reserve_and_lock hold the POOL lock across a sweep of every channel,
+// which a per-channel lock cannot express. Those two are the only pool-scoped
+// users, and both assert conf_computing_enabled, so the two regimes are
+// mutually exclusive by construction and never mix within one boot.
+bool uvm_channel_uses_per_channel_lock(uvm_channel_t *channel);
 
 // Proxy channels are used to push page tree related methods, so their channel
 // type is UVM_CHANNEL_TYPE_MEMOPS.
