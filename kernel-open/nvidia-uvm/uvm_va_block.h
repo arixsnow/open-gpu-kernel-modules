@@ -446,6 +446,23 @@ struct uvm_va_block_struct
     //       how noticeable this memory overhead actually is.
     uvm_va_block_gpu_state_t *gpus[UVM_ID_MAX_GPUS];
 
+    // Value of the fault buffer's replay_epoch when this block was last
+    // serviced. Written under the block lock in service_fault_batch_block and
+    // read there too, so a plain field rather than an atomic.
+    //
+    // Diagnostic only. It exists to split n_fault_authorized into faults a
+    // previous batch already serviced and faults a concurrent worker serviced
+    // inside this one, because only the first kind is reachable by a
+    // cross-batch dedup filter. See the authorized check in
+    // service_fault_batch_block_locked.
+    //
+    // Zero from nv_kmem_cache_zalloc, and replay_epoch also starts at zero, so
+    // a block mapped by something other than fault servicing (a user prefetch,
+    // say) and then faulted-on during the very first epoch reads as in-batch.
+    // Bounded to that one epoch out of tens of thousands, which is below the
+    // resolution of what this is for.
+    NvU64 service_epoch;
+
     // Mask to keep track of the pages that are read-duplicate
     uvm_page_mask_t read_duplicated_pages;
 

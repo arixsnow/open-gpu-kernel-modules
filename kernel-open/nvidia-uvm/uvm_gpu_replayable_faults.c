@@ -85,6 +85,27 @@ module_param(uvm_perf_fault_batch_count, uint, S_IRUGO);
 static uvm_perf_fault_replay_policy_t uvm_perf_fault_replay_policy = UVM_PERF_FAULT_REPLAY_POLICY_DEFAULT;
 module_param(uvm_perf_fault_replay_policy, uint, S_IRUGO);
 
+// Minimum microseconds between replays issued by the servicing loop. 0 is off
+// and is stock: no branch on any path changes behaviour.
+//
+// Designed in notes/34 (2026-07-16) off a pre-registered falsification, and
+// confirmed by stage_2 campaign 20260713_231043 before being built. See
+// uvm_gpu.h for the measurements. In one line: a replay makes every stalled
+// warp retry, a warp whose page is not resident re-faults, and under
+// BATCH_FLUSH there is one replay per batch - so replay frequency sets the
+// re-fault rate, and a worker pool replays far more often than the serial path
+// because its batches are faster.
+//
+// Deliberately NOT uvm_perf_fault_batch_count. Raising the batch cap also cuts
+// replays, and it does cut faults 34.5% on w7@110, but it feeds the prefetcher
+// a bigger batch per migration decision and costs 52% more per fault, so the
+// product does not move. Holding the batch at 256 and spacing only the replays
+// is the separation this knob exists to make.
+static unsigned uvm_perf_fault_service_replay_min_interval_us = 0;
+module_param(uvm_perf_fault_service_replay_min_interval_us, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_fault_service_replay_min_interval_us,
+                 "Minimum gap in microseconds between servicing-loop fault replays (0 = off, stock).");
+
 // Ceiling on the pinned pool width. This is a policy cap, not a structural
 // one: the worker array is allocated from it at fault buffer init and the only
 // fixed-size object that depends on it is the load array in
@@ -532,6 +553,14 @@ static NV_STATUS fault_buffer_init_replayable_faults(uvm_parent_gpu_t *parent_gp
                        replayable_faults->replay_policy);
     }
 
+    // Latched once here rather than read per batch, same as the policy above.
+    // last_replay_ns starts at 0, so the first batch of a pass always replays:
+    // NV_GETTIME() - 0 exceeds any interval, which is the behaviour we want -
+    // the gate spaces replays, it never delays the first one.
+    replayable_faults->service_replay_min_interval_ns =
+        (NvU64)uvm_perf_fault_service_replay_min_interval_us * 1000;
+    replayable_faults->last_replay_ns = 0;
+
     replayable_faults->replay_update_put_ratio = min(uvm_perf_fault_replay_update_put_ratio, 100u);
     if (replayable_faults->replay_update_put_ratio != uvm_perf_fault_replay_update_put_ratio) {
         UVM_INFO_PRINT("Invalid uvm_perf_fault_replay_update_put_ratio value on GPU %s: %u. Using %u instead\n",
@@ -864,6 +893,17 @@ static NV_STATUS push_replay_on_gpu(uvm_gpu_t *gpu,
     // way, which is the whole of what the epoch records. Counting them cannot
     // protect a chunk for longer, only release it sooner.
     atomic64_inc(&replayable_faults->replay_epoch);
+
+    // Stamped HERE and not at the two gated call sites, because this is the
+    // single funnel every replay passes through: the loop's batch replays, the
+    // replays inside fault_buffer_flush_locked, and cancel replays. So the
+    // interval gate can never be fooled into skipping because it did not notice
+    // a replay that went out on an ungated path.
+    //
+    // Unconditional, like the epoch above. A replay that was not requested by
+    // the servicing loop still made every stalled warp retry, which is exactly
+    // the event the gate is spacing.
+    replayable_faults->last_replay_ns = NV_GETTIME();
 
     // Add this push to the GPU's replay_tracker so cancel can wait on it.
     status = uvm_tracker_add_push_safe(&replayable_faults->replay_tracker, &push);
@@ -1861,6 +1901,28 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             // distinguishes a fault that moved data from one that did not.
             uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized);
 
+            // Split the authorized count by WHO already did the work, which is
+            // what decides whether a cross-batch dedup filter is worth
+            // building. Measurement only - nothing below acts on it.
+            //
+            //   xbatch: the block was last serviced in an EARLIER epoch, so a
+            //           filter carrying recently-serviced addresses across
+            //           batches would have dropped this entry before the block
+            //           lookup and the block lock.
+            //   inbatch: the block was serviced in THIS epoch, by this worker
+            //           or a sibling. A cross-batch filter cannot see it, and
+            //           only within-batch coordination could.
+            //
+            // A high xbatch share justifies the filter. A high inbatch share
+            // says the redundancy is the worker pool racing itself inside one
+            // batch, which is a different fix entirely, and it would explain
+            // why auth% is 6.47 at zero workers and 45.95 at twenty-one.
+            if (va_block->service_epoch ==
+                atomic64_read(&gpu->parent->fault_buffer.replayable.replay_epoch))
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_inbatch);
+            else
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_xbatch);
+
             // Not gated on the stats level: this one drives the flush-mode
             // decision below, not a report, so it has to be counted in every
             // build. atomic because parallel workers reach it concurrently.
@@ -2042,6 +2104,20 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
                                                                         block_faults));
 
     tracker_status = uvm_tracker_add_tracker_safe(tracker, &va_block->tracker);
+
+    // Stamp the block with the epoch it was serviced in, so the authorized
+    // check in service_fault_batch_block_locked can tell WHICH batch already
+    // did the work. Under the block lock, and a plain store because that lock
+    // is also held by every reader.
+    //
+    // replay_epoch advances once per replay and BATCH_FLUSH replays once per
+    // batch, so within a batch it is constant and equality means "this batch".
+    // That is the whole distinction a cross-batch dedup filter turns on:
+    // authorized because a PREVIOUS batch serviced the page (a filter would
+    // drop it) against authorized because a CONCURRENT WORKER serviced it in
+    // this batch (a cross-batch filter is useless against it). 45.95% of our
+    // faults at w7@110 arrive authorized and nothing measures the split.
+    va_block->service_epoch = atomic64_read(&gpu_va_space->gpu->parent->fault_buffer.replayable.replay_epoch);
 
     uvm_mutex_unlock(&va_block->lock);
 
@@ -4532,6 +4608,13 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
     NvU64 time_stamp;
     NV_STATUS status = NV_OK;
 
+    // Replay interval gate. replay_gated is per batch; replay_owed persists
+    // across the pass and is what the pass-exit replay tests, so a skipped
+    // batch can never leave the bottom half with serviced-but-unreplayed
+    // faults. Both are dead unless the interval is non-zero.
+    bool replay_gated = false;
+    bool replay_owed = false;
+
     // Batches whose replay has been pushed but not waited on. Was a bool, which
     // is the same thing with no upper bound; the count is what lets
     // uvm_perf_fault_service_max_inflight cap how far population may run ahead
@@ -4696,13 +4779,51 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         if (uvm_dynzero_enable)
             zc_pin_from_pressure(parent_gpu);
 
-        if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
+        // The replay interval gate. Zero is off and no arm of this expression
+        // runs, so the stock path is unchanged down to the branch.
+        //
+        // Both policy branches below issue a replay, and a replay makes every
+        // stalled warp retry - including warps whose page is still in flight,
+        // which then re-fault. Spacing the replays is therefore spacing the
+        // re-faults. notes/34 and uvm_gpu.h carry the measurement.
+        //
+        // replay_owed makes the skip safe rather than a dropped replay: the
+        // pass-exit replay below fires on it, so serviced faults are never left
+        // unreplayed when the loop ends. Within a pass, a skipped batch is
+        // covered by the next batch's replay once the interval elapses.
+        replay_gated = replayable_faults->service_replay_min_interval_ns != 0 &&
+                       (NvU64)(NV_GETTIME() - replayable_faults->last_replay_ns) <
+                           replayable_faults->service_replay_min_interval_ns;
+
+        if (replay_gated) {
+            replay_owed = true;
+
+            // Debug-gated like stats.num_replays in push_replay_on_gpu, because
+            // the two are only meaningful as a pair - num_replays reads 0
+            // without debug procfs, so an ungated skip count would give a
+            // spacing ratio computed against nothing. The runner always loads
+            // with uvm_enable_debug_procfs=1.
+            if (uvm_procfs_is_debug_enabled())
+                ++replayable_faults->stats.num_replays_skipped;
+
+            // NOTE, pre-registered in notes/34: under BATCH_FLUSH this skips
+            // the buffer flush as well as the replay, because
+            // fault_buffer_flush_locked always pushes one and there is no
+            // flush-without-replay variant. So the gate does two things at
+            // once - it stops new faults being raised, which is the point, and
+            // it retains stale entries the flush would have discarded, which
+            // works against it. Net effect is a measurement, not a deduction,
+            // and it is what the m<us> sweep is for. If faults do not fall,
+            // this is the first thing to suspect.
+        }
+        else if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
             time_stamp = NV_GETTIME();
             status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
             replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
             ++num_replays;
+            replay_owed = false;
         }
         else if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH_FLUSH) {
             uvm_gpu_buffer_flush_mode_t flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_CACHED_PUT;
@@ -4728,6 +4849,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             if (status != NV_OK)
                 break;
             ++num_replays;
+            replay_owed = false;
 
             // The replay push acquired the batch tracker, so the GPU already
             // orders it after every migration of this batch. Pipelined mode
@@ -4773,8 +4895,17 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
     // Make sure that we issue at least one replay if no replay has been
     // issued yet to avoid dropping faults that do not show up in the buffer
+    //
+    // replay_owed extends the same guarantee to the interval gate, and it is
+    // what makes a skipped replay a DEFERRED one rather than a dropped one. A
+    // warp whose fault was serviced stays stalled until a replay reaches the
+    // GMMU and raises no further interrupt by itself, so a serviced batch whose
+    // replay was skipped must not be allowed to end the pass unreplayed. The
+    // added stall is bounded by one pass, which is itself bounded by
+    // uvm_perf_fault_max_batches_per_service, the throttle cap, or an empty
+    // buffer. notes/34 carries the full no-hang argument.
     if ((status == NV_OK && replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_ONCE) ||
-        num_replays == 0) {
+        num_replays == 0 || replay_owed) {
         time_stamp = NV_GETTIME();
         status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
         replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;

@@ -510,6 +510,34 @@ typedef struct
         // and GPU removal
         uvm_tracker_t replay_tracker;
 
+        // Minimum gap between replays issued by the servicing loop, latched
+        // from uvm_perf_fault_service_replay_min_interval_us at init so the hot
+        // path reads one field. 0 disables the gate entirely, which is stock.
+        //
+        // Why this exists (notes/34, and measured in stage_2 campaign
+        // 20260713_231043): a replay makes every stalled warp retry, and a warp
+        // whose page is not yet resident re-faults. Under BATCH_FLUSH there is
+        // one replay per batch, so replay frequency sets the re-fault rate. At
+        // w7@110 the pool raises 6.44 M faults against the serial path's
+        // 3.73 M for the same pages, and 45.95% of them arrive already
+        // serviced. Amplification switches on exactly between one and two
+        // servicing threads (cfg1 3.72 M, cfg2 5.91 M), which is what a
+        // re-fault feedback loop looks like.
+        //
+        // The batch-count proxy already showed the mechanism is real: at 1024
+        // it cut faults 34.5% to 4.22 M and faults per page from 1.919 to
+        // 1.219, with pages moved up only 3.2%. It bought nothing because a
+        // bigger batch costs more per fault (6.43 us to 9.78), so the product
+        // stayed put. THIS knob leaves uvm_perf_fault_batch_count alone, which
+        // is the entire reason it is a separate control.
+        NvU64 service_replay_min_interval_ns;
+
+        // When the last replay was pushed, from push_replay_on_gpu - the single
+        // funnel every replay goes through, including flush and cancel replays.
+        // So the gate below is never fooled by a replay that went out on
+        // another path.
+        NvU64 last_replay_ns;
+
         // Monotonic count of replays pushed for this fault buffer, bumped once
         // per successful push_replay_on_gpu. A root chunk records the value it
         // sees whenever it is touched - populated or mapped
@@ -569,6 +597,16 @@ typedef struct
             NvU64 num_replays;
 
             NvU64 num_replays_ack_all;
+
+            // Batches whose replay the interval gate deferred. Reads as 0 on
+            // every stock arm, so a non-zero value is proof the gate engaged -
+            // which matters because the arm that fails by doing nothing and the
+            // arm that fails by doing the wrong thing need opposite responses.
+            //
+            // num_replays + num_replays_skipped is the batch count the stock
+            // path would have replayed at, so the ratio is the achieved
+            // spacing.
+            NvU64 num_replays_skipped;
 
             // Cumulative servicing pipeline timing and batch counts. Only
             // written from the replayable fault bottom half, which is

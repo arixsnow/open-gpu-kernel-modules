@@ -798,6 +798,8 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
                          parent_gpu->fault_buffer.replayable.stats.num_replays);
     UVM_SEQ_OR_DBG_PRINT(s, "  start_ack_all        %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_replays_ack_all);
+    UVM_SEQ_OR_DBG_PRINT(s, "  skipped              %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_replays_skipped);
     UVM_SEQ_OR_DBG_PRINT(s, "servicing_pipeline:\n");
     UVM_SEQ_OR_DBG_PRINT(s, "  num_batches          %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_batches);
@@ -1280,6 +1282,10 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_va_block_service));
     UVM_SEQ_OR_DBG_PRINT(s, "n_fault_authorized        %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fault_authorized));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_fault_auth_xbatch       %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fault_authorized_xbatch));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_fault_auth_inbatch      %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fault_authorized_inbatch));
     UVM_SEQ_OR_DBG_PRINT(s, "n_fault_upgrade           %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fault_upgrade));
     UVM_SEQ_OR_DBG_PRINT(s, "n_fault_serviced          %llu\n",

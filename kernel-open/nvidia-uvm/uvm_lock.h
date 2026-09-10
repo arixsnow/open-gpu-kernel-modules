@@ -1582,6 +1582,27 @@ typedef struct
     atomic64_t n_evict_proactive;
     atomic64_t ns_evict_proactive;
 
+    // n_fault_authorized split by WHICH servicing already did the work. These
+    // two sum to n_fault_authorized and decide whether a cross-batch dedup
+    // filter is worth building - the §44.8 item that has never had a number.
+    //
+    // 45.95% of our faults at w7@110 arrive already serviced, against 6.47% on
+    // the serial path, and that 39-point gap is the entire remaining wall gap.
+    // But "already serviced" has two causes needing opposite fixes:
+    //
+    //   xbatch  - an EARLIER batch serviced the block. A filter carrying
+    //             recently-serviced addresses across batches drops these before
+    //             the block lookup and the block lock. Builds the case for
+    //             cross-batch dedup.
+    //   inbatch - a CONCURRENT WORKER serviced it inside this batch. No
+    //             cross-batch filter can see these; only within-batch
+    //             coordination could. Kills the case for cross-batch dedup and
+    //             points at the pool racing itself instead.
+    //
+    // Diagnostic only. Nothing in the driver acts on either.
+    atomic64_t n_fault_authorized_xbatch;
+    atomic64_t n_fault_authorized_inbatch;
+
     // Sub-phases of uvm_va_block_make_resident_copy, in TWO BANKS chosen by the
     // cause argument. That function is shared: eviction reaches it through
     // uvm_va_block_evict_chunks, and fault servicing reaches it through
