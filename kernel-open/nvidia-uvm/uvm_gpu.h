@@ -538,6 +538,24 @@ typedef struct
         // another path.
         NvU64 last_replay_ns;
 
+        // Monotonic batch counter, bumped at the START of each batch in the
+        // servicing loop. Diagnostic: uvm_va_block_t.service_epoch is stamped
+        // from it so the authorized-fault split can tell whether an earlier
+        // BATCH already serviced the block.
+        //
+        // Distinct from replay_epoch, which counts replays. The two agree only
+        // while replays fire once per batch, and the replay interval gate
+        // breaks exactly that assumption - which is why the split had to move
+        // off the epoch.
+        //
+        // Written by the bottom half without a lock and read by the service
+        // workers, so it is a benign race by design: the value only advances,
+        // an aligned 64-bit load cannot tear on the platforms this builds for,
+        // and the worst outcome is one fault at a batch boundary classified as
+        // cross-batch when it was in-batch. An atomic on a path this hot would
+        // cost more than a diagnostic is worth.
+        NvU64 batch_id;
+
         // Monotonic count of replays pushed for this fault buffer, bumped once
         // per successful push_replay_on_gpu. A root chunk records the value it
         // sees whenever it is touched - populated or mapped

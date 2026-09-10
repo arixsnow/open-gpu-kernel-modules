@@ -985,11 +985,16 @@ static void fault_buffer_skip_replayable_entry(uvm_parent_gpu_t *parent_gpu, NvU
     parent_gpu->fault_buffer_hal->entry_clear_valid(parent_gpu, index);
 }
 
+// skip_replay discards the buffer without issuing the replay that normally
+// follows. Only the replay interval gate passes true, and only because it owes
+// a replay that the pass-exit path is guaranteed to issue. Every other caller
+// passes false and behaves exactly as before.
 static NV_STATUS fault_buffer_flush_locked(uvm_parent_gpu_t *parent_gpu,
                                            uvm_gpu_t *gpu,
                                            uvm_gpu_buffer_flush_mode_t flush_mode,
                                            uvm_fault_replay_type_t fault_replay,
-                                           uvm_fault_service_batch_context_t *batch_context)
+                                           uvm_fault_service_batch_context_t *batch_context,
+                                           bool skip_replay)
 {
     NvU32 get;
     NvU32 put;
@@ -1038,6 +1043,23 @@ static NV_STATUS fault_buffer_flush_locked(uvm_parent_gpu_t *parent_gpu,
 
     write_get(parent_gpu, get);
 
+    // The replay interval gate asks for the discard WITHOUT the replay, which
+    // is the one caller that passes true here.
+    //
+    // notes/34 chose not to add this variant, and gating the whole branch
+    // instead is what produced a 389x fault explosion on GESUMMV
+    // (20260910_150203: 51,736,977 faults against ours:21's 132,905). The
+    // discard above is what removes the stale backlog; suppressing it along
+    // with the replay leaves those entries to be fetched and re-serviced
+    // without end. On w7 the flush matters little and the defect was invisible.
+    //
+    // Safe because the caller owes a replay and the pass-exit replay in
+    // uvm_parent_gpu_service_replayable_faults always issues it. A warp whose
+    // fault was discarded here re-faults after that replay, which is the same
+    // contract a discarded entry has always had.
+    if (skip_replay)
+        return NV_OK;
+
     // Issue fault replay
     if (gpu)
         return push_replay_on_gpu(gpu, fault_replay, batch_context);
@@ -1056,7 +1078,8 @@ NV_STATUS uvm_gpu_replayable_buffer_flush(uvm_gpu_t *gpu)
                                        gpu,
                                        UVM_GPU_BUFFER_FLUSH_MODE_WAIT_UPDATE_PUT,
                                        UVM_FAULT_REPLAY_TYPE_START,
-                                       NULL);
+                                       NULL,
+                                       false);
 
     // This will trigger the top half to start servicing faults again, if the
     // replay brought any back in
@@ -1466,7 +1489,8 @@ static NV_STATUS translate_instance_ptrs(uvm_parent_gpu_t *parent_gpu,
                                                gpu,
                                                UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT,
                                                UVM_FAULT_REPLAY_TYPE_START,
-                                               batch_context);
+                                               batch_context,
+                                               false);
             if (status != NV_OK)
                  return status;
 
@@ -1917,8 +1941,7 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             // says the redundancy is the worker pool racing itself inside one
             // batch, which is a different fix entirely, and it would explain
             // why auth% is 6.47 at zero workers and 45.95 at twenty-one.
-            if (va_block->service_epoch ==
-                atomic64_read(&gpu->parent->fault_buffer.replayable.replay_epoch))
+            if (va_block->service_epoch == gpu->parent->fault_buffer.replayable.batch_id)
                 uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_inbatch);
             else
                 uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_xbatch);
@@ -2117,7 +2140,7 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_va_space_t *gpu_va_space,
     // drop it) against authorized because a CONCURRENT WORKER serviced it in
     // this batch (a cross-batch filter is useless against it). 45.95% of our
     // faults at w7@110 arrive authorized and nothing measures the split.
-    va_block->service_epoch = atomic64_read(&gpu_va_space->gpu->parent->fault_buffer.replayable.replay_epoch);
+    va_block->service_epoch = gpu_va_space->gpu->parent->fault_buffer.replayable.batch_id;
 
     uvm_mutex_unlock(&va_block->lock);
 
@@ -2593,7 +2616,8 @@ static NV_STATUS service_fault_batch_for_cancel(uvm_fault_service_batch_context_
                                        gpu,
                                        UVM_GPU_BUFFER_FLUSH_MODE_WAIT_UPDATE_PUT,
                                        UVM_FAULT_REPLAY_TYPE_START,
-                                       batch_context);
+                                       batch_context,
+                                       false);
     if (status != NV_OK)
         goto done;
 
@@ -2747,7 +2771,8 @@ done:
                                            gpu,
                                            UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT,
                                            UVM_FAULT_REPLAY_TYPE_START,
-                                           batch_context);
+                                           batch_context,
+                                           false);
     }
 
     return status;
@@ -3745,7 +3770,8 @@ static NV_STATUS cancel_faults_all(uvm_fault_service_batch_context_t *batch_cont
                                              gpu,
                                              UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT,
                                              UVM_FAULT_REPLAY_TYPE_START,
-                                             batch_context);
+                                             batch_context,
+                                             false);
 
     // We report the first encountered error.
     if (status == NV_OK)
@@ -3870,7 +3896,8 @@ static NV_STATUS cancel_faults_precise_tlb(uvm_gpu_t *gpu, uvm_fault_service_bat
                                            gpu,
                                            UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT,
                                            UVM_FAULT_REPLAY_TYPE_START_ACK_ALL,
-                                           batch_context);
+                                           batch_context,
+                                           false);
         if (status != NV_OK)
             break;
 
@@ -4686,6 +4713,14 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         batch_start_time = NV_GETTIME();
 
+        // Bumped at the START of the batch, before any servicing, so a block
+        // stamped during this batch compares equal to it. This replaces
+        // replay_epoch as the dedup stamp: the epoch only tracks batches while
+        // replays fire once per batch, and the interval gate freezes it across
+        // many, which made the m arms of 20260910_150203 read 76-99.9%
+        // "in-batch" as an artefact of the knob under test.
+        ++replayable_faults->batch_id;
+
         status = fetch_fault_buffer_entries(parent_gpu, batch_context, FAULT_FETCH_MODE_BATCH_READY);
         replayable_faults->stats.ns_fetch += NV_GETTIME() - batch_start_time;
         if (status != NV_OK)
@@ -4795,7 +4830,23 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                        (NvU64)(NV_GETTIME() - replayable_faults->last_replay_ns) <
                            replayable_faults->service_replay_min_interval_ns;
 
-        if (replay_gated) {
+        // The debt is booked HERE, the moment the decision to gate is taken,
+        // and not after the work below succeeds.
+        //
+        // The BATCH_FLUSH branch can fail partway - fault_buffer_flush_locked's
+        // spin-loop error path calls write_get and returns - which discards
+        // entries and advances GET with no replay issued. Setting the flag
+        // after that point would break out of the loop owing a replay that
+        // nothing records, and the pass-exit replay would only cover it in the
+        // num_replays == 0 case. Booking it first makes "gated implies owed"
+        // hold on every path out, including the error ones.
+        //
+        // Scoped to the two policies that replay per batch. ONCE and BLOCK do
+        // not, so there would be no replay to skip and counting one would
+        // misreport the spacing ratio.
+        if (replay_gated &&
+            (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH ||
+             replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH_FLUSH)) {
             replay_owed = true;
 
             // Debug-gated like stats.num_replays in push_replay_on_gpu, because
@@ -4805,16 +4856,14 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             // with uvm_enable_debug_procfs=1.
             if (uvm_procfs_is_debug_enabled())
                 ++replayable_faults->stats.num_replays_skipped;
+        }
 
-            // NOTE, pre-registered in notes/34: under BATCH_FLUSH this skips
-            // the buffer flush as well as the replay, because
-            // fault_buffer_flush_locked always pushes one and there is no
-            // flush-without-replay variant. So the gate does two things at
-            // once - it stops new faults being raised, which is the point, and
-            // it retains stale entries the flush would have discarded, which
-            // works against it. Net effect is a measurement, not a deduction,
-            // and it is what the m<us> sweep is for. If faults do not fall,
-            // this is the first thing to suspect.
+        // Under BATCH there is nothing to discard, so a gated batch just defers
+        // its replay and the debt above is the whole of it. BATCH_FLUSH is
+        // handled below and STILL FLUSHES, which is the correction this change
+        // exists for.
+        if (replay_gated && replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
+            // Nothing further.
         }
         else if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
             time_stamp = NV_GETTIME();
@@ -4844,34 +4893,55 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             }
 
             time_stamp = NV_GETTIME();
-            status = fault_buffer_flush_locked(parent_gpu, NULL, flush_mode, UVM_FAULT_REPLAY_TYPE_START, batch_context);
+            // THE FLUSH ALWAYS RUNS. Only the replay is gated.
+            //
+            // The first version of this gate skipped the whole branch, and that
+            // cost a 389x fault explosion on GESUMMV (20260910_150203:
+            // 51,736,977 faults against ours:21's 132,905, 336,794 batches
+            // against 589). The discard inside the flush is what removes the
+            // stale backlog. Suppressing it along with the replay leaves those
+            // entries to be fetched and re-serviced without end. On w7 the
+            // flush matters little, which is why only the thrash cell found it.
+            status = fault_buffer_flush_locked(parent_gpu,
+                                               NULL,
+                                               flush_mode,
+                                               UVM_FAULT_REPLAY_TYPE_START,
+                                               batch_context,
+                                               replay_gated);
             replayable_faults->stats.ns_replay += NV_GETTIME() - time_stamp;
             if (status != NV_OK)
                 break;
-            ++num_replays;
-            replay_owed = false;
 
-            // The replay push acquired the batch tracker, so the GPU already
-            // orders it after every migration of this batch. Pipelined mode
-            // defers this CPU-side wait and overlaps the next batch's
-            // fetch/service with this batch's copies and replay; the wait
-            // moves to the empty-fetch path above, or to the in-flight bound
-            // at the top of the loop, whichever comes first. Serial mode keeps
-            // the stock synchronous wait.
-            if (uvm_perf_fault_service_pipeline != 0) {
-                ++pending_replays;
-            }
-            else {
-                time_stamp = NV_GETTIME();
-                status = uvm_tracker_wait(&replayable_faults->replay_tracker);
-                replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
-                if (status != NV_OK)
-                    break;
+            // Flushed but not replayed. replay_owed was already booked above,
+            // before anything here could fail. Nothing in the else applies:
+            // there is no new replay to count, to defer into pending_replays,
+            // or to wait on.
+            if (!replay_gated) {
+                ++num_replays;
+                replay_owed = false;
 
-                // Third and, since uvm_perf_fault_service_pipeline defaults to
-                // 0, the one the stock path and the mechanism-off control
-                // actually take. See uvm_gpu_idle_window_open().
-                uvm_gpu_idle_window_open();
+                // The replay push acquired the batch tracker, so the GPU
+                // already orders it after every migration of this batch.
+                // Pipelined mode defers this CPU-side wait and overlaps the
+                // next batch's fetch/service with this batch's copies and
+                // replay; the wait moves to the empty-fetch path above, or to
+                // the in-flight bound at the top of the loop, whichever comes
+                // first. Serial mode keeps the stock synchronous wait.
+                if (uvm_perf_fault_service_pipeline != 0) {
+                    ++pending_replays;
+                }
+                else {
+                    time_stamp = NV_GETTIME();
+                    status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+                    replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
+                    if (status != NV_OK)
+                        break;
+
+                    // Third and, since uvm_perf_fault_service_pipeline defaults
+                    // to 0, the one the stock path and the mechanism-off
+                    // control actually take. See uvm_gpu_idle_window_open().
+                    uvm_gpu_idle_window_open();
+                }
             }
         }
 
