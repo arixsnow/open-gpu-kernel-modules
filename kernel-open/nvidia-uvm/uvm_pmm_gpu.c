@@ -245,6 +245,36 @@ module_param(uvm_perf_evict_proactive, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive,
                  "Free root chunks to keep in reserve on a background thread (0 = off, stock).");
 
+// Whether the proactive evictor may take its victim off the FREE lists. 0 is the
+// thread every campaign through 20260911_163356 ran; 1 makes it skip them.
+//
+// 0 is a bug, left reachable so every archived v arm keeps its meaning. The
+// thread shares pick_root_chunk_to_evict with the fault path, and that picker
+// hands out a free root chunk before it looks at any allocated one. Right for a
+// caller that needs a chunk now, wrong for a thread whose job is to add free
+// ones: the first pass of a wake evicts an allocated chunk and frees it, and
+// each later pass picks that same free chunk up again, evicts nothing, and
+// frees it back - unless an allocation took it in between, in which case that
+// pass evicts for real. free_root_chunks_upto barely climbs, so the loop spends
+// its whole budget and the reserve gains about one chunk per wake whatever the
+// target.
+//
+// Measured before it was read in the code. At w7@110 v8, v32 and v64 all left
+// ~182K demand evictions against 274K without the thread, while proactive
+// evictions grew with the budget, 1.1M to 4.1M to 7.5M. v64 averaged 0.48 us per
+// proactive eviction at @110 and 0.70 us at @150 (20260911_163356), where an
+// eviction that moves data costs ~20 us. ARIADNE's thread does not have this
+// bug: pick_used_root_chunk_to_evict walks the used list only.
+//
+// Skipping the free lists is the whole fix. The alloc lists are still walked in
+// stock order, UNUSED then DISCARDED then USED, because evicting an allocated
+// chunk that holds no data still returns real memory, and it is the cheapest
+// memory there is.
+static unsigned uvm_perf_evict_proactive_skip_free = 0;
+module_param(uvm_perf_evict_proactive_skip_free, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_skip_free,
+                 "Proactive evictor never takes a free root chunk as its victim (0 = pre-fix thread).");
+
 // Helper type for refcounting cache
 typedef struct
 {
@@ -1725,28 +1755,61 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     return NULL;
 }
 
-static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
+// Who is asking for a victim. The proactive evictor with the fix is the only
+// caller that skips the free lists, and the free-pick counters are split by the
+// other two so the pre-fix bug reads directly off an old v arm instead of being
+// inferred from a mean.
+typedef enum
 {
-    uvm_gpu_chunk_t *chunk;
+    // Anyone who needs a chunk now: the fault path, the PMA eviction callback
+    // and the test ioctl. A free root chunk is the cheapest answer and stays
+    // first, as in stock.
+    EVICT_PICK_DEMAND,
+
+    // The proactive evictor with uvm_perf_evict_proactive_skip_free=0.
+    EVICT_PICK_PROACTIVE,
+
+    // The proactive evictor with uvm_perf_evict_proactive_skip_free=1.
+    EVICT_PICK_PROACTIVE_SKIP_FREE,
+} evict_pick_t;
+
+static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, evict_pick_t pick)
+{
+    uvm_gpu_chunk_t *chunk = NULL;
 
     uvm_spin_lock(&pmm->list_lock);
 
     // Check if there are root chunks sitting in the free lists. Non-zero
     // chunks are preferred.
-    chunk = list_first_chunk(find_free_list(pmm,
-                                            UVM_PMM_GPU_MEMORY_TYPE_USER,
-                                            UVM_CHUNK_SIZE_MAX,
-                                            UVM_PMM_LIST_NO_ZERO));
-    if (chunk)
-        UVM_ASSERT(!chunk->is_zero);
-
-    if (!chunk) {
+    //
+    // Not for the fixed proactive evictor: taking a free chunk back is how the
+    // pre-fix thread spent its budget without growing the reserve. See
+    // uvm_perf_evict_proactive_skip_free.
+    if (pick != EVICT_PICK_PROACTIVE_SKIP_FREE) {
         chunk = list_first_chunk(find_free_list(pmm,
                                                 UVM_PMM_GPU_MEMORY_TYPE_USER,
                                                 UVM_CHUNK_SIZE_MAX,
-                                                UVM_PMM_LIST_ZERO));
+                                                UVM_PMM_LIST_NO_ZERO));
         if (chunk)
-            UVM_ASSERT(chunk->is_zero);
+            UVM_ASSERT(!chunk->is_zero);
+
+        if (!chunk) {
+            chunk = list_first_chunk(find_free_list(pmm,
+                                                    UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                                    UVM_CHUNK_SIZE_MAX,
+                                                    UVM_PMM_LIST_ZERO));
+            if (chunk)
+                UVM_ASSERT(chunk->is_zero);
+        }
+
+        // An atomic store under list_lock, a leaf spinlock: nothing here can
+        // sleep or take another lock.
+        if (chunk) {
+            if (pick == EVICT_PICK_PROACTIVE)
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_free_pick_proactive);
+            else
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_free_pick_demand);
+        }
     }
 
     // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
@@ -1778,9 +1841,16 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
     return NULL;
 }
 
+// The stock entry point, for callers that are not the proactive evictor.
+static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
+{
+    return pick_root_chunk_to_evict_from(pmm, EVICT_PICK_DEMAND);
+}
+
 static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
                                            uvm_pmm_gpu_memory_type_t type,
                                            uvm_pmm_context_t pmm_context,
+                                           evict_pick_t pick,
                                            uvm_gpu_chunk_t **out_chunk)
 {
     NV_STATUS status;
@@ -1796,7 +1866,7 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
     // so ns_pmm_lock_wait cannot see it.
     t0 = uvm_lock_probe_begin();
 
-    root_chunk = pick_root_chunk_to_evict(pmm);
+    root_chunk = pick_root_chunk_to_evict_from(pmm, pick);
 
     uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_pick, NULL);
 
@@ -1857,6 +1927,7 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
 static NV_STATUS pick_and_evict_root_chunk_retry(uvm_pmm_gpu_t *pmm,
                                                  uvm_pmm_gpu_memory_type_t type,
                                                  uvm_pmm_context_t pmm_context,
+                                                 evict_pick_t pick,
                                                  uvm_gpu_chunk_t **out_chunk)
 {
     NV_STATUS status;
@@ -1871,7 +1942,7 @@ static NV_STATUS pick_and_evict_root_chunk_retry(uvm_pmm_gpu_t *pmm,
     // Eviction can fail if the chunk gets selected for PMA eviction at
     // the same time. Keep retrying.
     do {
-        status = pick_and_evict_root_chunk(pmm, type, pmm_context, out_chunk);
+        status = pick_and_evict_root_chunk(pmm, type, pmm_context, pick, out_chunk);
     } while (status == NV_ERR_IN_USE);
 
     // Classify how this attempt ended, once, on the status the retry loop
@@ -2006,7 +2077,7 @@ static NV_STATUS alloc_or_evict_root_chunk(uvm_pmm_gpu_t *pmm,
             // help the caller in front of it, only the ones behind.
             proactive_evict_wake(pmm);
 
-            status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
+            status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, EVICT_PICK_DEMAND, chunk_out);
         }
 
         return status;
@@ -2033,7 +2104,7 @@ static NV_STATUS alloc_or_evict_root_chunk_unlocked(uvm_pmm_gpu_t *pmm,
             proactive_evict_wake(pmm);
 
             pmm_lock(pmm);
-            status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
+            status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, EVICT_PICK_DEMAND, chunk_out);
             uvm_mutex_unlock(&pmm->lock);
         }
 
@@ -2865,6 +2936,14 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
     NvU32 budget;
     NvU64 t0 = uvm_lock_probe_begin();
 
+    // Latched once per wake, like target. The param is S_IRUGO so it cannot
+    // change under the thread, but reading it once keeps every pick in a wake
+    // on the same side of the fix by construction rather than by that rule.
+    const evict_pick_t pick = uvm_perf_evict_proactive_skip_free ? EVICT_PICK_PROACTIVE_SKIP_FREE :
+                                                                   EVICT_PICK_PROACTIVE;
+
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive_wakes);
+
     {
         // BOUNDED at the reserve size, and the bound is not cosmetic. free_chunk
         // calls free_next_available_root_chunk on every root-chunk free, which
@@ -2901,10 +2980,16 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
             // reading once the reserve thread is running, and the comparison
             // that established eviction parallelises has to be made against a
             // v=0 arm.
+            //
+            // pick decides whether this can take a free root chunk back. With
+            // uvm_perf_evict_proactive_skip_free=0 it can, and after the first
+            // pass of a wake it nearly always does - the bug that param
+            // describes.
             uvm_mutex_lock(&pmm->lock);
             status = pick_and_evict_root_chunk_retry(pmm,
                                                      UVM_PMM_GPU_MEMORY_TYPE_USER,
                                                      PMM_CONTEXT_DEFAULT,
+                                                     pick,
                                                      &chunk);
             uvm_mutex_unlock(&pmm->lock);
 
@@ -3073,6 +3158,7 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_pages(void *void_pmm,
             status = pick_and_evict_root_chunk_retry(pmm,
                                                      UVM_PMM_GPU_MEMORY_TYPE_KERNEL,
                                                      PMM_CONTEXT_PMA_EVICTION,
+                                                     EVICT_PICK_DEMAND,
                                                      &chunk);
         }
         uvm_mutex_unlock(&pmm->lock);

@@ -1582,6 +1582,28 @@ typedef struct
     atomic64_t n_evict_proactive;
     atomic64_t ns_evict_proactive;
 
+    // One per proactive_evict_work call, so n_evict_proactive divided by this is
+    // the work done per wake. A thread that never grows its reserve spends its
+    // whole budget on every busy wake, which is the signature of the bug
+    // described at uvm_perf_evict_proactive_skip_free.
+    atomic64_t n_evict_proactive_wakes;
+
+    // Root chunks the victim picker took off the FREE lists instead of the alloc
+    // lists, split by who asked. Nothing is copied or unmapped for these.
+    //
+    // On the fault path that is the cheapest way to get a chunk, and it is stock
+    // behaviour. On the proactive thread it is the bug: a free chunk taken back
+    // and freed again adds nothing to the reserve. Before the fix, up to budget
+    // - 1 of the budget evictions in a busy wake land in _proactive, fewer when
+    // an allocation takes the free chunk between two passes; with
+    // uvm_perf_evict_proactive_skip_free=1 it is zero by construction.
+    //
+    // _demand also takes the PMA eviction callback and the test ioctl, neither of
+    // which runs on the benchmark cells (n_pma_evict_cbs reads 0 on the w7 and
+    // GESUMMV runs checked).
+    atomic64_t n_evict_free_pick_proactive;
+    atomic64_t n_evict_free_pick_demand;
+
     // n_fault_authorized split by WHICH servicing already did the work. These
     // two sum to n_fault_authorized and decide whether a cross-batch dedup
     // filter is worth building - the §44.8 item that has never had a number.
