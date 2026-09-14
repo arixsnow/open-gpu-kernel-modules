@@ -1252,6 +1252,8 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_evict_proactive));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_proactive_wakes   %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_proactive_wakes));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_proactive_gated   %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_proactive_gated));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_proactive %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_free_pick_proactive));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_demand  %llu\n",

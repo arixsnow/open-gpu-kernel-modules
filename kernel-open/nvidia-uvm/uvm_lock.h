@@ -1588,6 +1588,13 @@ typedef struct
     // described at uvm_perf_evict_proactive_skip_free.
     atomic64_t n_evict_proactive_wakes;
 
+    // Wakes that did nothing because PMA still had a free 2MB page, so no
+    // allocation could have needed an eviction yet. Only the fixed thread gates
+    // (uvm_perf_evict_proactive_skip_free=1); on an in-memory workload nearly
+    // every wake should land here, and on an oversubscribed one the share falls
+    // once the device fills.
+    atomic64_t n_evict_proactive_gated;
+
     // Root chunks the victim picker took off the FREE lists instead of the alloc
     // lists, split by who asked. Nothing is copied or unmapped for these.
     //

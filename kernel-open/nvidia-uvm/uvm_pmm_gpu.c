@@ -266,10 +266,21 @@ MODULE_PARM_DESC(uvm_perf_evict_proactive,
 // eviction that moves data costs ~20 us. ARIADNE's thread does not have this
 // bug: pick_used_root_chunk_to_evict walks the used list only.
 //
-// Skipping the free lists is the whole fix. The alloc lists are still walked in
-// stock order, UNUSED then DISCARDED then USED, because evicting an allocated
-// chunk that holds no data still returns real memory, and it is the cheapest
-// memory there is.
+// Skipping the free lists is the first half of the fix. The alloc lists are
+// still walked in stock order, UNUSED then DISCARDED then USED, because evicting
+// an allocated chunk that holds no data still returns real memory, and it is the
+// cheapest memory there is.
+//
+// The second half is a gate the bug was hiding the need for. The thread wakes
+// every 10 ms and tops its reserve up whether or not the device is full, and
+// allocations take a reserve chunk before they ask PMA. With one real eviction
+// per wake that was at most ~100 evictions a second of live data on a workload
+// that fits; fixed, it would be up to the whole target every 10 ms, on every
+// in-memory cell and through the fill of every oversubscribed one. So with this
+// set the thread also does nothing while PMA still has a free 2MB page, which is
+// exactly when no allocation can need an eviction. ARIADNE gates the same way,
+// on free_2mb == 0. The first campaign to run x (Stage V, 2026-09-13) ran
+// without the gate.
 static unsigned uvm_perf_evict_proactive_skip_free = 0;
 module_param(uvm_perf_evict_proactive_skip_free, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive_skip_free,
@@ -2917,6 +2928,26 @@ static void proactive_evict_wake(uvm_pmm_gpu_t *pmm)
     wake_up(&pmm->proactive_evict.wq);
 }
 
+// Whether PMA is out of the 2MB pages alloc_root_chunk asks it for, which is the
+// moment an allocation has to evict. Under Confidential Computing root chunks
+// come only from the protected region (UVM_PMA_ALLOCATE_PROTECTED_REGION in
+// alloc_root_chunk), so that region's counter is the one that decides.
+//
+// Read without a lock. PMA updates these volatile counters under its own, and a
+// stale read can only start or skip one wake early. pma_stats is NULL on a GPU
+// with no memory to manage (mem_info.size == 0), and then there is nothing to
+// reserve.
+static bool proactive_evict_pma_exhausted(uvm_pmm_gpu_t *pmm)
+{
+    if (!pmm->pma_stats)
+        return false;
+
+    if (g_uvm_global.conf_computing_enabled)
+        return READ_ONCE(pmm->pma_stats->numFreePages2mProtected) == 0;
+
+    return READ_ONCE(pmm->pma_stats->numFreePages2m) == 0;
+}
+
 // One wake's worth of work. Split out from the thread loop so the caller can
 // wrap it in UVM_ENTRY_VOID: everything below takes pmm->lock, and UVM's lock
 // tracking resolves the CURRENT THREAD's context to record the acquisition. A
@@ -2943,6 +2974,17 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
                                                                    EVICT_PICK_PROACTIVE;
 
     uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive_wakes);
+
+    // The fixed thread builds a reserve only once PMA is out of 2MB pages. Until
+    // then every allocation succeeds without evicting, and a chunk evicted into
+    // the reserve is live data thrown out for nothing - which allocations would
+    // then take ahead of PMA's free memory, so the thread would evict again. See
+    // uvm_perf_evict_proactive_skip_free. The pre-fix thread stays ungated, so an
+    // archived v arm and its rerun run the same code.
+    if (pick == EVICT_PICK_PROACTIVE_SKIP_FREE && !proactive_evict_pma_exhausted(pmm)) {
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive_gated);
+        return;
+    }
 
     {
         // BOUNDED at the reserve size, and the bound is not cosmetic. free_chunk
