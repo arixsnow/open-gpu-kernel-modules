@@ -286,6 +286,30 @@ module_param(uvm_perf_evict_proactive_skip_free, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive_skip_free,
                  "Proactive evictor never takes a free root chunk as its victim (0 = pre-fix thread).");
 
+// The adaptive reserve. 0 keeps the fixed target, uvm_perf_evict_proactive, and
+// every existing arm runs unchanged. Non-zero, and only with skip_free set, the
+// thread keeps the full target while the recent eviction rate is at or above
+// this many evictions per second, and a single chunk once it falls below 80% of
+// it.
+//
+// Why a fixed reserve cannot be right everywhere, from Stage W (20260914_195318).
+// A 16-chunk reserve beat the pool by 4-11% at w7@110-150, and by 4-6% at
+// nw@125-150. It lost 15.7% at w7@104, 3.2% at w7@105 and 4.5% at nw@110. The
+// losses carry 19-40% more pages and 22-51% more evictions: at 104% a 32 MB
+// reserve is about the whole shortfall, so every chunk held back is working set
+// that faults straight back in. The pool's own eviction rate per GPU-pass second
+// puts the losses at 4.6K-5.9K and the wins at 6.5K and up, with the neutral
+// cells (bfs, XSBench, BICG@150) at 3.0K-5.3K. A single chunk is the scale
+// ARIADNE's kthread keeps.
+//
+// The gap between the last loss and the first win is 10%, so this is a screened
+// candidate, not a measured law: the value comes from a sweep, and the rule has
+// to beat the fixed reserves on those same cells before anything relies on it.
+static unsigned uvm_perf_evict_proactive_on_rate = 0;
+module_param(uvm_perf_evict_proactive_on_rate, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_on_rate,
+                 "Evictions/s at which the reserve is kept full, 1 chunk below 80% of it (0 = fixed target).");
+
 // Helper type for refcounting cache
 typedef struct
 {
@@ -2924,6 +2948,10 @@ static void proactive_evict_wake(uvm_pmm_gpu_t *pmm)
     if (!pmm->proactive_evict.thread)
         return;
 
+    // One per demand-path eviction: both callers ring this immediately before
+    // they evict. The adaptive reserve's rate estimate reads it.
+    atomic64_inc(&pmm->proactive_evict.demand_evictions);
+
     atomic_set(&pmm->proactive_evict.wake, 1);
     wake_up(&pmm->proactive_evict.wq);
 }
@@ -2948,6 +2976,87 @@ static bool proactive_evict_pma_exhausted(uvm_pmm_gpu_t *pmm)
     return READ_ONCE(pmm->pma_stats->numFreePages2m) == 0;
 }
 
+// The reserve target for this wake, and the adaptive reserve's rate estimate.
+// See uvm_perf_evict_proactive_on_rate for the rule and the data behind it.
+//
+// Returns cap unchanged when the rule is off or the thread is pre-fix. Otherwise
+// it counts every eviction the device needed since the previous wake - the
+// demand-path ones from proactive_evict_wake, plus this thread's own real ones -
+// and folds the rate into an EWMA with a 200 ms time constant. A workload phase
+// moves it within a fraction of a second; one burst does not. The switch has
+// hysteresis, full at on_rate and back to a single chunk below 80% of it, so a
+// rate sitting on the threshold does not flip the reserve every wake.
+//
+// Called on every wake, gated or not, so a device that stops evicting decays the
+// estimate. Only the thread calls it, and only the thread writes the fields it
+// updates.
+//
+// do_div with a 32-bit divisor, as elsewhere in this driver: time is taken in
+// microseconds (a wake interval near 2^32 us is over an hour), and the
+// instantaneous rate is clamped at 1e9 per second so the EWMA products stay far
+// below 2^64.
+static NvU32 proactive_evict_effective_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
+{
+    const NvU32 tau_us = 200000;
+    const NvU64 on_rate = uvm_perf_evict_proactive_on_rate;
+    NvU64 now;
+    NvU64 dt;
+    NvU64 demand;
+    NvU64 inst;
+    NvU64 acc;
+    NvU32 dt_us;
+    NvU32 w;
+
+    if (on_rate == 0 || !uvm_perf_evict_proactive_skip_free)
+        return cap;
+
+    now = NV_GETTIME();
+    demand = atomic64_read(&pmm->proactive_evict.demand_evictions);
+
+    // First wake: nothing to measure against yet. Start small, the way a device
+    // that has not evicted anything should.
+    if (pmm->proactive_evict.rate_last_ns == 0) {
+        pmm->proactive_evict.rate_last_ns = now;
+        pmm->proactive_evict.rate_last_demand = demand;
+        pmm->proactive_evict.own_pending = 0;
+        return 1;
+    }
+
+    dt = now - pmm->proactive_evict.rate_last_ns;
+    do_div(dt, 1000);
+    dt_us = (dt > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (NvU32)dt;
+
+    if (dt_us > 0) {
+        inst = (demand - pmm->proactive_evict.rate_last_demand + pmm->proactive_evict.own_pending) * 1000000ULL;
+        do_div(inst, dt_us);
+        if (inst > 1000000000ULL)
+            inst = 1000000000ULL;
+
+        w = min(dt_us, tau_us);
+        acc = pmm->proactive_evict.rate_ewma * (tau_us - w) + inst * w;
+        do_div(acc, tau_us);
+        pmm->proactive_evict.rate_ewma = acc;
+
+        pmm->proactive_evict.rate_last_ns = now;
+        pmm->proactive_evict.rate_last_demand = demand;
+        pmm->proactive_evict.own_pending = 0;
+
+        if (pmm->proactive_evict.rate_high) {
+            if (pmm->proactive_evict.rate_ewma * 5 < on_rate * 4)
+                pmm->proactive_evict.rate_high = false;
+        }
+        else if (pmm->proactive_evict.rate_ewma >= on_rate) {
+            pmm->proactive_evict.rate_high = true;
+        }
+    }
+
+    uvm_lock_probe_add(&g_uvm_lock_contention_stats.sum_evict_proactive_rate, pmm->proactive_evict.rate_ewma);
+    if (pmm->proactive_evict.rate_high)
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive_high_wakes);
+
+    return pmm->proactive_evict.rate_high ? cap : 1;
+}
+
 // One wake's worth of work. Split out from the thread loop so the caller can
 // wrap it in UVM_ENTRY_VOID: everything below takes pmm->lock, and UVM's lock
 // tracking resolves the CURRENT THREAD's context to record the acquisition. A
@@ -2963,8 +3072,9 @@ static bool proactive_evict_pma_exhausted(uvm_pmm_gpu_t *pmm)
 // wrapper was not.
 static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
 {
-    NvU32 target = uvm_perf_evict_proactive;
+    NvU32 target;
     NvU32 budget;
+    NvU32 evicted = 0;
     NvU64 t0 = uvm_lock_probe_begin();
 
     // Latched once per wake, like target. The param is S_IRUGO so it cannot
@@ -2974,6 +3084,10 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
                                                                    EVICT_PICK_PROACTIVE;
 
     uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive_wakes);
+
+    // Before the gate, so a wake that does nothing still updates the rate. With
+    // uvm_perf_evict_proactive_on_rate off this is uvm_perf_evict_proactive.
+    target = proactive_evict_effective_target(pmm, uvm_perf_evict_proactive);
 
     // The fixed thread builds a reserve only once PMA is out of 2MB pages. Until
     // then every allocation succeeds without evicting, and a chunk evicted into
@@ -3042,6 +3156,7 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
                 break;
 
             uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive);
+            evicted++;
 
             // try_chunk_free, NOT free_chunk. free_chunk sets try_free for a
             // root chunk and calls free_next_available_root_chunk, which hands
@@ -3063,6 +3178,12 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
 
         uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_proactive, NULL);
     }
+
+    // This wake's real evictions, for the next wake's rate. Only the adaptive
+    // reserve reads it, and only it may accumulate: on the pre-fix thread most
+    // picks are free chunks and nothing ever drains the count.
+    if (uvm_perf_evict_proactive_on_rate && pick == EVICT_PICK_PROACTIVE_SKIP_FREE)
+        pmm->proactive_evict.own_pending += evicted;
 }
 
 static int proactive_evict_thread(void *arg)
@@ -3692,6 +3813,12 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->proactive_evict.thread = NULL;
     init_waitqueue_head(&pmm->proactive_evict.wq);
     atomic_set(&pmm->proactive_evict.wake, 0);
+    atomic64_set(&pmm->proactive_evict.demand_evictions, 0);
+    pmm->proactive_evict.rate_last_ns = 0;
+    pmm->proactive_evict.rate_last_demand = 0;
+    pmm->proactive_evict.own_pending = 0;
+    pmm->proactive_evict.rate_ewma = 0;
+    pmm->proactive_evict.rate_high = false;
 
     pmm->initialized = true;
 

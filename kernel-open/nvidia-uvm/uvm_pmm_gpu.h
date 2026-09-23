@@ -435,6 +435,17 @@ typedef struct uvm_pmm_gpu_struct
         // thread when it wakes. An atomic rather than a lock because the writer
         // is the fault path and must not block on the evictor.
         atomic_t wake;
+
+        // The adaptive reserve, uvm_perf_evict_proactive_on_rate.
+        // demand_evictions is counted by the fault path in proactive_evict_wake;
+        // every other field has exactly one writer, the thread, so none of them
+        // needs a lock.
+        atomic64_t demand_evictions;
+        NvU64 rate_last_ns;
+        NvU64 rate_last_demand;
+        NvU64 own_pending;
+        NvU64 rate_ewma;
+        bool rate_high;
     } proactive_evict;
 } uvm_pmm_gpu_t;
 

@@ -1595,6 +1595,14 @@ typedef struct
     // once the device fills.
     atomic64_t n_evict_proactive_gated;
 
+    // The adaptive reserve (uvm_perf_evict_proactive_on_rate). high_wakes counts
+    // wakes that chose the full target; sum_evict_proactive_rate adds the rate
+    // estimate, in evictions per second, once per wake. Both divide by
+    // n_evict_proactive_wakes: the share of time the reserve was full, and the
+    // mean rate the rule saw. Zero with the switch off.
+    atomic64_t n_evict_proactive_high_wakes;
+    atomic64_t sum_evict_proactive_rate;
+
     // Root chunks the victim picker took off the FREE lists instead of the alloc
     // lists, split by who asked. Nothing is copied or unmapped for these.
     //
