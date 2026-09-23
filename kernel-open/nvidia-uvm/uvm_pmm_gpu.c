@@ -310,6 +310,27 @@ module_param(uvm_perf_evict_proactive_on_rate, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive_on_rate,
                  "Evictions/s at which the reserve is kept full, 1 chunk below 80% of it (0 = fixed target).");
 
+// The adaptive reserve's low state: how many chunks it keeps while the rate is
+// below the threshold. 1 is the rule Stage X screened, so every existing t arm
+// runs unchanged. Only read when uvm_perf_evict_proactive_on_rate is set, and
+// never more than the full target.
+//
+// Why 0 exists, from Stage X (20260923_173643). With the rule in its low state
+// for the whole run, t6200 and t7500 still cost 2.2% against the pool at w7@104,
+// with 3.5% more pages. nw@110 runs in two modes, about 125K pages and 3.1 s or
+// about 153K and 3.2-3.4 s: the pool is in the fast mode in every run, and v8x,
+// v16x and ARIADNE in the slow one in every run - and t7500, in its low state
+// throughout, still landed in the slow mode in one of three runs. So a reserve of
+// even one chunk is enough to flip a shallow cell, and ARIADNE pays the same
+// (+5.3% at w7@104, +4.2% at nw@110). At 0 the thread evicts nothing until the
+// rate says the device is short, which makes the low state the pool itself, and
+// the rate it measures is then the pool's own eviction rate, which is exactly
+// what the thresholds were calibrated on.
+static unsigned uvm_perf_evict_proactive_floor = 1;
+module_param(uvm_perf_evict_proactive_floor, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_floor,
+                 "Chunks the adaptive reserve keeps below its rate threshold (default 1; 0 = evict nothing until the rate is high).");
+
 // Helper type for refcounting cache
 typedef struct
 {
@@ -2984,8 +3005,9 @@ static bool proactive_evict_pma_exhausted(uvm_pmm_gpu_t *pmm)
 // demand-path ones from proactive_evict_wake, plus this thread's own real ones -
 // and folds the rate into an EWMA with a 200 ms time constant. A workload phase
 // moves it within a fraction of a second; one burst does not. The switch has
-// hysteresis, full at on_rate and back to a single chunk below 80% of it, so a
-// rate sitting on the threshold does not flip the reserve every wake.
+// hysteresis, full at on_rate and back to the floor (uvm_perf_evict_proactive_floor,
+// one chunk by default) below 80% of it, so a rate sitting on the threshold does
+// not flip the reserve every wake.
 //
 // Called on every wake, gated or not, so a device that stops evicting decays the
 // estimate. Only the thread calls it, and only the thread writes the fields it
@@ -2999,6 +3021,10 @@ static NvU32 proactive_evict_effective_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
 {
     const NvU32 tau_us = 200000;
     const NvU64 on_rate = uvm_perf_evict_proactive_on_rate;
+    // The low state. 0 is safe with nothing else changed: the caller's loop is
+    // bounded by budget = target, so a target of 0 never enters it, evicts
+    // nothing and adds nothing to own_pending.
+    const NvU32 floor = min((NvU32)uvm_perf_evict_proactive_floor, cap);
     NvU64 now;
     NvU64 dt;
     NvU64 demand;
@@ -3019,7 +3045,7 @@ static NvU32 proactive_evict_effective_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
         pmm->proactive_evict.rate_last_ns = now;
         pmm->proactive_evict.rate_last_demand = demand;
         pmm->proactive_evict.own_pending = 0;
-        return 1;
+        return floor;
     }
 
     dt = now - pmm->proactive_evict.rate_last_ns;
@@ -3054,7 +3080,7 @@ static NvU32 proactive_evict_effective_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
     if (pmm->proactive_evict.rate_high)
         uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_proactive_high_wakes);
 
-    return pmm->proactive_evict.rate_high ? cap : 1;
+    return pmm->proactive_evict.rate_high ? cap : floor;
 }
 
 // One wake's worth of work. Split out from the thread loop so the caller can
