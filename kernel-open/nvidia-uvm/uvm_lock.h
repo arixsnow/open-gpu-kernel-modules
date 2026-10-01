@@ -1640,6 +1640,13 @@ typedef struct
     atomic64_t n_evict_refault_on_wakes;
     atomic64_t sum_evict_refault_harm;
 
+    // The gate's own transitions. resets counts idle resets (the eviction count
+    // still for a second, estimate dropped), switch_on counts floor-to-full
+    // switches. Together with on_wakes they say whether the gate engaged late,
+    // was reset between eviction phases, or flipped back and forth.
+    atomic64_t n_evict_refault_resets;
+    atomic64_t n_evict_refault_switch_on;
+
     // n_fault_authorized split by WHICH servicing already did the work. These
     // two sum to n_fault_authorized and decide whether a cross-batch dedup
     // filter is worth building - the §44.8 item that has never had a number.

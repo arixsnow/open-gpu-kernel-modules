@@ -1279,6 +1279,10 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_refault_on_wakes));
     UVM_SEQ_OR_DBG_PRINT(s, "sum_evict_refault_harm    %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_evict_refault_harm));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_refault_resets    %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_refault_resets));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_refault_switch_on %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_refault_switch_on));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_proactive %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_free_pick_proactive));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_demand  %llu\n",

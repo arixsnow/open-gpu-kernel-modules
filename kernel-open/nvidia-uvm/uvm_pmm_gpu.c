@@ -382,6 +382,39 @@ module_param(uvm_perf_evict_proactive_refault, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive_refault,
                  "Refault harm, in permille of evictions, up to which the reserve is kept full (0 = off).");
 
+// The refault gate's horizon: a refault closer than this many root chunks
+// counts as harm. 0 is the reserve target, uvm_perf_evict_proactive, which is
+// the gate Stage AD ran (20261001_151728), so every g arm keeps its meaning.
+//
+// Why a horizon past the reserve, from Stage AD (notes/46 §54.9). At the
+// reserve's own depth, 16, the floor estimate for nw@110 is 9.7% against 6.8%
+// for bfs@110, so no threshold keeps the reserve on for bfs and off for nw@110,
+// and nw@110 drops into its slow mode on a few thousand proactive evictions. At
+// 32 the same estimate is 29.8% for nw@110 and at most 10.8% on every workload
+// where the reserve wins, and the measurement with the reserve full is 38.0%
+// against at most 12.7%. The shallow workloads have their refaults just past
+// the reserve's depth, so looking one reserve further ahead is a safety margin.
+// It was read off AD after the fact; Stage AF judges it on workloads AD did not
+// run.
+static unsigned uvm_perf_evict_proactive_refault_horizon = 0;
+module_param(uvm_perf_evict_proactive_refault_horizon, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_refault_horizon,
+                 "Refault distance, in root chunks, below which a refault counts as harm (0 = the reserve target).");
+
+// How many consecutive harm windows at or below the threshold the gate needs
+// before it fills the reserve. 1 is the gate Stage AD ran. Switching back to
+// the floor stays immediate, so this only makes the gate slower to engage.
+//
+// Why, from Stage AD. g50 engaged on nw@110 although that workload's harm sat
+// near twice its threshold: 1,960 proactive evictions, 3% of its wakes, and
+// enough to put every run in nw@110's slow mode. One window can read low at the
+// start of an eviction phase, so one window is not enough evidence to evict
+// ahead of demand on a workload that punishes any of it.
+static unsigned uvm_perf_evict_proactive_refault_confirm = 1;
+module_param(uvm_perf_evict_proactive_refault_confirm, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_refault_confirm,
+                 "Consecutive harm windows at or below the threshold before the reserve fills (default 1).");
+
 bool uvm_pmm_gpu_refault_tracking(void)
 {
     return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault;
@@ -3066,12 +3099,16 @@ void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive)
     const NvU64 distance = now >= stamp ? now - stamp : 0;
     const NvU32 bucket = distance ? min_t(NvU32, fls64(distance), 11) : 0;
 
+    // Near is judged against the horizon, which is the reserve target this
+    // module was loaded with unless uvm_perf_evict_proactive_refault_horizon
+    // says further. On an arm with no reserve and no horizon nothing is near;
+    // the histogram still gives the count for any distance after the fact.
+    const NvU64 horizon = uvm_perf_evict_proactive_refault_horizon ? uvm_perf_evict_proactive_refault_horizon :
+                                                                     uvm_perf_evict_proactive;
+
     uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_dist[proactive ? 1 : 0][bucket]);
 
-    // Near against the reserve target this module was loaded with. On an arm
-    // with no reserve the target is 0 and nothing is near; the histogram still
-    // gives the count for any target after the fact.
-    if (distance < uvm_perf_evict_proactive) {
+    if (distance < horizon) {
         atomic64_inc(&pmm->refault.near);
         uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_near);
     }
@@ -3251,8 +3288,14 @@ static NvU32 proactive_evict_refault_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
         pmm->proactive_evict.harm_seen_ns = now;
     }
     else if (now - pmm->proactive_evict.harm_seen_ns > idle_ns) {
+        // Counted once per reset, not once per idle wake: after the first one
+        // the estimate is unseeded and the next idle wake finds nothing to drop.
+        if (pmm->proactive_evict.harm_seeded)
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_refault_resets);
+
         pmm->proactive_evict.harm_seeded = false;
         pmm->proactive_evict.harm_ok = false;
+        pmm->proactive_evict.harm_good_windows = 0;
         pmm->proactive_evict.harm_last_seq = seq;
         pmm->proactive_evict.harm_last_near = near;
     }
@@ -3282,12 +3325,24 @@ static NvU32 proactive_evict_refault_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
 
         // Hysteresis: full at or below theta, back to the floor above 5/4 of it,
         // so an estimate sitting on the threshold does not flip every window.
+        // Going full also needs uvm_perf_evict_proactive_refault_confirm
+        // windows in a row at or below theta; at its default of 1 that is the
+        // rule Stage AD ran. Going back to the floor never waits.
         if (pmm->proactive_evict.harm_ok) {
-            if ((NvU64)pmm->proactive_evict.harm_ewma * 4 > (NvU64)theta * 5)
+            if ((NvU64)pmm->proactive_evict.harm_ewma * 4 > (NvU64)theta * 5) {
                 pmm->proactive_evict.harm_ok = false;
+                pmm->proactive_evict.harm_good_windows = 0;
+            }
         }
         else if (pmm->proactive_evict.harm_ewma <= theta) {
-            pmm->proactive_evict.harm_ok = true;
+            pmm->proactive_evict.harm_good_windows++;
+            if (pmm->proactive_evict.harm_good_windows >= max(uvm_perf_evict_proactive_refault_confirm, 1u)) {
+                pmm->proactive_evict.harm_ok = true;
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_refault_switch_on);
+            }
+        }
+        else {
+            pmm->proactive_evict.harm_good_windows = 0;
         }
     }
 
@@ -4074,6 +4129,7 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->proactive_evict.harm_seen_seq = 0;
     pmm->proactive_evict.harm_seen_ns = 0;
     pmm->proactive_evict.harm_ewma = 0;
+    pmm->proactive_evict.harm_good_windows = 0;
     pmm->proactive_evict.harm_seeded = false;
     pmm->proactive_evict.harm_ok = false;
     atomic64_set(&pmm->refault.evict_seq, 0);

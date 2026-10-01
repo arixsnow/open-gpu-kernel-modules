@@ -457,6 +457,10 @@ typedef struct uvm_pmm_gpu_struct
         NvU64 harm_seen_seq;
         NvU64 harm_seen_ns;
         NvU32 harm_ewma;
+
+        // Consecutive windows at or below the threshold while at the floor,
+        // for uvm_perf_evict_proactive_refault_confirm.
+        NvU32 harm_good_windows;
         bool harm_seeded;
         bool harm_ok;
     } proactive_evict;
