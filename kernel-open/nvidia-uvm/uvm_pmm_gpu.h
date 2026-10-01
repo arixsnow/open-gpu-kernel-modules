@@ -446,8 +446,46 @@ typedef struct uvm_pmm_gpu_struct
         NvU64 own_pending;
         NvU64 rate_ewma;
         bool rate_high;
+
+        // The refault gate, uvm_perf_evict_proactive_refault. Written by the
+        // thread only, like the rate fields above. harm_ewma is in permille;
+        // harm_seeded is false until the first full window has set it.
+        // harm_seen_seq and harm_seen_ns are the last eviction count the thread
+        // saw change and when, for the idle reset.
+        NvU64 harm_last_seq;
+        NvU64 harm_last_near;
+        NvU64 harm_seen_seq;
+        NvU64 harm_seen_ns;
+        NvU32 harm_ewma;
+        bool harm_seeded;
+        bool harm_ok;
     } proactive_evict;
+
+    // Refault tracking, on with uvm_perf_evict_refault_track or the refault
+    // gate. Unlike proactive_evict this runs without the thread, so that a
+    // plain pool arm measures its own refault distances too.
+    struct
+    {
+        // Root chunks evicted on this GPU, by the allocation path, the reserve
+        // thread and PMA alike. A block's refault distance is this count at its
+        // refault minus the count stamped into it at its eviction.
+        atomic64_t evict_seq;
+
+        // Refaults at a distance below the reserve target, the ones a reserve
+        // of that size would have caused. The refault gate reads it.
+        atomic64_t near;
+    } refault;
 } uvm_pmm_gpu_t;
+
+// Whether evictions are stamped and refaults counted. See
+// uvm_perf_evict_refault_track in uvm_pmm_gpu.c.
+bool uvm_pmm_gpu_refault_tracking(void);
+
+// A block that was evicted from this GPU is getting GPU memory again. stamp
+// and proactive are what its eviction recorded in uvm_va_block_gpu_state_t.
+// Called under the block lock, from the population path; it only reads one
+// atomic and increments counters, so it takes no lock of its own.
+void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive);
 
 // Return containing GPU
 uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *pmm);

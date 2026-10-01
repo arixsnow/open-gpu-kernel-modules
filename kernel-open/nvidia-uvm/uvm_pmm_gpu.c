@@ -312,8 +312,9 @@ MODULE_PARM_DESC(uvm_perf_evict_proactive_on_rate,
 
 // The adaptive reserve's low state: how many chunks it keeps while the rate is
 // below the threshold. 1 is the rule Stage X screened, so every existing t arm
-// runs unchanged. Only read when uvm_perf_evict_proactive_on_rate is set, and
-// never more than the full target.
+// runs unchanged. Only read when uvm_perf_evict_proactive_on_rate or the refault
+// gate (uvm_perf_evict_proactive_refault) is set, and never more than the full
+// target. The refault gate uses it as its low state the same way.
 //
 // Why 0 exists, from Stage X (20260923_173643). With the rule in its low state
 // for the whole run, t6200 and t7500 still cost 2.2% against the pool at w7@104,
@@ -329,7 +330,62 @@ MODULE_PARM_DESC(uvm_perf_evict_proactive_on_rate,
 static unsigned uvm_perf_evict_proactive_floor = 1;
 module_param(uvm_perf_evict_proactive_floor, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive_floor,
-                 "Chunks the adaptive reserve keeps below its rate threshold (default 1; 0 = evict nothing until the rate is high).");
+                 "Chunks the adaptive reserve keeps in its low state, under the rate rule or the refault gate (default 1; 0 = evict nothing until the rule says go).");
+
+// Refault tracking. 0 is stock: nothing is stamped and nothing is counted. 1
+// stamps every block evicted from a GPU with that GPU's eviction count, and
+// when the block gets GPU memory again, counts the refault distance: how many
+// root chunks the GPU evicted in between. Behaviour does not change; the
+// histogram lands in cpu/lock_stats as n_refault_{dem,pro}_d<bucket>. The
+// refault gate below turns it on by itself.
+//
+// This is the refault distance of Linux's workingset detection
+// (mm/workingset.c): "If the inactive list had (R - E) more page slots, the
+// page would not have been evicted in between accesses". A reserve works the
+// other way round. It runs the device R chunks short, so a chunk evicted into
+// it and faulted back before R more evictions is a miss the reserve made:
+// without the reserve it would still have been resident. CPPE's MHPE counts
+// the same event with a buffer of recently evicted chunks, "When a page fault
+// occurs, the buffer is searched for the corresponding chunk. On a hit, the
+// number of wrong evictions is increased", which is a refault at a distance
+// below the buffer's length.
+static unsigned uvm_perf_evict_refault_track = 0;
+module_param(uvm_perf_evict_refault_track, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_refault_track,
+                 "Stamp evictions and count refault distances in cpu/lock_stats (0 = off, stock).");
+
+// The refault gate, the replacement for the rate rule. 0 keeps whichever rule
+// the other params select, so every existing arm runs unchanged. Non-zero, and
+// only with skip_free set, the thread keeps the full target while the harm
+// estimate is at or below this many permille and drops to the floor
+// (uvm_perf_evict_proactive_floor) once it is above 5/4 of it.
+//
+// Why the rate rule was the wrong signal, from Stage 3 (20260925_001619) read
+// on kernel time. The reserve helps where the pool evicts slowly as well as
+// where it evicts fast: at 4.5-5.1K evictions/s the fixed 16-chunk reserve is
+// 1.30-1.33x the pool on bfs, at 2.9-3.3K 1.24-1.29x on XSBench. At 5.3K it is
+// 0.80x on w7@104. The rate rule, calibrated on wall time where ARIADNE's
+// benchmarks are 92% host setup, never fires on bfs or XSBench. What separates
+// the cells is the shortfall against the reserve: at w7@104 the working set is
+// 4096 MiB against about 3938 usable, so every chunk held free is one the
+// workload is about to touch.
+//
+// The harm estimate is near refaults (distance below uvm_perf_evict_proactive)
+// per root chunk evicted, over windows of at least 64 evictions, smoothed with
+// a 1/4 weight. With the reserve full it is measured, as argued above. With
+// the reserve at the floor it is estimated from demand evictions: a refault
+// just beyond the memory's reach stands in for an access just inside it, the
+// same smoothness assumption the workingset code makes. For a pure loop that
+// is pessimistic, and the gate then keeps the floor, which is the pool.
+static unsigned uvm_perf_evict_proactive_refault = 0;
+module_param(uvm_perf_evict_proactive_refault, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_refault,
+                 "Refault harm, in permille of evictions, up to which the reserve is kept full (0 = off).");
+
+bool uvm_pmm_gpu_refault_tracking(void)
+{
+    return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault;
+}
 
 // Helper type for refcounting cache
 typedef struct
@@ -1342,9 +1398,13 @@ void uvm_pmm_gpu_merge_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     uvm_mutex_unlock(&pmm->lock);
 }
 
+// evict_seq is this root chunk's place in the GPU's eviction count, or 0 when
+// refault tracking is off; proactive says whether the reserve thread asked.
 static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
                                                 uvm_gpu_root_chunk_t *root_chunk,
-                                                uvm_va_block_t *va_block)
+                                                uvm_va_block_t *va_block,
+                                                NvU64 evict_seq,
+                                                bool proactive)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
@@ -1374,6 +1434,19 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
     status = uvm_va_block_evict_chunks(va_block, gpu, &root_chunk->chunk, &tracker);
 
     uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_chunks, NULL);
+
+    // The refault stamp, under the block lock that block_populate_gpu_chunk
+    // also holds when it reads and clears it. A block whose chunks left more
+    // than once before it came back keeps the latest stamp, which is the one
+    // its absence is measured from.
+    if (evict_seq && status == NV_OK) {
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+
+        if (gpu_state) {
+            gpu_state->evict_stamp = evict_seq;
+            gpu_state->evict_stamp_proactive = proactive;
+        }
+    }
 
     // Zero-copy candidacy, ARIADNE's (HPCA'26), off by default in this build.
     // The block has just left GPU memory, so decide whether it leaves the
@@ -1547,12 +1620,24 @@ static bool root_chunk_has_elevated_page(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_
     return page_count(page) > UVM_CHUNK_SIZE_MAX / PAGE_SIZE;
 }
 
-static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, uvm_pmm_context_t pmm_context)
+// proactive is true only for the reserve thread. It changes nothing about the
+// eviction; it is recorded in the refault stamp.
+static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm,
+                                  uvm_gpu_root_chunk_t *root_chunk,
+                                  uvm_pmm_context_t pmm_context,
+                                  bool proactive)
 {
     NV_STATUS status;
     NV_STATUS free_status;
     uvm_gpu_chunk_t *chunk = &root_chunk->chunk;
     const uvm_pmm_gpu_memory_type_t type = chunk->type;
+
+    // This chunk's place in the GPU's eviction count, taken when the first
+    // block is found in it, so that a root chunk holding no data (a free one
+    // the allocation path took back) does not lengthen anyone's refault
+    // distance. It displaced nothing. 0 means tracking is off, or nothing has
+    // been evicted yet.
+    NvU64 evict_seq = 0;
 
     uvm_assert_mutex_locked(&pmm->lock);
 
@@ -1575,7 +1660,14 @@ static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root
         // re-lock the PMM mutex. This is ok as we don't rely on any PMM state
         // that can change across the calls. In particular, the walk to pick the
         // next VA block to evict above is always started from the root chunk.
-        status = evict_root_chunk_from_va_block(pmm, root_chunk, evict.va_block_to_evict_from);
+        if (!evict_seq && uvm_pmm_gpu_refault_tracking())
+            evict_seq = atomic64_inc_return(&pmm->refault.evict_seq);
+
+        status = evict_root_chunk_from_va_block(pmm,
+                                                root_chunk,
+                                                evict.va_block_to_evict_from,
+                                                evict_seq,
+                                                proactive);
         if (status != NV_OK)
             goto error;
     }
@@ -1939,7 +2031,7 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
         return NV_ERR_NO_MEMORY;
     }
 
-    status = evict_root_chunk(pmm, root_chunk, pmm_context);
+    status = evict_root_chunk(pmm, root_chunk, pmm_context, pick != EVICT_PICK_DEMAND);
     if (status != NV_OK)
         return status;
 
@@ -2959,6 +3051,32 @@ static NvU32 free_root_chunks_upto(uvm_pmm_gpu_t *pmm, NvU32 target)
     return n;
 }
 
+// See uvm_perf_evict_refault_track for what a refault distance is, and the
+// declaration in uvm_pmm_gpu.h for the calling context. The distance is the
+// number of root chunks evicted on this GPU after this block's. The stamp is
+// the block's own root chunk's place in the count, so a block that comes back
+// before any other chunk is evicted reads 0.
+//
+// A stamp can never be ahead of the count: both come from the same atomic, the
+// stamp first. The guard keeps a corrupted stamp from wrapping into the top
+// bucket rather than asserting on the fault path.
+void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive)
+{
+    const NvU64 now = atomic64_read(&pmm->refault.evict_seq);
+    const NvU64 distance = now >= stamp ? now - stamp : 0;
+    const NvU32 bucket = distance ? min_t(NvU32, fls64(distance), 11) : 0;
+
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_dist[proactive ? 1 : 0][bucket]);
+
+    // Near against the reserve target this module was loaded with. On an arm
+    // with no reserve the target is 0 and nothing is near; the histogram still
+    // gives the count for any target after the fact.
+    if (distance < uvm_perf_evict_proactive) {
+        atomic64_inc(&pmm->refault.near);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_near);
+    }
+}
+
 // Wake the proactive evictor. Called from the allocation path when it is about
 // to evict, which is the moment we know the reserve is empty.
 //
@@ -3083,6 +3201,105 @@ static NvU32 proactive_evict_effective_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
     return pmm->proactive_evict.rate_high ? cap : floor;
 }
 
+// The reserve target for this wake under the refault gate. See
+// uvm_perf_evict_proactive_refault for the rule and the data behind it.
+//
+// Returns cap unchanged when the gate is off or the thread is pre-fix, as the
+// rate rule does. Otherwise each wake reads the GPU's eviction count and its
+// near-refault count. Once at least 64 root chunks have been evicted since the
+// last window closed, the window's harm is near refaults per eviction in
+// permille. It seeds the EWMA if this is the first window and is folded in with
+// a 1/4 weight otherwise. 64 evictions is 128 MB, well under a second on every
+// oversubscribed Stage 3 workload, and too few to decide on alone, which is
+// what the EWMA is for.
+//
+// The window is counted in evictions rather than time because harm is a ratio
+// of two event counts: a workload that evicts slowly gets the same evidence per
+// decision as one that evicts fast. That is the property the rate rule lacked.
+//
+// The idle reset. The runner keeps the module loaded across the runs of an arm
+// and across its workloads, so whatever one run left here would decide how the
+// next one starts. Once the eviction count has not moved for a second, the
+// estimate is dropped and the gate returns to the floor, and the next eviction
+// phase decides from its own first window. The rate rule needs no reset because
+// its EWMA decays with time.
+//
+// Called on every wake, gated or not, and only by the thread, which is the
+// only writer of the fields it updates.
+static NvU32 proactive_evict_refault_target(uvm_pmm_gpu_t *pmm, NvU32 cap)
+{
+    const NvU64 window = 64;
+    const NvU64 idle_ns = 1000000000ULL;
+    const NvU32 theta = uvm_perf_evict_proactive_refault;
+    // The low state, shared with the rate rule. 0 is safe for the same reason:
+    // the caller's loop is bounded by budget = target.
+    const NvU32 floor = min((NvU32)uvm_perf_evict_proactive_floor, cap);
+    NvU64 now;
+    NvU64 seq;
+    NvU64 near;
+    NvU64 evicted;
+
+    if (theta == 0 || !uvm_perf_evict_proactive_skip_free)
+        return cap;
+
+    now = NV_GETTIME();
+    seq = atomic64_read(&pmm->refault.evict_seq);
+    near = atomic64_read(&pmm->refault.near);
+
+    if (seq != pmm->proactive_evict.harm_seen_seq) {
+        pmm->proactive_evict.harm_seen_seq = seq;
+        pmm->proactive_evict.harm_seen_ns = now;
+    }
+    else if (now - pmm->proactive_evict.harm_seen_ns > idle_ns) {
+        pmm->proactive_evict.harm_seeded = false;
+        pmm->proactive_evict.harm_ok = false;
+        pmm->proactive_evict.harm_last_seq = seq;
+        pmm->proactive_evict.harm_last_near = near;
+    }
+
+    evicted = seq - pmm->proactive_evict.harm_last_seq;
+    if (evicted >= window) {
+        NvU64 harm = (near - pmm->proactive_evict.harm_last_near) * 1000;
+
+        // A window between two 10 ms wakes never comes near 2^32 evictions.
+        // The clamp is for do_div's 32-bit divisor, not for any workload. More
+        // near refaults than evictions in one window is possible, since a
+        // refault can land a window after its eviction, so harm is capped at
+        // the whole window.
+        do_div(harm, (NvU32)min_t(NvU64, evicted, 0xFFFFFFFFULL));
+        harm = min_t(NvU64, harm, 1000);
+
+        if (pmm->proactive_evict.harm_seeded) {
+            pmm->proactive_evict.harm_ewma = (NvU32)((3 * (NvU64)pmm->proactive_evict.harm_ewma + harm) / 4);
+        }
+        else {
+            pmm->proactive_evict.harm_ewma = (NvU32)harm;
+            pmm->proactive_evict.harm_seeded = true;
+        }
+
+        pmm->proactive_evict.harm_last_seq = seq;
+        pmm->proactive_evict.harm_last_near = near;
+
+        // Hysteresis: full at or below theta, back to the floor above 5/4 of it,
+        // so an estimate sitting on the threshold does not flip every window.
+        if (pmm->proactive_evict.harm_ok) {
+            if ((NvU64)pmm->proactive_evict.harm_ewma * 4 > (NvU64)theta * 5)
+                pmm->proactive_evict.harm_ok = false;
+        }
+        else if (pmm->proactive_evict.harm_ewma <= theta) {
+            pmm->proactive_evict.harm_ok = true;
+        }
+    }
+
+    // Gated on the probe level like the rate rule's pair, because both divide
+    // by n_evict_proactive_wakes, which is.
+    uvm_lock_probe_add(&g_uvm_lock_contention_stats.sum_evict_refault_harm, pmm->proactive_evict.harm_ewma);
+    if (pmm->proactive_evict.harm_ok)
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_refault_on_wakes);
+
+    return pmm->proactive_evict.harm_ok ? cap : floor;
+}
+
 // One wake's worth of work. Split out from the thread loop so the caller can
 // wrap it in UVM_ENTRY_VOID: everything below takes pmm->lock, and UVM's lock
 // tracking resolves the CURRENT THREAD's context to record the acquisition. A
@@ -3113,7 +3330,14 @@ static void proactive_evict_work(uvm_pmm_gpu_t *pmm)
 
     // Before the gate, so a wake that does nothing still updates the rate. With
     // uvm_perf_evict_proactive_on_rate off this is uvm_perf_evict_proactive.
-    target = proactive_evict_effective_target(pmm, uvm_perf_evict_proactive);
+    //
+    // The refault gate replaces the rate rule when it is set. The runner refuses
+    // to set both, so this order is only a tie-break, but it is the one that
+    // keeps the rate rule out of any arm that asked for the gate.
+    if (uvm_perf_evict_proactive_refault)
+        target = proactive_evict_refault_target(pmm, uvm_perf_evict_proactive);
+    else
+        target = proactive_evict_effective_target(pmm, uvm_perf_evict_proactive);
 
     // The fixed thread builds a reserve only once PMA is out of 2MB pages. Until
     // then every allocation succeeds without evicting, and a chunk evicted into
@@ -3539,7 +3763,7 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_range(void *void_pmm,
 
         pmm_lock(pmm);
 
-        status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_PMA_EVICTION);
+        status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_PMA_EVICTION, false);
         should_inject_error = uvm_pmm_should_inject_pma_eviction_error(pmm);
 
         uvm_mutex_unlock(&pmm->lock);
@@ -3845,6 +4069,15 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->proactive_evict.own_pending = 0;
     pmm->proactive_evict.rate_ewma = 0;
     pmm->proactive_evict.rate_high = false;
+    pmm->proactive_evict.harm_last_seq = 0;
+    pmm->proactive_evict.harm_last_near = 0;
+    pmm->proactive_evict.harm_seen_seq = 0;
+    pmm->proactive_evict.harm_seen_ns = 0;
+    pmm->proactive_evict.harm_ewma = 0;
+    pmm->proactive_evict.harm_seeded = false;
+    pmm->proactive_evict.harm_ok = false;
+    atomic64_set(&pmm->refault.evict_seq, 0);
+    atomic64_set(&pmm->refault.near, 0);
 
     pmm->initialized = true;
 
@@ -4132,7 +4365,7 @@ NV_STATUS uvm_test_evict_chunk(UVM_TEST_EVICT_CHUNK_PARAMS *params, struct file 
     }
 
     pmm_lock(pmm);
-    status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
+    status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT, false);
     uvm_mutex_unlock(&pmm->lock);
 
     if (status != NV_OK)

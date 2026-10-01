@@ -1619,6 +1619,27 @@ typedef struct
     atomic64_t n_evict_free_pick_proactive;
     atomic64_t n_evict_free_pick_demand;
 
+    // Refault distances (uvm_perf_evict_refault_track, uvm_pmm_gpu.c): how many
+    // root chunks this GPU evicted between a block's eviction and its return.
+    // Index 0 is a block the allocation path evicted, 1 one the reserve thread
+    // evicted. Bucket b holds distances in [2^(b-1), 2^b), bucket 0 distance 0
+    // and bucket 11 everything from 1024 up, so the refaults a reserve of 2^k
+    // chunks would cause are buckets 0..k. Ungated, like the fault disposition
+    // tallies: they are only counted with tracking on, and the refault gate
+    // must not depend on the probe level.
+    atomic64_t n_refault_dist[2][12];
+
+    // Refaults below the reserve target, uvm_perf_evict_proactive. The count
+    // the refault gate divides by evictions.
+    atomic64_t n_refault_near;
+
+    // The refault gate (uvm_perf_evict_proactive_refault). on_wakes counts wakes
+    // that chose the full target, sum_evict_refault_harm adds the harm estimate
+    // in permille once per wake; both divide by n_evict_proactive_wakes, as the
+    // rate rule's two counters do. Zero with the gate off.
+    atomic64_t n_evict_refault_on_wakes;
+    atomic64_t sum_evict_refault_harm;
+
     // n_fault_authorized split by WHICH servicing already did the work. These
     // two sum to n_fault_authorized and decide whether a cross-batch dedup
     // filter is worth building - the §44.8 item that has never had a number.

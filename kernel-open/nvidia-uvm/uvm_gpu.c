@@ -1258,6 +1258,27 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_proactive_high_wakes));
     UVM_SEQ_OR_DBG_PRINT(s, "sum_evict_proactive_rate  %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_evict_proactive_rate));
+    // One line per origin and bucket, named n_refault_{dem,pro}_d<bucket> so
+    // the capture script can list them as ordinary keys.
+    {
+        static const char *origin[2] = { "dem", "pro" };
+        NvU32 o, b;
+
+        for (o = 0; o < 2; o++) {
+            for (b = 0; b < 12; b++) {
+                UVM_SEQ_OR_DBG_PRINT(s, "n_refault_%s_d%-2u        %llu\n",
+                                     origin[o],
+                                     b,
+                                     uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_refault_dist[o][b]));
+            }
+        }
+    }
+    UVM_SEQ_OR_DBG_PRINT(s, "n_refault_near            %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_refault_near));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_refault_on_wakes  %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_refault_on_wakes));
+    UVM_SEQ_OR_DBG_PRINT(s, "sum_evict_refault_harm    %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_evict_refault_harm));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_proactive %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_free_pick_proactive));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_demand  %llu\n",

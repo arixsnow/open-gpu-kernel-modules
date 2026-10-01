@@ -221,6 +221,18 @@ typedef struct
 
     // Set of pages using EGM mappings.
     uvm_page_mask_t egm_pages;
+
+    // Refault tracking (uvm_perf_evict_refault_track and
+    // uvm_perf_evict_proactive_refault in uvm_pmm_gpu.c), never written with
+    // both off. evict_stamp is this GPU's eviction count, pmm->refault.
+    // evict_seq, just after this block's chunks were last evicted from it, and
+    // 0 once the block has GPU memory again. evict_stamp_proactive says whether
+    // the reserve thread or the allocation path evicted them. Both are written
+    // under the block lock only: by evict_root_chunk_from_va_block, which holds
+    // it around the eviction, and by block_populate_gpu_chunk, which holds it
+    // around the population that ends the absence.
+    NvU64 evict_stamp;
+    bool evict_stamp_proactive;
 } uvm_va_block_gpu_state_t;
 
 typedef struct

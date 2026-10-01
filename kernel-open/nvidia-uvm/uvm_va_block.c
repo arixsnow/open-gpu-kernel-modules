@@ -3021,6 +3021,17 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
 
     gpu_state->chunks[chunk_index] = chunk;
 
+    // The block is getting GPU memory again after an eviction: count the
+    // refault distance (uvm_perf_evict_refault_track in uvm_pmm_gpu.c). This is
+    // the one place every population goes through, fault, prefetch and migrate
+    // alike, and the block lock it holds is the one the stamp was written under.
+    // A block with several chunks clears the stamp on the first, so it counts
+    // once. With tracking off no stamp is ever written and this is one load.
+    if (gpu_state->evict_stamp) {
+        uvm_pmm_gpu_note_refault(&gpu->pmm, gpu_state->evict_stamp, gpu_state->evict_stamp_proactive);
+        gpu_state->evict_stamp = 0;
+    }
+
     // Zero-copy working set, ARIADNE's (HPCA'26), off by default in this build.
     // Count this block in the demand estimate the host-pin decision is sized
     // from, in units of 2 MB blocks rather than bytes. A block has to be
