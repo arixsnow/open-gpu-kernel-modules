@@ -334,6 +334,16 @@ typedef struct uvm_gpu_root_chunk_struct
     // Zero for a chunk never touched, which is below every real epoch and so
     // never protects.
     NvU64 touch_epoch;
+
+    // Whether this root chunk's last placement on an eviction list was the
+    // USED list. Root chunks are placed on those lists in exactly two places,
+    // chunk_update_lists_locked (always USED) and
+    // root_chunk_update_eviction_list (any of the three), both under
+    // pmm->list_lock, which is the lock this is written and read under. While
+    // the chunk sits on a list, that list is the last one it was placed on, so
+    // this says which list it is on without walking any. Only
+    // uvm_perf_evict_victim_order=1 reads it.
+    bool on_used_list;
 } uvm_gpu_root_chunk_t;
 
 typedef struct uvm_pmm_gpu_struct

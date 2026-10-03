@@ -415,6 +415,38 @@ module_param(uvm_perf_evict_proactive_refault_confirm, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_proactive_refault_confirm,
                  "Consecutive harm windows at or below the threshold before the reserve fills (default 1).");
 
+// The order the victim walk takes root chunks off the USED list. 0 is stock.
+//
+//   0  stock. Every make-resident moves the chunk to the tail
+//      (block_mark_memory_used -> uvm_pmm_gpu_mark_root_chunk_used), so the
+//      head holds the chunk whose block last had pages migrated into it the
+//      longest ago.
+//   1  first residency. A chunk already on the USED list keeps its place on
+//      later make-residents, so the head holds the chunk that became resident
+//      the longest ago. This is what ARIADNE's victim policy does underneath
+//      its Sharing Degree key: their artifact suppresses the two make-resident
+//      calls, "Suppressed, that list degrades from least-recently-used to
+//      first-became-resident" (their port's comment, uvm_va_block.c).
+//   2  least recently touched among the first uvm_perf_evict_scan_limit
+//      candidates of the USED list, by touch_epoch, which every populate and
+//      every map stamps. That is the use ordering NVIDIA's own TODO on the
+//      victim walk asks for (Bug 1765193).
+//
+// Why, from Stage AE (20261002_144230) and Stage 3 (20260925_001619), kernel
+// time. ARIADNE's victim policy with Sharing Degree OFF (ariadne:evict) is
+// 2.2x their all-off path on bfs@110 and 2.0-2.2x on ATAX@150 and MVT@150, and
+// neutral on BICG and nw. With Sharing Degree on (ariadne:nozc) bfs@110 takes
+// 293K faults against their servicing-only arm's 1,068K, and ours takes 1,089K.
+// Stock refreshes a block only when pages migrate into it, so a fully
+// resident block in heavy use never refreshes, reaches the head and is evicted
+// while in use. 1 stops refreshing anything; 2 refreshes on map as well, and
+// since a block is mapped when its faults are serviced, it should not help
+// that case. 2 is there to test which of the two the gain needs.
+static unsigned uvm_perf_evict_victim_order = 0;
+module_param(uvm_perf_evict_victim_order, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_victim_order,
+                 "Eviction victim order: 0 = stock, 1 = first residency, 2 = least recently touched among the scan limit.");
+
 bool uvm_pmm_gpu_refault_tracking(void)
 {
     return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault;
@@ -903,6 +935,7 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
             UVM_ASSERT(root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT ||
                        root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
             list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
+            root_chunk->on_used_list = true;
         }
     }
 
@@ -1811,11 +1844,20 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t 
                chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 
     if (!chunk_is_root_chunk_pinned(pmm, chunk) && !chunk_is_in_eviction(pmm, chunk)) {
+        uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
+
         // An unpinned chunk not selected for eviction should be on one of the
         // eviction lists.
         UVM_ASSERT(!list_empty(&chunk->list));
 
-        list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
+        // First residency order (uvm_perf_evict_victim_order=1): a chunk
+        // already on the USED list keeps its place, so the list stays in the
+        // order chunks became resident. A chunk coming back from UNUSED or
+        // DISCARDED still moves, which keeps discard handling as stock has it.
+        if (!(uvm_perf_evict_victim_order == 1 && alloc_list == UVM_PMM_ALLOC_LIST_USED && root_chunk->on_used_list))
+            list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
+
+        root_chunk->on_used_list = (alloc_list == UVM_PMM_ALLOC_LIST_USED);
     }
 
     // The second population stamp. USED only: this helper also serves
@@ -1936,6 +1978,45 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     return NULL;
 }
 
+// uvm_perf_evict_victim_order=2. The UNUSED and DISCARDED lists come first as
+// in stock, because a chunk on them holds no data the GPU is using and is the
+// cheapest memory there is. On the USED list, the least recently touched of
+// the first uvm_perf_evict_scan_limit entries, the earliest on ties so a
+// list of equal stamps keeps stock order. Bounded for the same reason as
+// get_first_evictable_chunk: this runs under list_lock, a spinlock on the
+// allocation path.
+static uvm_gpu_chunk_t *get_least_recently_touched_chunk(uvm_pmm_gpu_t *pmm)
+{
+    uvm_gpu_chunk_t *chunk;
+    uvm_gpu_chunk_t *best = NULL;
+    NvU64 best_epoch = 0;
+    unsigned examined = 0;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    chunk = list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]);
+    if (chunk)
+        return chunk;
+
+    chunk = list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_DISCARDED]);
+    if (chunk)
+        return chunk;
+
+    list_for_each_entry(chunk, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        NvU64 epoch = root_chunk_from_chunk(pmm, chunk)->touch_epoch;
+
+        if (examined++ >= max(uvm_perf_evict_scan_limit, 1u))
+            break;
+
+        if (!best || epoch < best_epoch) {
+            best = chunk;
+            best_epoch = epoch;
+        }
+    }
+
+    return best;
+}
+
 // Who is asking for a victim. The proactive evictor with the fix is the only
 // caller that skips the free lists, and the free-pick counters are split by the
 // other two so the pre-fix bug reads directly off an old v arm instead of being
@@ -2005,7 +2086,12 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, e
     // lock, and it falls back to the head so the worst case is the behaviour
     // below.
     if (!chunk) {
-        if (uvm_perf_evict_skip_pending_replay)
+        // Order 2 is its own walk and takes precedence over the skip: both
+        // read touch_epoch, and running one inside the other would make an arm
+        // that set both mean neither. The runner refuses that combination.
+        if (uvm_perf_evict_victim_order == 2)
+            chunk = get_least_recently_touched_chunk(pmm);
+        else if (uvm_perf_evict_skip_pending_replay)
             chunk = get_first_evictable_chunk(pmm);
         else
             chunk = get_first_allocated_chunk(pmm);
