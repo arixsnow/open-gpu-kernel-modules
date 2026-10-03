@@ -342,8 +342,16 @@ typedef struct uvm_gpu_root_chunk_struct
     // pmm->list_lock, which is the lock this is written and read under. While
     // the chunk sits on a list, that list is the last one it was placed on, so
     // this says which list it is on without walking any. Only
-    // uvm_perf_evict_victim_order=1 reads it.
+    // uvm_perf_evict_victim_order 1, 3 and 4 read it.
     bool on_used_list;
+
+    // Victim orders 3 and 4, ARIADNE's Sharing Degree key. resident_ns is when
+    // the chunk was last moved onto the USED list, so ordering by it is the
+    // first-residency list order of order 1. sd is the owning block's Sharing
+    // Degree at its latest make-resident. Both are written and read under
+    // pmm->list_lock.
+    NvU64 resident_ns;
+    NvU8 sd;
 } uvm_gpu_root_chunk_t;
 
 typedef struct uvm_pmm_gpu_struct
@@ -488,18 +496,47 @@ typedef struct uvm_pmm_gpu_struct
         // Refaults at a distance below the reserve target, the ones a reserve
         // of that size would have caused. The refault gate reads it.
         atomic64_t near;
+
+        // Victim order 4: evictions and near refaults charged to the policy
+        // that chose the victim, index UVM_EVICT_POLICY_FIFO or _SD minus one.
+        // Counted from the eviction path and the population path, so atomic.
+        atomic64_t policy_evictions[2];
+        atomic64_t policy_near[2];
     } refault;
+
+    // Victim order 4's switch between first residency and Sharing Degree.
+    // Written and read by the victim walk under list_lock only.
+    struct
+    {
+        NvU64 last_evictions[2];
+        NvU64 last_near[2];
+        NvU32 harm_ewma[2];
+        bool seeded[2];
+        NvU8 leader;
+        NvU32 disagreements;
+    } policy_switch;
 } uvm_pmm_gpu_t;
+
+// Which victim policy chose an eviction, recorded in the refault stamp. 0 is
+// every eviction victim order 4 did not choose.
+#define UVM_EVICT_POLICY_NONE 0
+#define UVM_EVICT_POLICY_FIFO 1
+#define UVM_EVICT_POLICY_SD   2
+
+// Whether the fault path should keep each block's Sharing Degree ring, which
+// only victim orders 3 and 4 read. See uvm_perf_evict_victim_order.
+bool uvm_pmm_gpu_sharing_tracking(void);
 
 // Whether evictions are stamped and refaults counted. See
 // uvm_perf_evict_refault_track in uvm_pmm_gpu.c.
 bool uvm_pmm_gpu_refault_tracking(void);
 
-// A block that was evicted from this GPU is getting GPU memory again. stamp
-// and proactive are what its eviction recorded in uvm_va_block_gpu_state_t.
-// Called under the block lock, from the population path; it only reads one
-// atomic and increments counters, so it takes no lock of its own.
-void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive);
+// A block that was evicted from this GPU is getting GPU memory again. stamp,
+// proactive and policy are what its eviction recorded in
+// uvm_va_block_gpu_state_t. Called under the block lock, from the population
+// path; it only reads one atomic and increments counters, so it takes no lock
+// of its own.
+void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive, NvU8 policy);
 
 // Return containing GPU
 uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *pmm);
@@ -683,7 +720,10 @@ void uvm_pmm_gpu_root_chunk_unlock(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *roo
 // If the chunk is pinned or selected for eviction, this won't do anything. The
 // chunk can be pinned when it's being initially populated by the VA block.
 // Allow that state to make this API easy to use for the caller.
-void uvm_pmm_gpu_mark_root_chunk_used(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
+//
+// sd is the owning block's Sharing Degree, recorded for victim orders 3 and 4
+// whatever the chunk's state; the caller holds the block lock it is read under.
+void uvm_pmm_gpu_mark_root_chunk_used(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU8 sd);
 
 // Record that this root chunk has just been touched - populated or mapped - so
 // the eviction victim walk will pass over it until a fault replay has been

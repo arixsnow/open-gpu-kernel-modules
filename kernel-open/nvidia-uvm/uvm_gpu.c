@@ -1283,6 +1283,20 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_refault_resets));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_refault_switch_on %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_refault_switch_on));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_policy_fifo       %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_policy[0]));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_policy_sd         %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_policy[1]));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_refault_policy_fifo     %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_refault_policy_near[0]));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_refault_policy_sd       %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_refault_policy_near[1]));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_policy_disagree   %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_policy_disagree));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_policy_explore    %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_policy_explore));
+    UVM_SEQ_OR_DBG_PRINT(s, "n_evict_policy_sd_leads   %llu\n",
+                         uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_policy_sd_leads));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_proactive %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_free_pick_proactive));
     UVM_SEQ_OR_DBG_PRINT(s, "n_evict_free_pick_demand  %llu\n",

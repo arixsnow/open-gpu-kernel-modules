@@ -1995,6 +1995,13 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             uvm_page_mask_set(&block_context->thrashing_pin_mask, page_index);
         }
 
+        // Sharing Degree, for victim orders 3 and 4 (uvm_pmm_gpu.c). The same
+        // place in the loop as ARIADNE's: after the thrashing hint, so a
+        // throttled fault is not counted, and demand faults only. The block
+        // lock is held for the whole loop.
+        if (service_access_type != UVM_FAULT_ACCESS_TYPE_PREFETCH && uvm_pmm_gpu_sharing_tracking())
+            uvm_va_block_note_fault_utlb(va_block, (NvU8)current_entry->fault_source.utlb_id);
+
         // Compute new residency and update the masks
         new_residency = uvm_va_block_select_residency(va_block,
                                                       block_context->block_context,

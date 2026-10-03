@@ -45,6 +45,14 @@
 #include <linux/wait.h>
 #include <linux/nodemask.h>
 
+// Length of the per-block uTLB ring Sharing Degree is counted over. 16 is
+// ARIADNE's UVM_PERF_PREFETCH_INFO_STORE_SIZE.
+#define UVM_SHARING_RING_SIZE 16
+
+// Record one non-prefetch fault's source uTLB in the block's Sharing Degree
+// ring. Called with the block lock held. Defined in uvm_va_block.c.
+void uvm_va_block_note_fault_utlb(uvm_va_block_t *va_block, NvU8 utlb_id);
+
 // VA blocks are the leaf nodes in the uvm_va_space tree for managed allocations
 // (VA ranges of type uvm_va_range_managed_t):
 //
@@ -233,6 +241,11 @@ typedef struct
     // around the population that ends the absence.
     NvU64 evict_stamp;
     bool evict_stamp_proactive;
+
+    // The victim policy that chose the eviction (UVM_EVICT_POLICY_*), so a
+    // refault can be charged to it under victim order 4. Same lock and
+    // lifetime as evict_stamp.
+    NvU8 evict_stamp_policy;
 } uvm_va_block_gpu_state_t;
 
 typedef struct
@@ -538,6 +551,24 @@ struct uvm_va_block_struct
         bool is_spled;
         NvU8 thr_count;
     } prefetch_info;
+
+    // Sharing Degree, ARIADNE's (HPCA'26), carried for the victim orders 3 and
+    // 4 (uvm_perf_evict_victim_order in uvm_pmm_gpu.c) and touched by nothing
+    // else. A ring of the source uTLB ids of the most recent
+    // UVM_SHARING_RING_SIZE non-prefetch faults on this block, and sd, the
+    // number of distinct ids in it. Written under the block lock, by the fault
+    // servicing loop only.
+    //
+    // Their semantics, kept so the number means what theirs does: every
+    // non-prefetch fault is pushed (one uTLB storming a block fills the ring
+    // and reads 1), the ring never ages, and 0 is the empty-slot sentinel, so
+    // faults from uTLB 0 are not counted.
+    struct
+    {
+        NvU8 ring[UVM_SHARING_RING_SIZE];
+        NvU8 head;
+        NvU8 sd;
+    } sharing;
 
     struct
     {

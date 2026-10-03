@@ -442,14 +442,73 @@ MODULE_PARM_DESC(uvm_perf_evict_proactive_refault_confirm,
 // while in use. 1 stops refreshing anything; 2 refreshes on map as well, and
 // since a block is mapped when its faults are serviced, it should not help
 // that case. 2 is there to test which of the two the gain needs.
+//
+//   3  ARIADNE's Sharing Degree key on the first-residency list: the victim
+//      is the minimum of (resident_ns >> 10) + ((coeff * sd) >> 4) among the
+//      first uvm_perf_evict_sd_scan_limit USED entries, where sd is the number
+//      of distinct uTLBs among the block's last 16 demand faults
+//      (uvm_va_block_note_fault_utlb). Their key, their coefficient, their
+//      ring. Two differences, both stated where they live: sd is refreshed on
+//      every make-resident rather than frozen at first residency, and the scan
+//      is bounded because it runs under list_lock on the allocation path.
+//   4  per eviction, the choice between 1 and 3, blamed by refaults. See
+//      pick_by_policy_switch.
+//
+// Why 3 and 4, from Stage AG (20261003_161755) and AE (20261002_144230).
+// Order 1 recovers the bfs gain without Sharing Degree (1.53-1.56x against
+// order 0) but ariadne:nozc, which adds the SD credit, is 5-9x faster again on
+// ATAX@150 and MVT@150 and 1.3-1.6x on bfs@110/125, while being 2x slower on
+// BICG, nw@150 and XSBench@150. AE measured SD averaged over 23 workloads at
+// 0.977 of their servicing alone. Its gains and its losses fall on different
+// workloads, so 3 is the port and 4 is the per-workload choice.
 static unsigned uvm_perf_evict_victim_order = 0;
 module_param(uvm_perf_evict_victim_order, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_victim_order,
-                 "Eviction victim order: 0 = stock, 1 = first residency, 2 = least recently touched among the scan limit.");
+                 "Eviction victim order: 0 = stock, 1 = first residency, 2 = least recently touched among the scan limit, "
+                 "3 = ARIADNE Sharing Degree key, 4 = 1 or 3 chosen by refaults.");
+
+// ARIADNE's uvm_perf_SD_coeff_evictqueue, at their value. Each unit of
+// Sharing Degree is (coeff >> 4) units of about 1.024 us of residency credit,
+// so 1000000 is about 64 ms per sharer. Their port's comment notes the paper
+// states 100 us; the shipped value is what their numbers came from.
+static unsigned uvm_perf_evict_sd_coeff = 1000000;
+module_param(uvm_perf_evict_sd_coeff, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_sd_coeff,
+                 "Sharing Degree credit in victim orders 3 and 4, ARIADNE's coefficient (default 1000000).");
+
+// How many USED entries orders 3 and 4 examine for the minimum key. ARIADNE
+// walks the whole list, up to root_chunks.count (12288 on a 24 GB part), from
+// their kthread. Ours also runs on the allocation path under list_lock, so it
+// is bounded, wider than the order-2 walk because a credited chunk may sit well
+// behind the head.
+static unsigned uvm_perf_evict_sd_scan_limit = 256;
+module_param(uvm_perf_evict_sd_scan_limit, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_sd_scan_limit,
+                 "USED-list entries victim orders 3 and 4 examine (default 256).");
+
+// Under order 4, one disagreement in this many takes the trailing policy's
+// victim, so both policies keep producing evictions to be judged on.
+static unsigned uvm_perf_evict_policy_explore = 8;
+module_param(uvm_perf_evict_policy_explore, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_policy_explore,
+                 "Victim order 4: one in this many disagreements follows the trailing policy (default 8).");
+
+bool uvm_pmm_gpu_sharing_tracking(void)
+{
+    return uvm_perf_evict_victim_order == 3 || uvm_perf_evict_victim_order == 4;
+}
+
+// Whether the USED list keeps first-residency order.
+static bool victim_order_fifo(void)
+{
+    return uvm_perf_evict_victim_order == 1 || uvm_perf_evict_victim_order == 3 ||
+           uvm_perf_evict_victim_order == 4;
+}
 
 bool uvm_pmm_gpu_refault_tracking(void)
 {
-    return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault;
+    // Order 4 is judged by refaults, so it needs the stamps.
+    return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault || uvm_perf_evict_victim_order == 4;
 }
 
 // Helper type for refcounting cache
@@ -936,6 +995,10 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
                        root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
             list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
             root_chunk->on_used_list = true;
+
+            // Moved to the tail, so for orders 3 and 4 it is now the youngest.
+            if (uvm_pmm_gpu_sharing_tracking())
+                root_chunk->resident_ns = NV_GETTIME();
         }
     }
 
@@ -1465,12 +1528,14 @@ void uvm_pmm_gpu_merge_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 }
 
 // evict_seq is this root chunk's place in the GPU's eviction count, or 0 when
-// refault tracking is off; proactive says whether the reserve thread asked.
+// refault tracking is off; proactive says whether the reserve thread asked,
+// and policy which victim policy chose it under victim order 4.
 static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
                                                 uvm_gpu_root_chunk_t *root_chunk,
                                                 uvm_va_block_t *va_block,
                                                 NvU64 evict_seq,
-                                                bool proactive)
+                                                bool proactive,
+                                                NvU8 policy)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
@@ -1511,6 +1576,7 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
         if (gpu_state) {
             gpu_state->evict_stamp = evict_seq;
             gpu_state->evict_stamp_proactive = proactive;
+            gpu_state->evict_stamp_policy = policy;
         }
     }
 
@@ -1686,12 +1752,14 @@ static bool root_chunk_has_elevated_page(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_
     return page_count(page) > UVM_CHUNK_SIZE_MAX / PAGE_SIZE;
 }
 
-// proactive is true only for the reserve thread. It changes nothing about the
-// eviction; it is recorded in the refault stamp.
+// proactive is true only for the reserve thread, and policy is the victim
+// policy that chose the chunk under victim order 4. Neither changes the
+// eviction; both are recorded in the refault stamp.
 static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm,
                                   uvm_gpu_root_chunk_t *root_chunk,
                                   uvm_pmm_context_t pmm_context,
-                                  bool proactive)
+                                  bool proactive,
+                                  NvU8 policy)
 {
     NV_STATUS status;
     NV_STATUS free_status;
@@ -1726,14 +1794,24 @@ static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm,
         // re-lock the PMM mutex. This is ok as we don't rely on any PMM state
         // that can change across the calls. In particular, the walk to pick the
         // next VA block to evict above is always started from the root chunk.
-        if (!evict_seq && uvm_pmm_gpu_refault_tracking())
+        if (!evict_seq && uvm_pmm_gpu_refault_tracking()) {
             evict_seq = atomic64_inc_return(&pmm->refault.evict_seq);
+
+            // Once per data-bearing root chunk, the same unit the refault
+            // distance counts in, so a policy's harm is near refaults per
+            // eviction it chose.
+            if (policy != UVM_EVICT_POLICY_NONE) {
+                atomic64_inc(&pmm->refault.policy_evictions[policy - 1]);
+                uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_policy[policy - 1]);
+            }
+        }
 
         status = evict_root_chunk_from_va_block(pmm,
                                                 root_chunk,
                                                 evict.va_block_to_evict_from,
                                                 evict_seq,
-                                                proactive);
+                                                proactive,
+                                                policy);
         if (status != NV_OK)
             goto error;
     }
@@ -1834,8 +1912,13 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     ++pmm->root_chunks.in_eviction_count;
 }
 
-static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_alloc_list_t alloc_list)
+static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm,
+                                            uvm_gpu_chunk_t *chunk,
+                                            uvm_pmm_alloc_list_t alloc_list,
+                                            NvU8 sd)
 {
+    uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
+
     uvm_spin_lock(&pmm->list_lock);
 
     UVM_ASSERT(uvm_gpu_chunk_get_size(chunk) == UVM_CHUNK_SIZE_MAX);
@@ -1844,21 +1927,28 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t 
                chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 
     if (!chunk_is_root_chunk_pinned(pmm, chunk) && !chunk_is_in_eviction(pmm, chunk)) {
-        uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
-
         // An unpinned chunk not selected for eviction should be on one of the
         // eviction lists.
         UVM_ASSERT(!list_empty(&chunk->list));
 
-        // First residency order (uvm_perf_evict_victim_order=1): a chunk
-        // already on the USED list keeps its place, so the list stays in the
-        // order chunks became resident. A chunk coming back from UNUSED or
+        // First residency order (uvm_perf_evict_victim_order 1, 3 and 4): a
+        // chunk already on the USED list keeps its place, so the list stays in
+        // the order chunks became resident. A chunk coming back from UNUSED or
         // DISCARDED still moves, which keeps discard handling as stock has it.
-        if (!(uvm_perf_evict_victim_order == 1 && alloc_list == UVM_PMM_ALLOC_LIST_USED && root_chunk->on_used_list))
+        if (!(victim_order_fifo() && alloc_list == UVM_PMM_ALLOC_LIST_USED && root_chunk->on_used_list)) {
             list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
+
+            if (alloc_list == UVM_PMM_ALLOC_LIST_USED && uvm_pmm_gpu_sharing_tracking())
+                root_chunk->resident_ns = NV_GETTIME();
+        }
 
         root_chunk->on_used_list = (alloc_list == UVM_PMM_ALLOC_LIST_USED);
     }
+
+    // The block's latest Sharing Degree, whatever the chunk's state, so a
+    // chunk that comes off a pin carries what its block has seen since.
+    if (alloc_list == UVM_PMM_ALLOC_LIST_USED && uvm_pmm_gpu_sharing_tracking())
+        root_chunk->sd = sd;
 
     // The second population stamp. USED only: this helper also serves
     // mark_root_chunk_unused and mark_root_chunk_discarded, and neither of
@@ -1879,19 +1969,19 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t 
     uvm_spin_unlock(&pmm->list_lock);
 }
 
-void uvm_pmm_gpu_mark_root_chunk_used(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+void uvm_pmm_gpu_mark_root_chunk_used(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU8 sd)
 {
-    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_USED);
+    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_USED, sd);
 }
 
 void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
-    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_UNUSED);
+    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_UNUSED, 0);
 }
 
 void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
-    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_DISCARDED);
+    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_DISCARDED, 0);
 }
 
 static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
@@ -2017,6 +2107,155 @@ static uvm_gpu_chunk_t *get_least_recently_touched_chunk(uvm_pmm_gpu_t *pmm)
     return best;
 }
 
+// ARIADNE's eviction key (their block_mark_memory_used and victim scan),
+// minimum first: residency time in units of about 1.024 us plus
+// (coeff * sd) >> 4 of credit.
+static NvU64 root_chunk_sd_key(uvm_gpu_root_chunk_t *root_chunk)
+{
+    return (root_chunk->resident_ns >> 10) + (((NvU64)uvm_perf_evict_sd_coeff * root_chunk->sd) >> 4);
+}
+
+// Victim orders 3 and 4. Returns the Sharing Degree candidate, the minimum
+// key among the first uvm_perf_evict_sd_scan_limit USED entries, and sets
+// *fifo to the first-residency candidate, the USED head. The UNUSED and
+// DISCARDED lists still come first and then both candidates are their head,
+// as in every other order. Ties keep list order, so with every sd equal the
+// two candidates are the same chunk.
+static uvm_gpu_chunk_t *get_sharing_degree_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t **fifo)
+{
+    uvm_gpu_chunk_t *chunk;
+    uvm_gpu_chunk_t *best = NULL;
+    NvU64 best_key = 0;
+    unsigned examined = 0;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    *fifo = NULL;
+
+    chunk = list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]);
+    if (!chunk)
+        chunk = list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_DISCARDED]);
+    if (chunk) {
+        *fifo = chunk;
+        return chunk;
+    }
+
+    list_for_each_entry(chunk, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        NvU64 key = root_chunk_sd_key(root_chunk_from_chunk(pmm, chunk));
+
+        if (examined++ >= max(uvm_perf_evict_sd_scan_limit, 1u))
+            break;
+
+        if (!*fifo)
+            *fifo = chunk;
+
+        if (!best || key < best_key) {
+            best = chunk;
+            best_key = key;
+        }
+    }
+
+    return best;
+}
+
+// Victim order 4: which policy leads, from the refaults each one's victims
+// have caused. Called under list_lock by the walk, which is the only writer of
+// pmm->policy_switch.
+//
+// The judge is CPPE's (Coordinated Page Prefetch and Eviction, MHPE): "A
+// buffer is allocated for an application to record recently evicted chunks.
+// When a page fault occurs, the buffer is searched for the corresponding
+// chunk. On a hit, the number of wrong evictions is increased", and the policy
+// switches on that count. Here the buffer is the refault stamp, a wrong
+// eviction is a refault closer than the horizon (as in the refault gate), and
+// the two policies are ARIADNE's two orders. Only evictions where the two
+// disagreed are charged, since an eviction both would have made says nothing
+// about either.
+//
+// A policy's harm is updated once 16 of its evictions have accumulated:
+// near refaults per eviction in permille, seeding or folding in with a 1/4
+// weight, as the gate does. The leader changes only when the other policy's
+// harm is below 4/5 of the leader's, so two near-equal policies do not trade
+// places every window.
+static NvU8 policy_switch_leader(uvm_pmm_gpu_t *pmm)
+{
+    NvU32 p;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    for (p = 0; p < 2; p++) {
+        NvU64 evictions = atomic64_read(&pmm->refault.policy_evictions[p]);
+        NvU64 near = atomic64_read(&pmm->refault.policy_near[p]);
+        NvU64 d_evict = evictions - pmm->policy_switch.last_evictions[p];
+        NvU64 harm;
+
+        if (d_evict < 16)
+            continue;
+
+        harm = (near - pmm->policy_switch.last_near[p]) * 1000;
+        do_div(harm, (NvU32)min_t(NvU64, d_evict, 0xFFFFFFFFULL));
+        harm = min_t(NvU64, harm, 1000);
+
+        if (pmm->policy_switch.seeded[p]) {
+            pmm->policy_switch.harm_ewma[p] = (NvU32)((3 * (NvU64)pmm->policy_switch.harm_ewma[p] + harm) / 4);
+        }
+        else {
+            pmm->policy_switch.harm_ewma[p] = (NvU32)harm;
+            pmm->policy_switch.seeded[p] = true;
+        }
+
+        pmm->policy_switch.last_evictions[p] = evictions;
+        pmm->policy_switch.last_near[p] = near;
+    }
+
+    {
+        const NvU32 lead = pmm->policy_switch.leader == UVM_EVICT_POLICY_SD ? 1 : 0;
+        const NvU32 other = 1 - lead;
+
+        if (pmm->policy_switch.seeded[0] && pmm->policy_switch.seeded[1] &&
+            (NvU64)pmm->policy_switch.harm_ewma[other] * 5 < (NvU64)pmm->policy_switch.harm_ewma[lead] * 4)
+            pmm->policy_switch.leader = other ? UVM_EVICT_POLICY_SD : UVM_EVICT_POLICY_FIFO;
+    }
+
+    return pmm->policy_switch.leader;
+}
+
+// Victim order 4's pick. *policy is the policy that chose the victim, or
+// UVM_EVICT_POLICY_NONE when the two agreed.
+static uvm_gpu_chunk_t *pick_by_policy_switch(uvm_pmm_gpu_t *pmm, NvU8 *policy)
+{
+    uvm_gpu_chunk_t *fifo;
+    uvm_gpu_chunk_t *sd = get_sharing_degree_chunk(pmm, &fifo);
+    NvU8 leader;
+    bool explore;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    *policy = UVM_EVICT_POLICY_NONE;
+
+    if (sd == fifo)
+        return sd;
+
+    leader = policy_switch_leader(pmm);
+    pmm->policy_switch.disagreements++;
+    explore = uvm_perf_evict_policy_explore &&
+              pmm->policy_switch.disagreements % uvm_perf_evict_policy_explore == 0;
+
+    if (explore)
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_policy_explore);
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_policy_disagree);
+    if (leader == UVM_EVICT_POLICY_SD)
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_policy_sd_leads);
+
+    if ((leader == UVM_EVICT_POLICY_SD) != explore) {
+        *policy = UVM_EVICT_POLICY_SD;
+        return sd;
+    }
+
+    *policy = UVM_EVICT_POLICY_FIFO;
+    return fifo;
+}
+
 // Who is asking for a victim. The proactive evictor with the fix is the only
 // caller that skips the free lists, and the free-pick counters are split by the
 // other two so the pre-fix bug reads directly off an old v arm instead of being
@@ -2035,9 +2274,13 @@ typedef enum
     EVICT_PICK_PROACTIVE_SKIP_FREE,
 } evict_pick_t;
 
-static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, evict_pick_t pick)
+// *policy is the victim policy that chose the chunk under victim order 4, and
+// UVM_EVICT_POLICY_NONE otherwise.
+static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, evict_pick_t pick, NvU8 *policy)
 {
     uvm_gpu_chunk_t *chunk = NULL;
+
+    *policy = UVM_EVICT_POLICY_NONE;
 
     uvm_spin_lock(&pmm->list_lock);
 
@@ -2089,8 +2332,17 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, e
         // Order 2 is its own walk and takes precedence over the skip: both
         // read touch_epoch, and running one inside the other would make an arm
         // that set both mean neither. The runner refuses that combination.
-        if (uvm_perf_evict_victim_order == 2)
+        if (uvm_perf_evict_victim_order == 2) {
             chunk = get_least_recently_touched_chunk(pmm);
+        }
+        else if (uvm_perf_evict_victim_order == 3) {
+            uvm_gpu_chunk_t *fifo;
+
+            chunk = get_sharing_degree_chunk(pmm, &fifo);
+        }
+        else if (uvm_perf_evict_victim_order == 4) {
+            chunk = pick_by_policy_switch(pmm, policy);
+        }
         else if (uvm_perf_evict_skip_pending_replay)
             chunk = get_first_evictable_chunk(pmm);
         else
@@ -2111,7 +2363,9 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, e
 // The stock entry point, for callers that are not the proactive evictor.
 static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
 {
-    return pick_root_chunk_to_evict_from(pmm, EVICT_PICK_DEMAND);
+    NvU8 policy;
+
+    return pick_root_chunk_to_evict_from(pmm, EVICT_PICK_DEMAND, &policy);
 }
 
 static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
@@ -2123,6 +2377,7 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
     NV_STATUS status;
     uvm_gpu_chunk_t *chunk;
     uvm_gpu_root_chunk_t *root_chunk;
+    NvU8 policy;
     NvU64 t0;
 
     uvm_assert_mutex_locked(&pmm->lock);
@@ -2133,7 +2388,7 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
     // so ns_pmm_lock_wait cannot see it.
     t0 = uvm_lock_probe_begin();
 
-    root_chunk = pick_root_chunk_to_evict_from(pmm, pick);
+    root_chunk = pick_root_chunk_to_evict_from(pmm, pick, &policy);
 
     uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_evict_pick, NULL);
 
@@ -2150,7 +2405,7 @@ static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
         return NV_ERR_NO_MEMORY;
     }
 
-    status = evict_root_chunk(pmm, root_chunk, pmm_context, pick != EVICT_PICK_DEMAND);
+    status = evict_root_chunk(pmm, root_chunk, pmm_context, pick != EVICT_PICK_DEMAND, policy);
     if (status != NV_OK)
         return status;
 
@@ -3179,7 +3434,7 @@ static NvU32 free_root_chunks_upto(uvm_pmm_gpu_t *pmm, NvU32 target)
 // A stamp can never be ahead of the count: both come from the same atomic, the
 // stamp first. The guard keeps a corrupted stamp from wrapping into the top
 // bucket rather than asserting on the fault path.
-void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive)
+void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive, NvU8 policy)
 {
     const NvU64 now = atomic64_read(&pmm->refault.evict_seq);
     const NvU64 distance = now >= stamp ? now - stamp : 0;
@@ -3192,11 +3447,22 @@ void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive)
     const NvU64 horizon = uvm_perf_evict_proactive_refault_horizon ? uvm_perf_evict_proactive_refault_horizon :
                                                                      uvm_perf_evict_proactive;
 
+    // The victim policies are judged against the same horizon, and against 16
+    // root chunks when no reserve or horizon sets one, so a pool without a
+    // reserve still charges its wrong evictions. 16 is the reserve depth the
+    // refault gate was built at.
+    const NvU64 policy_horizon = horizon ? horizon : 16;
+
     uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_dist[proactive ? 1 : 0][bucket]);
 
     if (distance < horizon) {
         atomic64_inc(&pmm->refault.near);
         uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_near);
+    }
+
+    if (policy != UVM_EVICT_POLICY_NONE && distance < policy_horizon) {
+        atomic64_inc(&pmm->refault.policy_near[policy - 1]);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_policy_near[policy - 1]);
     }
 }
 
@@ -3904,7 +4170,7 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_range(void *void_pmm,
 
         pmm_lock(pmm);
 
-        status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_PMA_EVICTION, false);
+        status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_PMA_EVICTION, false, UVM_EVICT_POLICY_NONE);
         should_inject_error = uvm_pmm_should_inject_pma_eviction_error(pmm);
 
         uvm_mutex_unlock(&pmm->lock);
@@ -4220,6 +4486,18 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->proactive_evict.harm_ok = false;
     atomic64_set(&pmm->refault.evict_seq, 0);
     atomic64_set(&pmm->refault.near, 0);
+    for (i = 0; i < 2; i++) {
+        atomic64_set(&pmm->refault.policy_evictions[i], 0);
+        atomic64_set(&pmm->refault.policy_near[i], 0);
+        pmm->policy_switch.last_evictions[i] = 0;
+        pmm->policy_switch.last_near[i] = 0;
+        pmm->policy_switch.harm_ewma[i] = 0;
+        pmm->policy_switch.seeded[i] = false;
+    }
+    // First residency leads until Sharing Degree shows fewer wrong evictions:
+    // AE measured it ahead on average (sd over svc 0.977).
+    pmm->policy_switch.leader = UVM_EVICT_POLICY_FIFO;
+    pmm->policy_switch.disagreements = 0;
 
     pmm->initialized = true;
 
@@ -4507,7 +4785,7 @@ NV_STATUS uvm_test_evict_chunk(UVM_TEST_EVICT_CHUNK_PARAMS *params, struct file 
     }
 
     pmm_lock(pmm);
-    status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT, false);
+    status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT, false, UVM_EVICT_POLICY_NONE);
     uvm_mutex_unlock(&pmm->lock);
 
     if (status != NV_OK)

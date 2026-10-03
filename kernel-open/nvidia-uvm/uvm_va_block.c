@@ -3028,7 +3028,10 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
     // A block with several chunks clears the stamp on the first, so it counts
     // once. With tracking off no stamp is ever written and this is one load.
     if (gpu_state->evict_stamp) {
-        uvm_pmm_gpu_note_refault(&gpu->pmm, gpu_state->evict_stamp, gpu_state->evict_stamp_proactive);
+        uvm_pmm_gpu_note_refault(&gpu->pmm,
+                                 gpu_state->evict_stamp,
+                                 gpu_state->evict_stamp_proactive,
+                                 gpu_state->evict_stamp_policy);
         gpu_state->evict_stamp = 0;
     }
 
@@ -3557,8 +3560,37 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
     if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
         // The chunk has to be there if this GPU is resident
         UVM_ASSERT(uvm_processor_mask_test(&block->resident, id));
-        uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm, uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0]);
+        uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm,
+                                         uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0],
+                                         block->sharing.sd);
     }
+}
+
+// See the sharing struct in uvm_va_block.h. ARIADNE keeps the distinct count
+// incrementally and stops its scan at the first empty slot, so a uTLB-0 fault
+// written into the ring hides the slots after it until it is overwritten. This
+// recounts every non-empty slot instead, over a 256-bit set since uTLB ids are
+// eight bits: the same quantity, without that blind spot, at 16 steps.
+void uvm_va_block_note_fault_utlb(uvm_va_block_t *va_block, NvU8 utlb_id)
+{
+    DECLARE_BITMAP(seen, 256);
+    NvU8 sd = 0;
+    NvU32 i;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    va_block->sharing.ring[va_block->sharing.head] = utlb_id;
+    va_block->sharing.head = (va_block->sharing.head + 1) % UVM_SHARING_RING_SIZE;
+
+    bitmap_zero(seen, 256);
+    for (i = 0; i < UVM_SHARING_RING_SIZE; i++) {
+        NvU8 id = va_block->sharing.ring[i];
+
+        if (id != 0 && !__test_and_set_bit(id, seen))
+            sd++;
+    }
+
+    va_block->sharing.sd = sd;
 }
 
 static void block_set_resident_processor(uvm_va_block_t *block, uvm_processor_id_t id)

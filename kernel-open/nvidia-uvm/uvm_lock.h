@@ -1647,6 +1647,20 @@ typedef struct
     atomic64_t n_evict_refault_resets;
     atomic64_t n_evict_refault_switch_on;
 
+    // Victim order 4 (uvm_perf_evict_victim_order, uvm_pmm_gpu.c). Index 0 is
+    // first residency, 1 Sharing Degree. n_evict_policy counts data-bearing
+    // evictions each policy chose where the two disagreed, and
+    // n_refault_policy_near their refaults inside the horizon; the ratio is
+    // each policy's wrong-eviction rate. disagree counts the picks where the
+    // two differed, explore those that followed the trailing policy, and
+    // sd_leads those taken while Sharing Degree led. Ungated: the switch reads
+    // its own atomics, these only report it.
+    atomic64_t n_evict_policy[2];
+    atomic64_t n_refault_policy_near[2];
+    atomic64_t n_evict_policy_disagree;
+    atomic64_t n_evict_policy_explore;
+    atomic64_t n_evict_policy_sd_leads;
+
     // n_fault_authorized split by WHICH servicing already did the work. These
     // two sum to n_fault_authorized and decide whether a cross-batch dedup
     // filter is worth building - the §44.8 item that has never had a number.
