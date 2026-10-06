@@ -3032,6 +3032,12 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
                                  gpu_state->evict_stamp,
                                  gpu_state->evict_stamp_proactive,
                                  gpu_state->evict_stamp_policy);
+
+        // Victim order 6 counts every refault of its two leader groups, at
+        // any distance, which is how DIP's set dueling compares miss counts.
+        if (uvm_pmm_gpu_dip_enabled())
+            uvm_pmm_gpu_note_dip_refault(&gpu->pmm, block->start);
+
         gpu_state->evict_stamp = 0;
     }
 

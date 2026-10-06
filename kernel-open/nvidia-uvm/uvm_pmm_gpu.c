@@ -465,7 +465,60 @@ static unsigned uvm_perf_evict_victim_order = 0;
 module_param(uvm_perf_evict_victim_order, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_victim_order,
                  "Eviction victim order: 0 = stock, 1 = first residency, 2 = least recently touched among the scan limit, "
-                 "3 = ARIADNE Sharing Degree key, 4 = 1 or 3 chosen by refaults.");
+                 "3 = ARIADNE Sharing Degree key, 4 = 1 or 3 chosen by refaults, 5 = bimodal insertion, "
+                 "6 = 1 or 5 by set dueling.");
+
+// Victim orders 5 and 6: thrash protection for loops larger than memory.
+//
+//   5  bimodal insertion (BIP) on the first-residency list: a chunk newly
+//      placed on the USED list goes to the HEAD, so it is the next victim once
+//      its batch is done with it, except one in uvm_perf_evict_bip_keep, which
+//      goes to the tail. In a loop over more blocks than fit, FIFO and LRU
+//      evict every block just before it is used again, while BIP keeps a stable
+//      sample resident and reuses it on every pass.
+//   6  per-block choice between 1 (tail) and 5 (BIP) by set dueling. Blocks
+//      whose VA block index is 0 mod 32 always use FIFO, 1 mod 32 always BIP;
+//      a refault on either group moves a saturating selector, and every other
+//      block follows the group that refaults less.
+//
+// Both come from Qureshi et al., "Adaptive Insertion Policies for High
+// Performance Caching", ISCA 2007 (BIP, DIP and set dueling), and CPPE's MHPE
+// uses MRU for thrashing access patterns for the same reason. Both require
+// the replay-pending skip (uvm_perf_evict_skip_pending_replay, token e),
+// enforced by the runner: a chunk placed at the head is otherwise the next
+// victim while its own batch still needs it.
+//
+// Why, from Stage AH (20261003_221652). ARIADNE's Sharing Degree arm moves
+// 5.5x fewer pages than ours on ATAX@150 (79M against 435M) and 3x fewer on
+// MVT@150. 85-90% of our refaults there come back at distances of 256 root
+// chunks or more, the signature of a cyclic pass over more data than fits.
+static unsigned uvm_perf_evict_bip_keep = 32;
+module_param(uvm_perf_evict_bip_keep, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_bip_keep,
+                 "Victim orders 5 and 6: one in this many BIP placements goes to the tail (default 32).");
+
+// Paced eviction. 0 is today: the reserve thread is woken when an allocation
+// has already found the reserve empty and has to evict on the fault path, or
+// every 10 ms. 1 also wakes it each time an allocation claims a free chunk
+// while PMA is out of 2MB pages, so the reserve is topped up as it drains and
+// the fault path should rarely have to evict at all.
+//
+// Why, from Stage 3 (20260925_001619) and Stage Z (20260924_172934) at
+// prefetch threshold 1. Both engines move the same pages on w7@110/1
+// (120.4M against ARIADNE's 121.6M) with the same pushes, but our batch-end
+// wait per page is 194 ns against their 150 (202 against 155 at 150%). Moving
+// evictions to the reserve thread brings it to 166/176 ns: copy-outs then
+// overlap copy-ins instead of preceding them in the same worker. But our
+// thread is rung only when the reserve is already empty, so a 2-chunk reserve
+// still left 152.8K of 242K evictions on the fault path, and a 16-chunk one
+// moved them off at the cost of +24% faults by evicting live blocks in bursts.
+// ARIADNE's fault loop rings its evictor before every block whose allocation
+// would leave fewer than two free chunks, and the evictor takes exactly one,
+// which is the pacing this carries over.
+static unsigned uvm_perf_evict_proactive_paced = 0;
+module_param(uvm_perf_evict_proactive_paced, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_proactive_paced,
+                 "Ring the reserve thread on every allocation from the reserve while PMA is out (0 = off).");
 
 // ARIADNE's uvm_perf_SD_coeff_evictqueue, at their value. Each unit of
 // Sharing Degree is (coeff >> 4) units of about 1.024 us of residency credit,
@@ -498,17 +551,96 @@ bool uvm_pmm_gpu_sharing_tracking(void)
     return uvm_perf_evict_victim_order == 3 || uvm_perf_evict_victim_order == 4;
 }
 
-// Whether the USED list keeps first-residency order.
+// Whether the USED list keeps first-residency order: no refresh on later
+// make-residents. Orders 5 and 6 place new chunks by BIP but do not refresh
+// them either.
 static bool victim_order_fifo(void)
 {
     return uvm_perf_evict_victim_order == 1 || uvm_perf_evict_victim_order == 3 ||
-           uvm_perf_evict_victim_order == 4;
+           uvm_perf_evict_victim_order == 4 || uvm_perf_evict_victim_order == 5 ||
+           uvm_perf_evict_victim_order == 6;
+}
+
+static bool victim_order_bip(void)
+{
+    return uvm_perf_evict_victim_order == 5 || uvm_perf_evict_victim_order == 6;
+}
+
+bool uvm_pmm_gpu_dip_enabled(void)
+{
+    return uvm_perf_evict_victim_order == 6;
+}
+
+// Order 6's leader groups, by VA block index.
+#define UVM_DIP_GROUPS      32
+#define UVM_DIP_GROUP_FIFO  0
+#define UVM_DIP_GROUP_BIP   1
+
+static NvU32 dip_group(NvU64 va_block_start)
+{
+    return (NvU32)((va_block_start / UVM_VA_BLOCK_SIZE) % UVM_DIP_GROUPS);
+}
+
+void uvm_pmm_gpu_note_dip_refault(uvm_pmm_gpu_t *pmm, NvU64 va_block_start)
+{
+    const NvU32 group = dip_group(va_block_start);
+
+    // Saturating, as DIP's PSEL. Concurrent workers can overshoot a bound by
+    // a step or two between the read and the add; the clamp on read in
+    // bip_place_head absorbs that.
+    if (group == UVM_DIP_GROUP_FIFO) {
+        if (atomic_read(&pmm->bip.psel) < UVM_DIP_PSEL_MAX)
+            atomic_inc(&pmm->bip.psel);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_dip_refault_fifo);
+    }
+    else if (group == UVM_DIP_GROUP_BIP) {
+        if (atomic_read(&pmm->bip.psel) > 0)
+            atomic_dec(&pmm->bip.psel);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_dip_refault_bip);
+    }
+}
+
+// Whether a root chunk newly placed on the USED list goes to the head (BIP)
+// rather than the tail. Orders 5 and 6 only; called under list_lock at the two
+// placement sites. va_block is the chunk's block, NULL if it has none yet, in
+// which case it is placed as a follower.
+static bool bip_place_head(uvm_pmm_gpu_t *pmm, uvm_va_block_t *va_block)
+{
+    bool bip;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    if (uvm_perf_evict_victim_order == 5) {
+        bip = true;
+    }
+    else {
+        const NvU32 group = va_block ? dip_group(va_block->start) : UVM_DIP_GROUPS;
+
+        if (group == UVM_DIP_GROUP_FIFO)
+            bip = false;
+        else if (group == UVM_DIP_GROUP_BIP)
+            bip = true;
+        else
+            bip = atomic_read(&pmm->bip.psel) > UVM_DIP_PSEL_MID;
+    }
+
+    // The one-in-N keep, so a loop's protected sample is refreshed over time.
+    if (bip && uvm_perf_evict_bip_keep && ++pmm->bip.placements % uvm_perf_evict_bip_keep == 0)
+        bip = false;
+
+    if (bip)
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_bip_head);
+    else
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_bip_tail);
+
+    return bip;
 }
 
 bool uvm_pmm_gpu_refault_tracking(void)
 {
-    // Order 4 is judged by refaults, so it needs the stamps.
-    return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault || uvm_perf_evict_victim_order == 4;
+    // Orders 4 and 6 are judged by refaults, so they need the stamps.
+    return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault ||
+           uvm_perf_evict_victim_order == 4 || uvm_perf_evict_victim_order == 6;
 }
 
 // Helper type for refcounting cache
@@ -642,6 +774,8 @@ static bool check_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static struct list_head *find_free_list_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static void proactive_evict_wake(uvm_pmm_gpu_t *pmm);
+static void proactive_evict_ring(uvm_pmm_gpu_t *pmm);
+static bool proactive_evict_pma_exhausted(uvm_pmm_gpu_t *pmm);
 
 static size_t root_chunk_index(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk)
 {
@@ -993,7 +1127,15 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
         else if (root_chunk->chunk.state != UVM_PMM_GPU_CHUNK_STATE_FREE) {
             UVM_ASSERT(root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT ||
                        root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
-            list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
+
+            // Orders 5 and 6 decide where a NEW placement goes. A chunk that
+            // is already a USED-list member moves to the tail as in every other
+            // order, so sub-chunk churn on a resident root chunk is unchanged.
+            if (victim_order_bip() && !root_chunk->on_used_list &&
+                bip_place_head(pmm, root_chunk->chunk.va_block))
+                list_move(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
+            else
+                list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
             root_chunk->on_used_list = true;
 
             // Moved to the tail, so for orders 3 and 4 it is now the youngest.
@@ -1003,8 +1145,13 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
     }
 
     // TODO: Bug 1757148: Improve fragmentation of split chunks
-    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE)
+    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE) {
+        // A root chunk going back to a free list has left residency, so its
+        // next placement on USED is a new one (orders 5 and 6 read this).
+        if (chunk == &root_chunk->chunk)
+            root_chunk->on_used_list = false;
         list_move_tail(&chunk->list, find_free_list_chunk(pmm, chunk));
+    }
     else if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         list_del_init(&chunk->list);
 }
@@ -1910,6 +2057,11 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     list_del_init(&chunk->list);
     uvm_gpu_chunk_set_in_eviction(chunk, true);
     ++pmm->root_chunks.in_eviction_count;
+
+    // Off every list now, so its next USED placement is a new one. Orders 1
+    // and 3-6 read this; it was left set before, which every placement site
+    // tolerated, but BIP has to know a returning chunk from a resident one.
+    root_chunk->on_used_list = false;
 }
 
 static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm,
@@ -1936,7 +2088,12 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm,
         // the order chunks became resident. A chunk coming back from UNUSED or
         // DISCARDED still moves, which keeps discard handling as stock has it.
         if (!(victim_order_fifo() && alloc_list == UVM_PMM_ALLOC_LIST_USED && root_chunk->on_used_list)) {
-            list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
+            // Orders 5 and 6 place a chunk newly arriving on USED by BIP.
+            if (alloc_list == UVM_PMM_ALLOC_LIST_USED && victim_order_bip() && !root_chunk->on_used_list &&
+                bip_place_head(pmm, root_chunk->chunk.va_block))
+                list_move(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
+            else
+                list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
 
             if (alloc_list == UVM_PMM_ALLOC_LIST_USED && uvm_pmm_gpu_sharing_tracking())
                 root_chunk->resident_ns = NV_GETTIME();
@@ -2124,6 +2281,7 @@ static NvU64 root_chunk_sd_key(uvm_gpu_root_chunk_t *root_chunk)
 static uvm_gpu_chunk_t *get_sharing_degree_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t **fifo)
 {
     uvm_gpu_chunk_t *chunk;
+    uvm_gpu_chunk_t *head = NULL;
     uvm_gpu_chunk_t *best = NULL;
     NvU64 best_key = 0;
     unsigned examined = 0;
@@ -2146,6 +2304,16 @@ static uvm_gpu_chunk_t *get_sharing_degree_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chu
         if (examined++ >= max(uvm_perf_evict_sd_scan_limit, 1u))
             break;
 
+        if (!head)
+            head = chunk;
+
+        // The replay-pending skip (token e) composes with these orders too:
+        // a chunk touched by the batch being serviced is not a candidate for
+        // either policy. ARIADNE's victim scans skip the current batch's
+        // blocks in every configuration (batch_blocks, last_access_time).
+        if (uvm_perf_evict_skip_pending_replay && root_chunk_replay_pending(pmm, chunk))
+            continue;
+
         if (!*fifo)
             *fifo = chunk;
 
@@ -2153,6 +2321,13 @@ static uvm_gpu_chunk_t *get_sharing_degree_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chu
             best = chunk;
             best_key = key;
         }
+    }
+
+    // Everything examined was in the current batch: fall back to the head,
+    // as get_first_evictable_chunk does, so the worst case is stock order.
+    if (!best) {
+        *fifo = head;
+        return head;
     }
 
     return best;
@@ -2768,6 +2943,15 @@ NV_STATUS alloc_chunk(uvm_pmm_gpu_t *pmm,
     }
 
 out:
+    // Paced eviction: an allocation while PMA is out of 2MB pages took memory
+    // the reserve holds (or had to evict for it), so top the reserve up now
+    // rather than when the next allocation finds it empty. See
+    // uvm_perf_evict_proactive_paced. Cheap enough for every allocation: one
+    // volatile read here, an atomic store and a wake in the ring.
+    if (uvm_perf_evict_proactive_paced && type == UVM_PMM_GPU_MEMORY_TYPE_USER &&
+        pmm->proactive_evict.thread && proactive_evict_pma_exhausted(pmm))
+        proactive_evict_ring(pmm);
+
     *out_chunk = chunk;
 
     return NV_OK;
@@ -2814,6 +2998,9 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     chunk->type = type;
     chunk->state = initial_state;
     chunk->is_zero = is_zero;
+
+    // Fresh from PMA, so not a USED-list member whatever its last life was.
+    root_chunk->on_used_list = false;
 
     if (initial_state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         ++pmm->root_chunks.pinned_count;
@@ -3479,6 +3666,20 @@ static void proactive_evict_wake(uvm_pmm_gpu_t *pmm)
     // One per demand-path eviction: both callers ring this immediately before
     // they evict. The adaptive reserve's rate estimate reads it.
     atomic64_inc(&pmm->proactive_evict.demand_evictions);
+
+    atomic_set(&pmm->proactive_evict.wake, 1);
+    wake_up(&pmm->proactive_evict.wq);
+}
+
+// The paced doorbell (uvm_perf_evict_proactive_paced): proactive_evict_wake
+// without the demand count, since no allocation had to evict. The rate rule
+// reads demand_evictions, and this must not move it.
+static void proactive_evict_ring(uvm_pmm_gpu_t *pmm)
+{
+    if (!pmm->proactive_evict.thread)
+        return;
+
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_proactive_rings);
 
     atomic_set(&pmm->proactive_evict.wake, 1);
     wake_up(&pmm->proactive_evict.wq);
@@ -4498,6 +4699,8 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     // AE measured it ahead on average (sd over svc 0.977).
     pmm->policy_switch.leader = UVM_EVICT_POLICY_FIFO;
     pmm->policy_switch.disagreements = 0;
+    pmm->bip.placements = 0;
+    atomic_set(&pmm->bip.psel, UVM_DIP_PSEL_MID);
 
     pmm->initialized = true;
 

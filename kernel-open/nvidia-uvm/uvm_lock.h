@@ -1661,6 +1661,18 @@ typedef struct
     atomic64_t n_evict_policy_explore;
     atomic64_t n_evict_policy_sd_leads;
 
+    // Paced eviction (uvm_perf_evict_proactive_paced): rings of the reserve
+    // thread from the allocation path, one per claimed chunk while PMA is out.
+    atomic64_t n_evict_proactive_rings;
+
+    // Victim orders 5 and 6: USED-list placements at the head (evicted first)
+    // and at the tail (kept), and order 6's leader-group refaults that moved
+    // the selector, FIFO leaders then BIP leaders.
+    atomic64_t n_evict_bip_head;
+    atomic64_t n_evict_bip_tail;
+    atomic64_t n_dip_refault_fifo;
+    atomic64_t n_dip_refault_bip;
+
     // n_fault_authorized split by WHICH servicing already did the work. These
     // two sum to n_fault_authorized and decide whether a cross-batch dedup
     // filter is worth building - the §44.8 item that has never had a number.

@@ -515,7 +515,33 @@ typedef struct uvm_pmm_gpu_struct
         NvU8 leader;
         NvU32 disagreements;
     } policy_switch;
+
+    // Victim orders 5 and 6, bimodal insertion on the first-residency list.
+    // placements counts BIP placements, for the one-in-N tail keep; it is
+    // written under list_lock. psel is order 6's set-dueling selector,
+    // moved by refaults of the two leader groups from the population path,
+    // so it is atomic. Above UVM_DIP_PSEL_MID the BIP leaders refault less and
+    // followers insert BIP.
+    struct
+    {
+        NvU32 placements;
+        atomic_t psel;
+    } bip;
 } uvm_pmm_gpu_t;
+
+// Order 6's selector: a saturating counter in [0, UVM_DIP_PSEL_MAX], DIP's
+// PSEL (Qureshi et al., ISCA 2007), started at the midpoint.
+#define UVM_DIP_PSEL_MAX 1023
+#define UVM_DIP_PSEL_MID 512
+
+// A refault on a block under victim order 6. Moves the selector if the block
+// is in one of the two leader groups. Called under the block lock from the
+// population path, next to uvm_pmm_gpu_note_refault; takes no lock.
+void uvm_pmm_gpu_note_dip_refault(uvm_pmm_gpu_t *pmm, NvU64 va_block_start);
+
+// Whether victim order 6 is selected, so the population path knows to call
+// the above.
+bool uvm_pmm_gpu_dip_enabled(void);
 
 // Which victim policy chose an eviction, recorded in the refault stamp. 0 is
 // every eviction victim order 4 did not choose.
