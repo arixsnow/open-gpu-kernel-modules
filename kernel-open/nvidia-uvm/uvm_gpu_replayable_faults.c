@@ -1570,11 +1570,38 @@ static uvm_fault_access_type_t check_fault_access_permissions(uvm_gpu_t *gpu,
 // Copy stage. Takes the block the fault thread staged, issues the transfer that
 // uvm_va_block_service_locked_populate deferred, and completes servicing.
 //
-// Runs with no lock held. uvm_va_block_service_copy_finish reaches
-// uvm_va_block_map, uvm_va_block_unmap and block_copy_resident_pages, each of
-// which asserts the block lock, so a debug build trips immediately. That is
-// their mechanism, not a port artifact, and it is why the ARIADNE arm is
-// validated on release builds only.
+// Theirs runs this with no lock held (their artifact, uvm_gpu_replayable_faults.c
+// :1390 on 535.86.05). uvm_va_block_service_copy_finish reaches uvm_va_block_map,
+// uvm_va_block_unmap and block_copy_resident_pages, all of which assume the block
+// lock, and one stock path under the map does more than assume it. When vidmem is
+// so short that a page table cannot be allocated without eviction,
+// block_alloc_pt_range_with_retry unlocks va_block->lock, allocates with eviction,
+// locks it again and returns MORE_PROCESSING_REQUIRED for the caller to retry.
+// From a thread that never held the lock, that releases a lock it does not own,
+// then takes it and returns with it held, and nothing here ever releases it. The
+// block stays locked by an idle thread for good.
+//
+// That is the 150% decode deadlock (notes/47 §5, repro 20261014_223737): Xid 31
+// FAULT_PDE on the page left unmapped, then the fault bottom half in mutex_lock
+// on the block forever, with this thread and the eviction thread idle at the top
+// of their loops and no live holder. It needs page tables to run out, so their
+// 4 GB benchmarks almost never reach it and an LLM thrashing at 150% reaches it
+// within a second. At 125% it never fired in three runs.
+//
+// The fix is the lock stock holds here, taken for the whole copy and finish.
+// Crash-only, under the MINIMAL-FIX principle: their mechanism is the overlap,
+// this block's copy running while the fault thread populates the next one, and
+// that overlap is unchanged, because the fault thread releases the next block's
+// lock at the end of service_fault_batch_block before it waits on done. The lock
+// only serialises this thread against another thread in the SAME block, which
+// stock code requires. A MORE_PROCESSING_REQUIRED from the retry now leaves the
+// lock released as it should be. The pages it did not reach stay resident and
+// unmapped, or uncopied, and the GPU refaults on them so the fault thread
+// finishes them on its normal path.
+//
+// The va_space read lock is still the fault thread's, held across its wait, not
+// this thread's. A develop build would trip on that assertion instead, so the
+// ARIADNE arm stays validated on release builds only.
 static int uvm_gpu_copy(void *data)
 {
     parallel_data_struct *pcd = (parallel_data_struct *)data;
@@ -1616,6 +1643,10 @@ static int uvm_gpu_copy(void *data)
         // box down with it.
         if (!pcd->stop && pcd->va_block) {
             if (UVM_ID_IS_GPU(pcd->processor_id)) {
+                // See the comment above the function: without this the stock
+                // page-table retry leaks the block lock under memory pressure.
+                uvm_mutex_lock(&pcd->va_block->lock);
+
                 for_each_id_in_mask(new_residency, &pcd->service_context.resident_processors) {
                     pcd->status = uvm_va_block_service_copy_finish(pcd->processor_id,
                                                                    pcd->va_block,
@@ -1623,6 +1654,8 @@ static int uvm_gpu_copy(void *data)
                     if (pcd->status != NV_OK)
                         break;
                 }
+
+                uvm_mutex_unlock(&pcd->va_block->lock);
             }
             else {
                 UVM_ERR_PRINT("ARIADNE copy thread was handed a batch with processor id %u, "
@@ -3547,6 +3580,13 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             uvm_processor_id_t new_residency;
             NV_STATUS drain_status = NV_OK;
 
+            // The block lock, for the reason uvm_gpu_copy takes it: theirs
+            // drains with none held (their artifact, :2451), and under page-table
+            // pressure the stock retry under the map leaks it. No block lock is
+            // held here, the loop is over and both kthread waits have returned,
+            // so this cannot order against another lock this thread holds.
+            uvm_mutex_lock(&ar_gpu->pd_copy.va_block->lock);
+
             for_each_id_in_mask(new_residency, &ar_gpu->pd_copy.service_context.resident_processors) {
                 drain_status = uvm_va_block_service_copy_finish(ar_gpu->pd_copy.processor_id,
                                                                 ar_gpu->pd_copy.va_block,
@@ -3555,11 +3595,23 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                     break;
             }
 
+            uvm_mutex_unlock(&ar_gpu->pd_copy.va_block->lock);
+
             ar_gpu->pd_copy.va_block = NULL;
             ar_gpu->pd_copy.processor_id = UVM_ID_INVALID;
             ar_gpu->pd_copy.new_residency = UVM_ID_INVALID;
 
-            if (status == NV_OK)
+            // MORE_PROCESSING_REQUIRED is the page-table retry asking to be run
+            // again, not a failure. Stock gets it inside UVM_VA_BLOCK_RETRY_LOCKED
+            // and loops. This split has no retry loop around the finish, and
+            // passing it up is fatal: any status other than NV_OK makes
+            // uvm_parent_gpu_service_replayable_faults cancel the whole batch to
+            // trigger RC, which is the Xid 31 the 150% runs died with. So it is
+            // dropped, the way uvm_gpu_copy already drops its own status: the
+            // pages the finish did not reach stay unmapped, the GPU refaults on
+            // them, and the next batch maps them on the normal path. Every other
+            // error is still returned.
+            if (status == NV_OK && drain_status != NV_ERR_MORE_PROCESSING_REQUIRED)
                 status = drain_status;
         }
     }
