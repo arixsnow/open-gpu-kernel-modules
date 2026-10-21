@@ -170,6 +170,16 @@ struct uvm_service_block_context_struct
     // the result of bitmap_weight(read_duplicate_count_mask)
     unsigned read_duplicate_count;
 
+    // Residency recording (patch 00): the pages of this servicing call that
+    // demand-faulted to the faulting GPU, prefetched pages excluded, and
+    // whether any was a write. Filled by service_fault_batch_block_locked and
+    // folded into the block's gpu_state->util only after the call succeeds,
+    // so a retried call records its pages once. Worker-private, like the rest
+    // of this context. util_dfault is valid only when util_dfault_count > 0.
+    uvm_page_mask_t util_dfault;
+    unsigned util_dfault_count;
+    bool util_dfault_write;
+
     //
     // Fields used by the CPU fault handling routine
     //

@@ -1374,6 +1374,80 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
     UVM_SEQ_OR_DBG_PRINT(s, "n_gpu_idle_windows        %llu\n",
                          uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gpu_idle_windows));
 
+    // Ground-truth counters (patch 00). Histograms print one key per bucket,
+    // <name>_b<bucket>, so the capture script lists them as ordinary keys.
+    {
+        static const char *flush_mode[2] = { "cached", "update" };
+        NvU32 i;
+
+        for (i = 0; i < 2; i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_flush_calls_%s     %llu\n",
+                                 flush_mode[i],
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_flush_calls[i]));
+            UVM_SEQ_OR_DBG_PRINT(s, "n_flush_discard_%s   %llu\n",
+                                 flush_mode[i],
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_flush_discard[i]));
+        }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_fetch_calls             %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fetch_calls));
+        UVM_SEQ_OR_DBG_PRINT(s, "sum_fetch_window          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_fetch_window));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_fetch_cap_hits          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fetch_cap_hits));
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_fault_auth_age); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_fault_auth_age_b%-2u     %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_fault_auth_age[i]));
+        }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_pages_h2d_demand        %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_pages_h2d_demand));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_pages_h2d_prefetch      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_pages_h2d_prefetch));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_pages_d2h_evict         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_pages_d2h_evict));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_pages_d2h_other         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_pages_d2h_other));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_thrash_hint_throttle    %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_thrash_hint_throttle));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_thrash_hint_pin         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_thrash_hint_pin));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_evict_victim_inbatch    %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_victim_inbatch));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_evict_victim_prevbatch  %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_victim_prevbatch));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_evict_pick_pending_fallback %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_pick_pending_fallback));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_util_res_closed         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_util_res_closed));
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_n4); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_util_n4_b%-2u            %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_util_n4[i]));
+        }
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_n64); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_util_n64_b%-2u           %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_util_n64[i]));
+        }
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_life); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_util_life_b%-2u          %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_util_life[i]));
+        }
+        UVM_SEQ_OR_DBG_PRINT(s, "sum_util_n4               %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_util_n4));
+        UVM_SEQ_OR_DBG_PRINT(s, "sum_util_n64              %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_util_n64));
+        UVM_SEQ_OR_DBG_PRINT(s, "sum_util_resident         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_util_resident));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_util_readonly_res       %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_util_readonly_res));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_evict_pages_copied      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_pages_copied));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_evict_pages_clean       %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_evict_pages_clean));
+    }
+
     uvm_up_read(&g_uvm_global.pm.lock);
 
     return 0;

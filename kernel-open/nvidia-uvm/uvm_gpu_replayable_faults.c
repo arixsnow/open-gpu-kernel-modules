@@ -998,6 +998,7 @@ static NV_STATUS fault_buffer_flush_locked(uvm_parent_gpu_t *parent_gpu,
 {
     NvU32 get;
     NvU32 put;
+    NvU32 discarded = 0;
     uvm_spin_loop_t spin;
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     NV_STATUS status;
@@ -1036,12 +1037,22 @@ static NV_STATUS fault_buffer_flush_locked(uvm_parent_gpu_t *parent_gpu,
         }
 
         fault_buffer_skip_replayable_entry(parent_gpu, get);
+        ++discarded;
         ++get;
         if (get == replayable_faults->max_faults)
             get = 0;
     }
 
     write_get(parent_gpu, get);
+
+    // Entries the GPU raised that no batch will ever fetch or count. Index 1
+    // covers both UPDATE_PUT modes: they differ only in waiting first.
+    {
+        const NvU32 mode = (flush_mode == UVM_GPU_BUFFER_FLUSH_MODE_CACHED_PUT) ? 0 : 1;
+
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_flush_calls[mode]);
+        uvm_lock_probe_add(&g_uvm_lock_contention_stats.n_flush_discard[mode], discarded);
+    }
 
     // The replay interval gate asks for the discard WITHOUT the replay, which
     // is the one caller that passes true here.
@@ -1259,6 +1270,15 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
 
     put = replayable_faults->cached_put;
 
+    // The backlog this batch sees: entries between GET and the PUT snapshot.
+    // Normal batch fetches only; the cancel paths drain everything (FETCH_ALL).
+    if (fetch_mode == FAULT_FETCH_MODE_BATCH_READY && get != put) {
+        const NvU32 window = (put > get) ? (put - get) : (put + replayable_faults->max_faults - get);
+
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fetch_calls);
+        uvm_lock_probe_add(&g_uvm_lock_contention_stats.sum_fetch_window, window);
+    }
+
     batch_context->is_single_instance_ptr = true;
     batch_context->last_fault = NULL;
 
@@ -1367,6 +1387,13 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
 
 done:
     write_get(parent_gpu, get);
+
+    // Stopped by the batch cap, not by running out of ready entries.
+    if (fetch_mode == FAULT_FETCH_MODE_BATCH_READY &&
+        status == NV_OK &&
+        get != put &&
+        fault_index >= parent_gpu->fault_buffer.max_batch_size)
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fetch_cap_hits);
 
     batch_context->num_cached_faults = fault_index;
     batch_context->num_coalesced_faults = num_coalesced_faults;
@@ -1816,6 +1843,8 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
     uvm_processor_mask_zero(&block_context->resident_processors);
     block_context->thrashing_pin_count = 0;
     block_context->read_duplicate_count = 0;
+    block_context->util_dfault_count = 0;
+    block_context->util_dfault_write = false;
 
     // The first entry is guaranteed to fall within this block
     UVM_ASSERT(first_fault_entry->va_space == va_space);
@@ -1923,7 +1952,11 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             // (ARIADNE) and 1.95 (ours) faults per page to do it, and the
             // excess ratio tracks the wall gap. Nothing else in the statistics
             // distinguishes a fault that moved data from one that did not.
-            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized);
+            //
+            // First pass only (patch 00): a MORE_PROCESSING_REQUIRED retry runs
+            // this loop again over the same entries and used to count them again.
+            if (block_context->num_retries == 0)
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized);
 
             // Split the authorized count by WHO already did the work, which is
             // what decides whether a cross-batch dedup filter is worth
@@ -1941,10 +1974,25 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             // says the redundancy is the worker pool racing itself inside one
             // batch, which is a different fix entirely, and it would explain
             // why auth% is 6.47 at zero workers and 45.95 at twenty-one.
-            if (va_block->service_epoch == gpu->parent->fault_buffer.replayable.batch_id)
-                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_inbatch);
-            else
-                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_xbatch);
+            //
+            // inbatch is zero by construction on this branch: service_epoch is
+            // stamped after the block's whole retry loop and a block's faults
+            // are serviced in one call. The age histogram below is what
+            // separates the previous batch's stale re-faults (age 1) from pages
+            // serviced long ago.
+            if (block_context->num_retries == 0) {
+                const NvU64 batch = gpu->parent->fault_buffer.replayable.batch_id;
+                const NvU64 epoch = va_block->service_epoch;
+
+                if (epoch == batch)
+                    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_inbatch);
+                else
+                    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_authorized_xbatch);
+
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_fault_auth_age[
+                    uvm_lock_stat_log2_bucket(batch >= epoch ? batch - epoch : 0,
+                                              ARRAY_SIZE(g_uvm_lock_contention_stats.n_fault_auth_age))]);
+            }
 
             // Not gated on the stats level: this one drives the flush-mode
             // decision below, not a report, so it has to be counted in every
@@ -1964,7 +2012,7 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
         //
         // Same predicate as above, so it is a second cheap region test under a
         // lock already held, not a new kind of query.
-        if (uvm_lock_probes_enabled()) {
+        if (uvm_lock_probes_enabled() && block_context->num_retries == 0) {
             if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
                 uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_fault_upgrade);
             else
@@ -1983,12 +2031,17 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             // Only update the flag the first time since logical permissions
             // cannot change while we hold the VA space lock.
             // TODO: Bug 1750144: That might not be true with HMM.
-            if (block_context->num_retries == 0)
+            if (block_context->num_retries == 0) {
                 mark_fault_throttled(batch_context, current_entry);
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_thrash_hint_throttle);
+            }
 
             continue;
         }
         else if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_PIN) {
+            if (block_context->num_retries == 0)
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_thrash_hint_pin);
+
             if (block_context->thrashing_pin_count++ == 0)
                 uvm_page_mask_zero(&block_context->thrashing_pin_mask);
 
@@ -2044,6 +2097,20 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             uvm_page_mask_set(&block_context->read_duplicate_mask, page_index);
         }
 
+        // Residency record (patch 00): a demand fault this GPU will service
+        // locally. Prefetch-type faults are the hardware prefetcher's guesses,
+        // not accesses, and do not count.
+        if (uvm_id_equal(new_residency, gpu->id) &&
+            service_access_type != UVM_FAULT_ACCESS_TYPE_PREFETCH &&
+            uvm_va_block_util_tracking()) {
+            if (block_context->util_dfault_count++ == 0)
+                uvm_page_mask_zero(&block_context->util_dfault);
+
+            uvm_page_mask_set(&block_context->util_dfault, page_index);
+            if (service_access_type >= UVM_FAULT_ACCESS_TYPE_WRITE)
+                block_context->util_dfault_write = true;
+        }
+
         ++page_fault_count;
 
         block_context->access_type[page_index] = service_access_type;
@@ -2067,6 +2134,19 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
     if (page_fault_count > 0) {
         block_context->region = uvm_va_block_region(first_page_index, last_page_index + 1);
         status = uvm_va_block_service_locked(gpu, va_block, va_block_retry, block_context);
+
+        // Fold this call's demand faults into the open residency. After the
+        // call, not before: a retried call reaches here again with the same
+        // pages, and the gpu_state may only exist once the call populated it.
+        if (status == NV_OK && block_context->util_dfault_count > 0) {
+            uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+
+            if (gpu_state && gpu_state->util.open) {
+                uvm_page_mask_or(&gpu_state->util.dfault, &gpu_state->util.dfault, &block_context->util_dfault);
+                if (block_context->util_dfault_write)
+                    gpu_state->util.dwrite = true;
+            }
+        }
     }
 
     *block_faults = i - first_fault_index;

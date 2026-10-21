@@ -3021,6 +3021,25 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
 
     gpu_state->chunks[chunk_index] = chunk;
 
+    // Open a residency record (patch 00). Before the refault hook below, which
+    // clears the eviction stamp this reads. The first chunk of a block with
+    // several opens it; later chunks join the same residency. Not for HMM,
+    // whose eviction path does not close it.
+    if (!gpu_state->util.open && !uvm_va_block_is_hmm(block) && uvm_va_block_util_tracking()) {
+        const NvU64 seq = atomic64_read(&gpu->pmm.refault.evict_seq);
+
+        uvm_page_mask_zero(&gpu_state->util.dfault);
+        gpu_state->util.dwrite = false;
+        gpu_state->util.populate_seq = seq;
+        if (gpu_state->evict_stamp) {
+            const NvU64 distance = seq >= gpu_state->evict_stamp ? seq - gpu_state->evict_stamp : 0;
+
+            gpu_state->util.refaults++;
+            gpu_state->util.last_distance = (NvU32)min_t(NvU64, distance, NV_U32_MAX);
+        }
+        gpu_state->util.open = true;
+    }
+
     // The block is getting GPU memory again after an eviction: count the
     // refault distance (uvm_perf_evict_refault_track in uvm_pmm_gpu.c). This is
     // the one place every population goes through, fault, prefetch and migrate
@@ -3570,6 +3589,11 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
                                          uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0],
                                          block->sharing.sd);
     }
+}
+
+bool uvm_va_block_util_tracking(void)
+{
+    return uvm_lock_probes_enabled();
 }
 
 // See the sharing struct in uvm_va_block.h. ARIADNE keeps the distinct count
@@ -4929,6 +4953,34 @@ out:
             uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_16up);
 
         uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_svc_copy_pages, moved);
+    }
+
+    // Every cause (patch 00). Eviction write-back is the one stock never
+    // reports in pages, and prefetch is the one the fault counters exclude.
+    if (uvm_lock_probes_enabled()) {
+        const NvU32 moved = uvm_page_mask_weight(migrated_pages);
+
+        if (moved && UVM_ID_IS_GPU(dst_id)) {
+            NvU32 prefetched = 0;
+
+            // A local mask: callers may hold state in the context's scratch
+            // masks across this function.
+            if (prefetch_page_mask) {
+                uvm_page_mask_t prefetched_pages;
+
+                if (uvm_page_mask_and(&prefetched_pages, migrated_pages, prefetch_page_mask))
+                    prefetched = uvm_page_mask_weight(&prefetched_pages);
+            }
+
+            uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_pages_h2d_prefetch, prefetched);
+            uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_pages_h2d_demand, moved - prefetched);
+        }
+        else if (moved) {
+            if (block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION)
+                uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_pages_d2h_evict, moved);
+            else
+                uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_pages_d2h_other, moved);
+        }
     }
 
     // Add the discarded pages to the migrated pages.
@@ -12846,6 +12898,8 @@ static NV_STATUS block_cpu_fault_locked(uvm_va_block_t *va_block,
 
     service_context->read_duplicate_count = 0;
     service_context->thrashing_pin_count = 0;
+    service_context->util_dfault_count = 0;
+    service_context->util_dfault_write = false;
     service_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
 
     if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_PIN) {
@@ -13325,6 +13379,65 @@ static void block_add_eviction_mappings_entry(void *args)
     UVM_ENTRY_VOID(block_add_eviction_mappings(args));
 }
 
+// Close the residency record at eviction (patch 00). resident is the number
+// of pages being evicted, clean the number the CPU still held, which the
+// eviction does not copy back. Called under the block lock from the eviction
+// path, which holds no VA space lock and so touches only block state and the
+// global counters.
+static void block_util_harvest(uvm_va_block_t *va_block,
+                               uvm_gpu_t *gpu,
+                               uvm_va_block_gpu_state_t *gpu_state,
+                               NvU32 resident,
+                               NvU32 clean)
+{
+    const uvm_page_index_t pages_per_big = max_t(uvm_page_index_t, UVM_BIG_PAGE_SIZE / PAGE_SIZE, 1);
+    const uvm_page_index_t num_pages = uvm_va_block_num_cpu_pages(va_block);
+    uvm_page_index_t first;
+    NvU32 n4;
+    NvU32 n64 = 0;
+
+    if (!gpu_state->util.open)
+        return;
+
+    gpu_state->util.open = false;
+
+    if (!uvm_lock_probes_enabled())
+        return;
+
+    n4 = uvm_page_mask_weight(&gpu_state->util.dfault);
+    for (first = 0; first < num_pages; first += pages_per_big) {
+        uvm_va_block_region_t big = uvm_va_block_region(first, min_t(uvm_page_index_t, first + pages_per_big, num_pages));
+
+        if (!uvm_page_mask_region_empty(&gpu_state->util.dfault, big))
+            n64++;
+    }
+
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_res_closed);
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_n4[
+        uvm_lock_stat_log2_bucket(n4, ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_n4))]);
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_n64[
+        uvm_lock_stat_log2_bucket(n64, ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_n64))]);
+
+    // The eviction sequence only advances with refault tracking on. It has
+    // already counted this eviction, so a block evicted before any other
+    // reads 1.
+    if (uvm_pmm_gpu_refault_tracking()) {
+        const NvU64 seq = atomic64_read(&gpu->pmm.refault.evict_seq);
+        const NvU64 life = seq >= gpu_state->util.populate_seq ? seq - gpu_state->util.populate_seq : 0;
+
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_life[
+            uvm_lock_stat_log2_bucket(life, ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_life))]);
+    }
+
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_util_n4, n4);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_util_n64, n64);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_util_resident, resident);
+    if (n4 > 0 && !gpu_state->util.dwrite)
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_readonly_res);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_evict_pages_copied, resident >= clean ? resident - clean : 0);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_evict_pages_clean, clean);
+}
+
 NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                                     uvm_gpu_t *gpu,
                                     uvm_gpu_chunk_t *root_chunk,
@@ -13344,6 +13457,8 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     struct mm_struct *mm;
     bool accessed_by_set = false;
     NvU64 t0;
+    NvU32 util_resident = 0;
+    NvU32 util_clean = 0;
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -13478,6 +13593,20 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
         const uvm_va_policy_t *policy = &va_block->managed_range->policy;
         accessed_by_set = uvm_processor_mask_get_count(&policy->accessed_by) > 0;
 
+        // Residency record (patch 00): pages the CPU still holds a valid copy
+        // of (read duplicates) leave without a copy. Counted before the
+        // migration changes residency, whenever the record is kept: the
+        // mechanisms that learn from it need it at any stats level.
+        if (gpu_state->util.open && uvm_va_block_util_tracking()) {
+            uvm_page_mask_t cpu_valid;
+
+            util_resident = uvm_page_mask_weight(pages_to_evict);
+            if (uvm_page_mask_and(&cpu_valid,
+                                  pages_to_evict,
+                                  uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE)))
+                util_clean = uvm_page_mask_weight(&cpu_valid);
+        }
+
         // TODO: Bug 1765193: make_resident() breaks read-duplication, but it's
         // not necessary to do so for eviction. Add a version that unmaps only
         // the processors that have mappings to the pages being evicted.
@@ -13500,6 +13629,9 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
 
     if (status != NV_OK)
         goto out;
+
+    if (!uvm_va_block_is_hmm(va_block))
+        block_util_harvest(va_block, gpu, gpu_state, util_resident, util_clean);
 
     // VA space lock may not be held and hence we cannot reestablish any
     // mappings here and need to defer it to a work queue.

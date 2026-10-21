@@ -1707,6 +1707,19 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
                        &g_uvm_lock_contention_stats.ns_evict_block_lock,
                        &g_uvm_lock_contention_stats.n_evict_block_lock_acqs);
 
+    // Victims the fault path serviced in the batch now running or the one
+    // before it (patch 00). service_epoch is written under the block lock held
+    // here; batch_id only grows, so a stale read can misfile one eviction by
+    // one batch. 0 is the epoch of a block never serviced.
+    if (uvm_lock_probes_enabled() && va_block->service_epoch != 0) {
+        const NvU64 batch = READ_ONCE(gpu->parent->fault_buffer.replayable.batch_id);
+
+        if (va_block->service_epoch == batch)
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_victim_inbatch);
+        else if (va_block->service_epoch + 1 == batch)
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_evict_victim_prevbatch);
+    }
+
     t0 = uvm_lock_probe_begin();
 
     status = uvm_va_block_evict_chunks(va_block, gpu, &root_chunk->chunk, &tracker);
@@ -2199,8 +2212,11 @@ static uvm_gpu_chunk_t *get_first_evictable_chunk(uvm_pmm_gpu_t *pmm)
             if (!head)
                 head = chunk;
 
-            if (examined++ >= uvm_perf_evict_scan_limit)
+            if (examined++ >= uvm_perf_evict_scan_limit) {
+                // The budget ran out: the head, protected or not (patch 00).
+                uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_pick_pending_fallback);
                 return head;
+            }
 
             if (!root_chunk_replay_pending(pmm, chunk))
                 return chunk;

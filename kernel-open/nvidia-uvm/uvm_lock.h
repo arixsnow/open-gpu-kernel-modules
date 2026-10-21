@@ -1955,6 +1955,82 @@ typedef struct
     // while the thread that would queue it is off CPU.
     atomic64_t ns_gpu_idle;
     atomic64_t n_gpu_idle_windows;
+
+    // ------------------------------------------------------------------
+    // Ground-truth counters (patch 00). All gated on stats_level >= 2 and
+    // none changes a decision.
+    // ------------------------------------------------------------------
+
+    // Fault-buffer entries a flush clears without fetching them, and the flush
+    // calls, by mode: [0] CACHED_PUT, [1] UPDATE_PUT or WAIT_UPDATE_PUT. Stock
+    // never counts these, so the fetched total (replayable_faults) understates
+    // what the GPU raised by exactly n_flush_discard[0] + [1]. The serial path
+    // discards more of its stale re-fault bursts than the pool does, because
+    // its longer batches leave more entries past the fetch cap; comparing
+    // fetched counts across widths without these compares different things.
+    atomic64_t n_flush_calls[2];
+    atomic64_t n_flush_discard[2];
+
+    // Fetch window: entries between GET and the PUT snapshot when a fetch
+    // starts, summed over fetches that found any, and fetches that stopped at
+    // the batch cap with entries still pending. sum/n is the backlog a batch
+    // sees; cap hits say whether the 256-entry batch is the limit.
+    atomic64_t n_fetch_calls;
+    atomic64_t sum_fetch_window;
+    atomic64_t n_fetch_cap_hits;
+
+    // Age, in batches, of an authorized fault: replayable batch_id minus the
+    // block's service_epoch. Buckets 0, 1, 2-3, 4-7, 8-15, 16-31, 32-63, >=64.
+    // Age 1 is the stale re-fault of the previous batch's replay; large ages
+    // are pages serviced long ago (an earlier workload iteration).
+    atomic64_t n_fault_auth_age[8];
+
+    // Pages moved by any make_resident, by direction and cause. h2d_demand +
+    // h2d_prefetch is what the fault path brought in; d2h_evict is eviction
+    // write-back, which no stock counter reports in pages; d2h_other is every
+    // other copy to the CPU (CPU faults, migrations).
+    atomic64_t n_pages_h2d_demand;
+    atomic64_t n_pages_h2d_prefetch;
+    atomic64_t n_pages_d2h_evict;
+    atomic64_t n_pages_d2h_other;
+
+    // Thrashing-detector hints taken on the replayable path, first pass only.
+    // Says whether stock thrashing mitigation engages at all on a cell.
+    atomic64_t n_thrash_hint_throttle;
+    atomic64_t n_thrash_hint_pin;
+
+    // Eviction victims whose block was serviced in the batch running when the
+    // eviction started (inbatch) or the batch before it (prevbatch). In the
+    // pool both are re-faults the eviction causes itself.
+    atomic64_t n_evict_victim_inbatch;
+    atomic64_t n_evict_victim_prevbatch;
+
+    // The replay-pending victim walk ran out of its scan budget and returned
+    // the list head. Under bimodal insertion the head is the newest chunk, so
+    // this is the measure of that leak.
+    atomic64_t n_evict_pick_pending_fallback;
+
+    // Residency harvest, recorded when a block's GPU chunks are evicted.
+    // A residency runs from the population that gave the block GPU memory to
+    // that eviction. n4 is the number of pages demand-faulted in it (prefetch
+    // excluded), n64 the number of 64 KB big pages holding at least one of
+    // them. Buckets: n4 0,1,2-3,...,256-511,512 (11); n64 0,1,2-3,...,16-31,32
+    // (7). life is the residency length in root-chunk evictions on this GPU,
+    // log2 like n_refault_dist; recorded only with refault tracking on, the
+    // only time the eviction sequence advances. resident is pages resident at
+    // eviction, copied those written back, clean those the CPU still held
+    // (read duplicates) and so evicted without a copy. readonly counts
+    // residencies whose demand faults were all reads.
+    atomic64_t n_util_res_closed;
+    atomic64_t n_util_n4[11];
+    atomic64_t n_util_n64[7];
+    atomic64_t n_util_life[12];
+    atomic64_t sum_util_n4;
+    atomic64_t sum_util_n64;
+    atomic64_t sum_util_resident;
+    atomic64_t n_util_readonly_res;
+    atomic64_t n_evict_pages_copied;
+    atomic64_t n_evict_pages_clean;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every
@@ -2069,6 +2145,13 @@ static inline void uvm_lock_stat_inc(atomic64_t *n)
 static inline void uvm_lock_stat_add(atomic64_t *n, NvU64 count)
 {
     atomic64_add(count, uvm_lock_stat_local(n));
+}
+
+// The log2 bucket the histograms use, n_refault_dist's convention: 0 for 0,
+// else fls64(v) capped at num_buckets - 1, so bucket b holds [2^(b-1), 2^b).
+static inline NvU32 uvm_lock_stat_log2_bucket(NvU64 v, NvU32 num_buckets)
+{
+    return v ? min_t(NvU32, fls64(v), num_buckets - 1) : 0;
 }
 
 // Open timestamp for the GPU idle window described on ns_gpu_idle above. One

@@ -1163,6 +1163,8 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
     uvm_processor_mask_zero(&service_context->resident_processors);
     service_context->read_duplicate_count = 0;
     service_context->thrashing_pin_count = 0;
+    service_context->util_dfault_count = 0;
+    service_context->util_dfault_write = false;
 
     // If the page is already resident on the accessing processor, the
     // notification for this page is stale. Skip it.

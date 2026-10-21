@@ -423,6 +423,8 @@ static NV_STATUS service_managed_fault_in_block_locked(uvm_va_block_t *va_block,
 
     service_context->read_duplicate_count = 0;
     service_context->thrashing_pin_count = 0;
+    service_context->util_dfault_count = 0;
+    service_context->util_dfault_write = false;
 
     page_index = uvm_va_block_cpu_page_index(va_block, fault_entry->fault_address);
 

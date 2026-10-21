@@ -53,6 +53,11 @@
 // ring. Called with the block lock held. Defined in uvm_va_block.c.
 void uvm_va_block_note_fault_utlb(uvm_va_block_t *va_block, NvU8 utlb_id);
 
+// True while per-residency records (uvm_va_block_gpu_state_t::util) are kept:
+// at stats level 2, and whenever a mechanism that reads them is enabled.
+// Defined in uvm_va_block.c.
+bool uvm_va_block_util_tracking(void);
+
 // VA blocks are the leaf nodes in the uvm_va_space tree for managed allocations
 // (VA ranges of type uvm_va_range_managed_t):
 //
@@ -246,6 +251,23 @@ typedef struct
     // refault can be charged to it under victim order 4. Same lock and
     // lifetime as evict_stamp.
     NvU8 evict_stamp_policy;
+
+    // Residency record (patch 00), maintained only while
+    // uvm_va_block_util_tracking() is true. A residency opens when
+    // block_populate_gpu_chunk gives the block GPU memory and closes when
+    // uvm_va_block_evict_chunks takes it away; a block whose pages all move
+    // to the CPU keeps its chunk and so stays in the same residency. dfault
+    // holds the pages this GPU demand-faulted in the residency (prefetched
+    // pages excluded), dwrite whether any of those faults was a write or
+    // stronger. Written under the block lock only, the evict_stamp contract.
+    struct {
+        uvm_page_mask_t dfault;
+        NvU64 populate_seq;
+        NvU32 refaults;
+        NvU32 last_distance;
+        bool open;
+        bool dwrite;
+    } util;
 } uvm_va_block_gpu_state_t;
 
 typedef struct
