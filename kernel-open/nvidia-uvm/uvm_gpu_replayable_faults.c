@@ -4615,6 +4615,9 @@ static void zc_pin_from_pressure(uvm_parent_gpu_t *parent_gpu)
     uvm_spin_lock(&gpu->pmm.list_lock);
     list_for_each(cur, &gpu->pmm.root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED])
         resident++;
+    // Used chunks held by scan resistance (patch 05) are resident too.
+    list_for_each(cur, &gpu->pmm.root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_PROTECTED])
+        resident++;
     uvm_spin_unlock(&gpu->pmm.list_lock);
 
     uvm_spin_lock(&gpu->zc_lock);

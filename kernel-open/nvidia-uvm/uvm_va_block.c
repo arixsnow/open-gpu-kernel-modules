@@ -14319,8 +14319,11 @@ static void block_util_harvest(uvm_va_block_t *va_block,
         if (uvm_perf_remote_policy != 9 &&
             uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX &&
             uvm_pmm_gpu_under_pressure(&gpu->pmm)) {
-            const bool qualifies = n4 <= uvm_perf_remote_max_faults &&
-                                   gpu_state->util.refaults >= uvm_perf_remote_min_refaults;
+            // Or, under scan resistance with remote overflow (patch 05), any
+            // block of a detected loop that was not in the protected set.
+            const bool qualifies = (n4 <= uvm_perf_remote_max_faults &&
+                                    gpu_state->util.refaults >= uvm_perf_remote_min_refaults) ||
+                                   (gpu_state->chunks[0] && uvm_pmm_gpu_scan_overflow(&gpu->pmm, gpu_state->chunks[0]));
 
             atomic64_inc(&va_block->managed_range->util.rmt_n);
             if (qualifies) {

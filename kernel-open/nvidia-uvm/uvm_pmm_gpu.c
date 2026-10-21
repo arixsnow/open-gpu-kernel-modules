@@ -249,6 +249,55 @@ bool uvm_pmm_gpu_protect_batch(void)
     return uvm_perf_evict_protect_batch != 0;
 }
 
+// Scan resistance (patch 05). When the working set is a loop larger than
+// memory, every LRU or FIFO order evicts exactly the block needed soonest: on
+// llama.cpp token generation, and ATAX and MVT at 150%, over 90% of refaults
+// come back after 256 or more evictions, and llama8b tg@110 runs 125 s against
+// 5 s for llama's own layer offload, which keeps a fixed part resident. This
+// keeps a fixed part resident too: while a loop is detected, newly placed root
+// chunks fill a protected set (UVM_PMM_ALLOC_LIST_PROTECTED) up to the user
+// chunks resident when pressure began minus uvm_perf_scan_margin, and the rest
+// is overflow.
+//
+//   0  off.
+//   1  detect, protect, and place overflow at the USED head (MRU), so the
+//      newest overflow chunk is evicted first and the older ones survive.
+//   2  detect, protect, and serve evicted overflow blocks remotely (needs
+//      uvm_perf_remote_policy; the overflow then stops cycling at all).
+//   3  static oracle: protect from the first eviction on, no detector, never
+//      release, MRU overflow. The premise test: if this does not beat the
+//      victim orders on ATAX@150 the remaining cost is not eviction order.
+//
+// The detector reads the refault distances (refault tracking is forced on):
+// a loop of B blocks over C chunks refaults at a near-constant distance of
+// about B - C, so most of a window's refaults land in two adjacent log2
+// buckets, while uniform random access spreads them. LOOP is entered after two
+// windows with at least uvm_perf_scan_conc_permille of uvm_perf_scan_window
+// refaults in two adjacent buckets at or above uvm_perf_scan_min_bucket, and
+// left after two windows under uvm_perf_scan_off_permille or a second without
+// refaults. Random access entering LOOP by mistake costs nothing: every order
+// has the same hit rate there. A shifting hot set is the case it can hurt,
+// which is why it releases on a change.
+static unsigned uvm_perf_scan_protect = 0;
+module_param(uvm_perf_scan_protect, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_scan_protect,
+                 "Scan resistance for loops larger than memory: 0 off, 1 MRU overflow, 2 remote overflow, 3 static oracle.");
+
+static unsigned uvm_perf_scan_margin = 256;
+module_param(uvm_perf_scan_margin, uint, S_IRUGO);
+static unsigned uvm_perf_scan_conc_permille = 800;
+module_param(uvm_perf_scan_conc_permille, uint, S_IRUGO);
+static unsigned uvm_perf_scan_off_permille = 600;
+module_param(uvm_perf_scan_off_permille, uint, S_IRUGO);
+static unsigned uvm_perf_scan_window = 256;
+module_param(uvm_perf_scan_window, uint, S_IRUGO);
+static unsigned uvm_perf_scan_min_bucket = 5;
+module_param(uvm_perf_scan_min_bucket, uint, S_IRUGO);
+
+#define UVM_SCAN_OFF  0
+#define UVM_SCAN_LOOP 1
+#define UVM_SCAN_IDLE_NS (1000ULL * 1000 * 1000)
+
 #define UVM_PMM_PRESSURE_WINDOW_NS (1000ULL * 1000 * 1000)
 
 bool uvm_pmm_gpu_under_pressure(uvm_pmm_gpu_t *pmm)
@@ -686,7 +735,8 @@ bool uvm_pmm_gpu_refault_tracking(void)
     // uvm_perf_remote_min_refaults).
     return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault ||
            uvm_perf_evict_victim_order == 4 || uvm_perf_evict_victim_order == 6 ||
-           uvm_va_block_rmt_policy() != 0;
+           uvm_va_block_rmt_policy() != 0 ||
+           uvm_perf_scan_protect == 1 || uvm_perf_scan_protect == 2;
 }
 
 // Helper type for refcounting cache
@@ -1158,6 +1208,216 @@ NV_STATUS uvm_pmm_gpu_alloc_user(uvm_pmm_gpu_t *pmm,
     return pmm_gpu_alloc(pmm, num_chunks, chunk_size, UVM_PMM_GPU_MEMORY_TYPE_USER, flags, chunks, out_tracker);
 }
 
+// ----------------------------------------------------------------------------
+// Scan resistance (patch 05). Everything here runs under list_lock.
+// ----------------------------------------------------------------------------
+
+static bool scan_active(uvm_pmm_gpu_t *pmm)
+{
+    return uvm_perf_scan_protect != 0 && atomic_read(&pmm->scan.state) == UVM_SCAN_LOOP;
+}
+
+static bool root_chunk_protected(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk)
+{
+    return root_chunk->protect_gen != 0 && root_chunk->protect_gen == pmm->scan.gen && scan_active(pmm);
+}
+
+// The chunk leaves the protected set (freed, evicted, gone unused).
+static void scan_unprotect_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk)
+{
+    if (!root_chunk_protected(pmm, root_chunk))
+        return;
+
+    root_chunk->protect_gen = 0;
+    if (pmm->scan.protected_count)
+        pmm->scan.protected_count--;
+}
+
+// The quota is fixed once, at the first placement made under pressure: the
+// user root chunks on the eviction lists then, less the margin. One walk of the
+// lists, once per loop.
+static void scan_ensure_quota_locked(uvm_pmm_gpu_t *pmm)
+{
+    uvm_pmm_alloc_list_t alloc_list;
+    NvU32 count = 0;
+
+    if (pmm->scan.quota || !uvm_pmm_gpu_under_pressure(pmm))
+        return;
+
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
+        struct list_head *entry;
+
+        list_for_each(entry, &pmm->root_chunks.alloc_list[alloc_list])
+            count++;
+    }
+
+    pmm->scan.quota = count > uvm_perf_scan_margin ? count - uvm_perf_scan_margin : 1;
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_scan_quota, pmm->scan.quota);
+}
+
+// Place a root chunk going to USED while a loop is detected. Returns true when
+// it was placed here and the caller must not place it again. new_placement is
+// a chunk arriving on USED rather than one already there being touched.
+static bool scan_place_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, bool new_placement)
+{
+    if (!scan_active(pmm))
+        return false;
+
+    if (root_chunk_protected(pmm, root_chunk)) {
+        list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_PROTECTED]);
+        return true;
+    }
+
+    if (!new_placement) {
+        // An overflow chunk keeps the place its arrival gave it: MRU evicts
+        // by arrival, which a touch must not refresh. Mode 2 leaves overflow
+        // to the normal order and its blocks go remote at eviction instead.
+        // A root chunk coming back from a pin is on no list (pinning delists
+        // it and leaves on_used_list set): it must be placed again, by the
+        // normal order, or no victim walk would ever see it.
+        if (list_empty(&root_chunk->chunk.list))
+            return false;
+
+        return uvm_perf_scan_protect != 2;
+    }
+
+    scan_ensure_quota_locked(pmm);
+
+    if (pmm->scan.quota && pmm->scan.protected_count < pmm->scan.quota) {
+        root_chunk->protect_gen = pmm->scan.gen;
+        pmm->scan.protected_count++;
+        list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_PROTECTED]);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_protect);
+        return true;
+    }
+
+    if (uvm_perf_scan_protect == 2)
+        return false;
+
+    list_move(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_overflow_head);
+    return true;
+}
+
+static void scan_enter_loop(uvm_pmm_gpu_t *pmm)
+{
+    uvm_spin_lock(&pmm->list_lock);
+    if (atomic_read(&pmm->scan.state) != UVM_SCAN_LOOP) {
+        // A new generation, so nothing from an earlier loop counts as protected.
+        pmm->scan.gen++;
+        if (pmm->scan.gen == 0)
+            pmm->scan.gen = 1;
+        pmm->scan.quota = 0;
+        pmm->scan.protected_count = 0;
+        atomic_set(&pmm->scan.state, UVM_SCAN_LOOP);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_on);
+    }
+    uvm_spin_unlock(&pmm->list_lock);
+}
+
+// Release: O(1). The protected set goes back behind USED, and the generation
+// bump turns every protect_gen stale at once.
+static void scan_exit_loop(uvm_pmm_gpu_t *pmm)
+{
+    uvm_spin_lock(&pmm->list_lock);
+    if (atomic_read(&pmm->scan.state) == UVM_SCAN_LOOP) {
+        atomic_set(&pmm->scan.state, UVM_SCAN_OFF);
+        pmm->scan.gen++;
+        if (pmm->scan.gen == 0)
+            pmm->scan.gen = 1;
+        list_splice_tail_init(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_PROTECTED],
+                              &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
+        pmm->scan.quota = 0;
+        pmm->scan.protected_count = 0;
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_off);
+    }
+    uvm_spin_unlock(&pmm->list_lock);
+}
+
+// The detector, fed one refault bucket at a time from uvm_pmm_gpu_note_refault
+// (populate path, block lock held, no PMM lock).
+static void scan_note_refault(uvm_pmm_gpu_t *pmm, NvU32 bucket)
+{
+    const NvU64 window = max(uvm_perf_scan_window, 16u);
+    NvU64 now;
+    NvU64 last;
+    NvU64 d[12];
+    NvU64 total = 0;
+    NvU64 best = 0;
+    NvU32 modal = 0;
+    NvU32 conc;
+    NvU32 b;
+
+    // Off, and the static oracle, have no detector: nothing to do, not even a
+    // timestamp.
+    if (uvm_perf_scan_protect != 1 && uvm_perf_scan_protect != 2)
+        return;
+
+    now = NV_GETTIME();
+    last = (NvU64)atomic64_xchg(&pmm->scan.last_ns, now);
+
+    if (last && now - last > UVM_SCAN_IDLE_NS && atomic_read(&pmm->scan.state) == UVM_SCAN_LOOP)
+        scan_exit_loop(pmm);
+
+    atomic64_inc(&pmm->scan.dist[bucket]);
+    if ((NvU64)atomic64_inc_return(&pmm->scan.n) % window != 0)
+        return;
+
+    for (b = 0; b < 12; b++) {
+        d[b] = (NvU64)atomic64_xchg(&pmm->scan.dist[b], 0);
+        total += d[b];
+        if (d[b] > d[modal])
+            modal = b;
+    }
+
+    if (total == 0)
+        return;
+
+    for (b = 0; b + 1 < 12; b++)
+        best = max(best, d[b] + d[b + 1]);
+
+    conc = (NvU32)(best * 1000 / total);
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_windows);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_scan_conc, conc);
+
+    if (atomic_read(&pmm->scan.state) != UVM_SCAN_LOOP) {
+        if (conc >= uvm_perf_scan_conc_permille && modal >= uvm_perf_scan_min_bucket)
+            pmm->scan.good++;
+        else
+            pmm->scan.good = 0;
+
+        if (pmm->scan.good >= 2) {
+            pmm->scan.good = 0;
+            pmm->scan.bad = 0;
+            scan_enter_loop(pmm);
+        }
+    }
+    else {
+        if (conc < uvm_perf_scan_off_permille)
+            pmm->scan.bad++;
+        else
+            pmm->scan.bad = 0;
+
+        if (pmm->scan.bad >= 2) {
+            pmm->scan.good = 0;
+            pmm->scan.bad = 0;
+            scan_exit_loop(pmm);
+        }
+    }
+}
+
+bool uvm_pmm_gpu_scan_overflow(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+{
+    uvm_gpu_root_chunk_t *root_chunk;
+
+    if (uvm_perf_scan_protect != 2 || !scan_active(pmm))
+        return false;
+
+    root_chunk = root_chunk_from_chunk(pmm, chunk);
+
+    return READ_ONCE(root_chunk->protect_gen) != READ_ONCE(pmm->scan.gen);
+}
+
 static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
@@ -1177,7 +1437,11 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
             // Orders 5 and 6 decide where a NEW placement goes. A chunk that
             // is already a USED-list member moves to the tail as in every other
             // order, so sub-chunk churn on a resident root chunk is unchanged.
-            if (victim_order_bip() && !root_chunk->on_used_list &&
+            // Scan resistance (patch 05) places it first while a loop is on.
+            if (scan_place_locked(pmm, root_chunk, !root_chunk->on_used_list)) {
+                // Placed by scan resistance.
+            }
+            else if (victim_order_bip() && !root_chunk->on_used_list &&
                 bip_place_head(pmm, root_chunk->chunk.va_block))
                 list_move(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
             else
@@ -1194,8 +1458,10 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
     if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE) {
         // A root chunk going back to a free list has left residency, so its
         // next placement on USED is a new one (orders 5 and 6 read this).
-        if (chunk == &root_chunk->chunk)
+        if (chunk == &root_chunk->chunk) {
             root_chunk->on_used_list = false;
+            scan_unprotect_locked(pmm, root_chunk);
+        }
         list_move_tail(&chunk->list, find_free_list_chunk(pmm, chunk));
     }
     else if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
@@ -2120,6 +2386,11 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     uvm_gpu_chunk_set_in_eviction(chunk, true);
     ++pmm->root_chunks.in_eviction_count;
 
+    if (root_chunk_protected(pmm, root_chunk)) {
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_breach);
+        scan_unprotect_locked(pmm, root_chunk);
+    }
+
     // Off every list now, so its next USED placement is a new one. Orders 1
     // and 3-6 read this; it was left set before, which every placement site
     // tolerated, but BIP has to know a returning chunk from a resident one.
@@ -2145,11 +2416,20 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm,
         // eviction lists.
         UVM_ASSERT(!list_empty(&chunk->list));
 
+        // Scan resistance (patch 05): placed first while a loop is on, and a
+        // protected chunk going unused or discarded leaves the protected set.
+        if (alloc_list != UVM_PMM_ALLOC_LIST_USED)
+            scan_unprotect_locked(pmm, root_chunk);
+
+        if (alloc_list == UVM_PMM_ALLOC_LIST_USED &&
+            scan_place_locked(pmm, root_chunk, !root_chunk->on_used_list)) {
+            // Placed by scan resistance.
+        }
         // First residency order (uvm_perf_evict_victim_order 1, 3 and 4): a
         // chunk already on the USED list keeps its place, so the list stays in
         // the order chunks became resident. A chunk coming back from UNUSED or
         // DISCARDED still moves, which keeps discard handling as stock has it.
-        if (!(victim_order_fifo() && alloc_list == UVM_PMM_ALLOC_LIST_USED && root_chunk->on_used_list)) {
+        else if (!(victim_order_fifo() && alloc_list == UVM_PMM_ALLOC_LIST_USED && root_chunk->on_used_list)) {
             // Orders 5 and 6 place a chunk newly arriving on USED by BIP.
             if (alloc_list == UVM_PMM_ALLOC_LIST_USED && victim_order_bip() && !root_chunk->on_used_list &&
                 bip_place_head(pmm, root_chunk->chunk.va_block))
@@ -2622,6 +2902,18 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, e
             chunk = get_first_evictable_chunk(pmm, !(uvm_perf_evict_protect_batch && pick != EVICT_PICK_DEMAND));
         else
             chunk = get_first_allocated_chunk(pmm);
+
+        // Orders 2-4 walk USED only. With everything protected (patch 05) they
+        // find nothing, and a demand pick must still get a chunk.
+        if (!chunk && pick == EVICT_PICK_DEMAND && scan_active(pmm))
+            chunk = get_first_allocated_chunk(pmm);
+    }
+
+    // The reserve thread never evicts a protected chunk (patch 05): demand
+    // does, as a last resort, and chunk_start_eviction counts it.
+    if (chunk && pick != EVICT_PICK_DEMAND && root_chunk_protected(pmm, root_chunk_from_chunk(pmm, chunk))) {
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_scan_proactive_skip);
+        chunk = NULL;
     }
 
     if (chunk)
@@ -3741,6 +4033,8 @@ void uvm_pmm_gpu_note_refault(uvm_pmm_gpu_t *pmm, NvU64 stamp, bool proactive, N
     const NvU64 policy_horizon = horizon ? horizon : 16;
 
     uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_refault_dist[proactive ? 1 : 0][bucket]);
+
+    scan_note_refault(pmm, bucket);
 
     if (distance < horizon) {
         atomic64_inc(&pmm->refault.near);
@@ -4905,6 +5199,13 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     uvm_spin_lock_init(&pmm->list_lock, UVM_LOCK_ORDER_LEAF);
     uvm_spin_lock_init(&pmm->rmt.lock, UVM_LOCK_ORDER_LEAF);
     INIT_LIST_HEAD(&pmm->rmt.list);
+
+    // The static oracle of scan resistance (patch 05) is in a loop from the
+    // start; its quota waits for the first placement under pressure.
+    if (uvm_perf_scan_protect == 3) {
+        pmm->scan.gen = 1;
+        atomic_set(&pmm->scan.state, UVM_SCAN_LOOP);
+    }
 
     // BEFORE pmm->initialized, and this ordering is load-bearing. Every failure
     // below jumps to cleanup, which calls uvm_pmm_gpu_deinit, which runs only

@@ -199,6 +199,13 @@ typedef enum
     // Root chunks used by VA blocks, likely with resident pages.
     UVM_PMM_ALLOC_LIST_USED,
 
+    // Scan resistance (patch 05, uvm_perf_scan_protect): used root chunks
+    // kept resident while a loop larger than memory is detected. Last in the
+    // order, so every walk that goes list by list reaches it only after USED:
+    // a demand eviction takes a protected chunk only as a last resort, and the
+    // reserve thread never does. Empty unless scan protection is on.
+    UVM_PMM_ALLOC_LIST_PROTECTED,
+
     UVM_PMM_ALLOC_LIST_COUNT
 } uvm_pmm_alloc_list_t;
 
@@ -344,6 +351,11 @@ typedef struct uvm_gpu_root_chunk_struct
     // this says which list it is on without walking any. Only
     // uvm_perf_evict_victim_order 1, 3 and 4 read it.
     bool on_used_list;
+
+    // Scan resistance (patch 05): the protection generation this chunk was
+    // protected in, 0 for never. Protected exactly when it equals
+    // pmm->scan.gen while a loop is detected. Under list_lock.
+    NvU32 protect_gen;
 
     // Victim orders 3 and 4, ARIADNE's Sharing Degree key. resident_ns is when
     // the chunk was last moved onto the USED list, so ordering by it is the
@@ -498,6 +510,25 @@ typedef struct uvm_pmm_gpu_struct
         NvU32 count;
     } rmt;
 
+    // Scan resistance (patch 05). state is read lock-free by the placement
+    // sites and written under list_lock with gen, quota and protected_count.
+    // dist and n are the detector's window of refault-distance buckets, and
+    // good and bad its consecutive-window counts (written by whichever
+    // refault closes a window; a lost update only delays a transition).
+    struct
+    {
+        atomic_t state;
+        NvU32 gen;
+        NvU32 quota;
+        NvU32 protected_count;
+        NvU32 windows;
+        atomic64_t dist[12];
+        atomic64_t n;
+        atomic64_t last_ns;
+        NvU32 good;
+        NvU32 bad;
+    } scan;
+
     // Refault tracking, on with uvm_perf_evict_refault_track or the refault
     // gate. Unlike proactive_evict this runs without the thread, so that a
     // plain pool arm measures its own refault distances too.
@@ -590,6 +621,12 @@ bool uvm_pmm_gpu_under_pressure(uvm_pmm_gpu_t *pmm);
 // not running or the entry cannot be allocated. Callable with the block lock
 // held; may sleep.
 bool uvm_pmm_gpu_rmt_register(uvm_pmm_gpu_t *pmm, uvm_va_block_t *va_block, NvU32 delay_ms);
+
+// Scan resistance with remote overflow (uvm_perf_scan_protect 2, patch 05):
+// true when a loop is detected and this root chunk is not in the protected
+// set, so its block should be served remotely once evicted. Lock-free read;
+// a stale answer misplaces one block once.
+bool uvm_pmm_gpu_scan_overflow(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 
 // A block that was evicted from this GPU is getting GPU memory again. stamp,
 // proactive and policy are what its eviction recorded in

@@ -1506,6 +1506,24 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_reg_fail));
         UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_evict_map           %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_evict_map));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_on                 %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_on));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_off                %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_off));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_protect            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_protect));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_overflow_head      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_overflow_head));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_breach             %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_breach));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_proactive_skip     %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_proactive_skip));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_scan_windows            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_scan_windows));
+        UVM_SEQ_OR_DBG_PRINT(s, "sum_scan_conc             %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_scan_conc));
+        UVM_SEQ_OR_DBG_PRINT(s, "sum_scan_quota            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_scan_quota));
     }
 
     uvm_up_read(&g_uvm_global.pm.lock);

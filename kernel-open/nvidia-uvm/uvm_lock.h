@@ -2085,6 +2085,22 @@ typedef struct
     atomic64_t n_rmt_registered;
     atomic64_t n_rmt_reg_fail;
     atomic64_t n_rmt_evict_map;
+
+    // Scan resistance (patch 05), ungated. on/off: loop detections and
+    // releases; protect: chunks placed in the protected set; overflow_head:
+    // overflow placed MRU; breach: protected chunks a demand eviction had to
+    // take; proactive_skip: reserve picks refused a protected chunk; windows
+    // and sum_conc: detector windows and their concentration in permille
+    // (mean = sum_conc / windows); sum_quota: quotas set.
+    atomic64_t n_scan_on;
+    atomic64_t n_scan_off;
+    atomic64_t n_scan_protect;
+    atomic64_t n_scan_overflow_head;
+    atomic64_t n_scan_breach;
+    atomic64_t n_scan_proactive_skip;
+    atomic64_t n_scan_windows;
+    atomic64_t sum_scan_conc;
+    atomic64_t sum_scan_quota;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every
