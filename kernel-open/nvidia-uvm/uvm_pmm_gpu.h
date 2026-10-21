@@ -557,6 +557,9 @@ bool uvm_pmm_gpu_sharing_tracking(void);
 // uvm_perf_evict_refault_track in uvm_pmm_gpu.c.
 bool uvm_pmm_gpu_refault_tracking(void);
 
+// Batch-scoped eviction protection (uvm_perf_evict_protect_batch, patch 01).
+bool uvm_pmm_gpu_protect_batch(void);
+
 // A block that was evicted from this GPU is getting GPU memory again. stamp,
 // proactive and policy are what its eviction recorded in
 // uvm_va_block_gpu_state_t. Called under the block lock, from the population

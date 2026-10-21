@@ -597,6 +597,14 @@ typedef struct
         // the allocator.
         atomic64_t replay_epoch;
 
+        // The tightening the paragraph above leaves for later (patch 01,
+        // uvm_perf_evict_protect_batch): the value replay_epoch had when every
+        // replay issued so far was last seen COMPLETE. Written only by the
+        // servicing thread, after a wait on replay_tracker returns or when the
+        // tracker is found complete at the start of a batch. A chunk touched at
+        // epoch E stays protected while E + uvm_perf_evict_protect_lag >= this.
+        atomic64_t replay_done_epoch;
+
         // If there is a ratio larger than replay_update_put_ratio of duplicate
         // faults in a batch, PUT pointer is updated before flushing the buffer
         // that comes before the replay method.

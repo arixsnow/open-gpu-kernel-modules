@@ -2031,6 +2031,16 @@ typedef struct
     atomic64_t n_util_readonly_res;
     atomic64_t n_evict_pages_copied;
     atomic64_t n_evict_pages_clean;
+
+    // Batch-scoped eviction protection (patch 01). Ungated: they report the
+    // mechanism, which runs whatever the stats level. batches counts stamp
+    // passes, stamped the root chunks they protected, busy the blocks skipped
+    // because their lock was held, and proactive_none the reserve-thread picks
+    // that found only protected candidates and evicted nothing.
+    atomic64_t n_protect_batches;
+    atomic64_t n_protect_stamped;
+    atomic64_t n_protect_busy;
+    atomic64_t n_protect_proactive_none;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every

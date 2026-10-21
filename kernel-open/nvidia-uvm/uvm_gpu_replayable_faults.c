@@ -518,6 +518,9 @@ static NV_STATUS fault_buffer_init_replayable_faults(uvm_parent_gpu_t *parent_gp
     // servicing has never populated must never be protected.
     atomic64_set(&replayable_faults->replay_epoch, 1);
 
+    // Nothing issued yet, so nothing completed: the same starting point.
+    atomic64_set(&replayable_faults->replay_done_epoch, 1);
+
     batch_context->ordered_fault_cache = uvm_kvmalloc_zero(replayable_faults->max_faults *
                                                            sizeof(*batch_context->ordered_fault_cache));
     if (!batch_context->ordered_fault_cache)
@@ -985,6 +988,15 @@ static void fault_buffer_skip_replayable_entry(uvm_parent_gpu_t *parent_gpu, NvU
     parent_gpu->fault_buffer_hal->entry_clear_valid(parent_gpu, index);
 }
 
+// Every replay issued so far is known complete (patch 01): record it for the
+// batch-protection test in the victim walk. Called by the servicing thread,
+// the only thread that issues replays, right after a wait on replay_tracker
+// returns OK, so no replay can have been issued in between.
+static void note_replays_done(uvm_replayable_fault_buffer_t *replayable_faults)
+{
+    atomic64_set(&replayable_faults->replay_done_epoch, atomic64_read(&replayable_faults->replay_epoch));
+}
+
 // skip_replay discards the buffer without issuing the replay that normally
 // follows. Only the replay interval gate passes true, and only because it owes
 // a replay that the pass-exit path is guaranteed to issue. Every other caller
@@ -1008,6 +1020,8 @@ static NV_STATUS fault_buffer_flush_locked(uvm_parent_gpu_t *parent_gpu,
     // Wait for the prior replay to flush out old fault messages
     if (flush_mode == UVM_GPU_BUFFER_FLUSH_MODE_WAIT_UPDATE_PUT) {
         status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+        if (status == NV_OK)
+            note_replays_done(replayable_faults);
         if (status != NV_OK)
             return status;
     }
@@ -2711,6 +2725,8 @@ static NV_STATUS service_fault_batch_for_cancel(uvm_fault_service_batch_context_
     // Wait for the flush's replay to finish to give the legitimate faults a
     // chance to show up in the buffer again.
     status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+    if (status == NV_OK)
+        note_replays_done(replayable_faults);
     if (status != NV_OK)
         goto done;
 
@@ -3990,6 +4006,8 @@ static NV_STATUS cancel_faults_precise_tlb(uvm_gpu_t *gpu, uvm_fault_service_bat
 
         // 4) Wait for replay to finish
         status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+        if (status == NV_OK)
+            note_replays_done(replayable_faults);
         if (status != NV_OK)
             break;
 
@@ -4713,6 +4731,87 @@ static void zc_pin_from_pressure(uvm_parent_gpu_t *parent_gpu)
     uvm_mutex_unlock(&gpu->zc_lifetime_lock);
 }
 
+// Batch-scoped eviction protection (uvm_perf_evict_protect_batch, patch 01).
+//
+// Stamp the root chunk of every VA block this batch names before any worker
+// services it. Without this the victim walk sees as touched only the blocks
+// already serviced, so the pool's evictors (every worker's demand path and the
+// reserve thread) can take a block a sibling worker is about to service, which
+// then re-faults at once. ARIADNE excludes every block of the current batch
+// from its victim scans (its batch_blocks); this carries the same protection
+// in the stamp the walk already reads, released when the replay completes.
+//
+// Best effort and bounded: one VA space read lock per VA space in the batch,
+// one range lookup and one trylock per block. A block without GPU memory has
+// nothing to protect. A block whose lock is held is skipped: it is being
+// evicted already, or serviced, and servicing stamps it anyway. The block lock
+// is what makes reading gpu_state->chunks[0] safe; unlocked, the chunk could
+// be evicted and freed under the read.
+static void stamp_batch_blocks(uvm_fault_service_batch_context_t *batch_context)
+{
+    uvm_va_space_t *locked_va_space = NULL;
+    uvm_va_space_t *last_va_space = NULL;
+    uvm_gpu_t *last_gpu = NULL;
+    NvU64 last_start = 0;
+    NvU64 stamped = 0;
+    NvU64 busy = 0;
+    NvU32 i;
+
+    for (i = 0; i < batch_context->num_coalesced_faults; i++) {
+        uvm_fault_buffer_entry_t *entry = batch_context->ordered_fault_cache[i];
+        const NvU64 start = UVM_VA_BLOCK_ALIGN_DOWN(entry->fault_address);
+        uvm_va_block_t *va_block;
+        uvm_va_block_gpu_state_t *gpu_state;
+
+        if (!entry->va_space || !entry->gpu || entry->is_fatal)
+            continue;
+
+        // Sorted by VA space, GPU and address, so a block's entries are adjacent.
+        if (entry->va_space == last_va_space && entry->gpu == last_gpu && start == last_start)
+            continue;
+
+        last_va_space = entry->va_space;
+        last_gpu = entry->gpu;
+        last_start = start;
+
+        if (entry->va_space != locked_va_space) {
+            if (locked_va_space)
+                uvm_va_space_up_read(locked_va_space);
+
+            uvm_va_space_down_read(entry->va_space);
+            locked_va_space = entry->va_space;
+        }
+
+        if (uvm_va_block_find(entry->va_space, entry->fault_address, &va_block) != NV_OK)
+            continue;
+
+        // Root chunks are tracked for eviction only for full 2 MB non-HMM
+        // blocks, the guard block_map_gpu_to uses for the same stamp.
+        if (uvm_va_block_is_hmm(va_block) || uvm_va_block_size(va_block) != UVM_CHUNK_SIZE_MAX)
+            continue;
+
+        if (!uvm_mutex_trylock(&va_block->lock)) {
+            ++busy;
+            continue;
+        }
+
+        gpu_state = uvm_va_block_gpu_state_get(va_block, entry->gpu->id);
+        if (gpu_state && gpu_state->chunks[0]) {
+            uvm_pmm_gpu_mark_root_chunk_touched(&entry->gpu->pmm, gpu_state->chunks[0]);
+            ++stamped;
+        }
+
+        uvm_mutex_unlock(&va_block->lock);
+    }
+
+    if (locked_va_space)
+        uvm_va_space_up_read(locked_va_space);
+
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_protect_batches);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_protect_stamped, stamped);
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_protect_busy, busy);
+}
+
 void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 {
     NvU32 num_replays = 0;
@@ -4779,6 +4878,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             pending_replays >= uvm_perf_fault_service_max_inflight) {
             time_stamp = NV_GETTIME();
             status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+            if (status == NV_OK)
+                note_replays_done(replayable_faults);
             replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
             pending_replays = 0;
             if (status != NV_OK)
@@ -4797,6 +4898,12 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         batch_context->fatal_va_space              = NULL;
         batch_context->fatal_gpu                   = NULL;
         batch_context->has_throttled_faults        = false;
+
+        // The pass-exit replay is never waited on, and pipelined replays are
+        // waited only at the bound, so also look before each batch whether the
+        // outstanding replays have finished (patch 01).
+        if (uvm_pmm_gpu_protect_batch() && uvm_tracker_is_completed(&replayable_faults->replay_tracker))
+            note_replays_done(replayable_faults);
 
         batch_start_time = NV_GETTIME();
 
@@ -4823,6 +4930,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 pending_replays = 0;
                 time_stamp = NV_GETTIME();
                 status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+                if (status == NV_OK)
+                    note_replays_done(replayable_faults);
                 replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
                 if (status != NV_OK)
                     break;
@@ -4853,7 +4962,12 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         else if (status != NV_OK)
             break;
 
+        // Protect this batch's blocks before any worker services one (patch
+        // 01). Counted inside ns_service, which is where its cost lands.
         time_stamp = NV_GETTIME();
+        if (uvm_pmm_gpu_protect_batch())
+            stamp_batch_blocks(batch_context);
+
         status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context);
         replayable_faults->stats.ns_service += NV_GETTIME() - time_stamp;
 
@@ -5020,6 +5134,8 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                 else {
                     time_stamp = NV_GETTIME();
                     status = uvm_tracker_wait(&replayable_faults->replay_tracker);
+                    if (status == NV_OK)
+                        note_replays_done(replayable_faults);
                     replayable_faults->stats.ns_tracker_wait += NV_GETTIME() - time_stamp;
                     if (status != NV_OK)
                         break;

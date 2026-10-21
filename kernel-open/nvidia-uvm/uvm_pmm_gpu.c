@@ -215,6 +215,40 @@ module_param(uvm_perf_evict_skip_pending_replay, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_evict_skip_pending_replay,
                  "Skip eviction candidates whose fault replay has not been issued (0 = off, stock).");
 
+// Batch-scoped eviction protection (patch 01). 1 makes every victim walk
+// skip root chunks the fault path touched, or will touch, in a batch whose
+// replay has not COMPLETED (plus uvm_perf_evict_protect_lag further replays):
+// the servicing thread stamps the root chunk of every VA block a batch names
+// before any worker runs (stamp_batch_blocks in uvm_gpu_replayable_faults.c),
+// and the walk compares against replay_done_epoch instead of replay_epoch.
+// Applies to every victim order except 2 and to the reserve thread, which gets
+// no head fallback: rather than pre-evict a protected chunk it stops filling.
+// Demand picks keep the head fallback, so allocation can never newly fail.
+// 0 is off and leaves every walk exactly as it is.
+static unsigned uvm_perf_evict_protect_batch = 0;
+module_param(uvm_perf_evict_protect_batch, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_evict_protect_batch,
+                 "Protect root chunks of in-flight fault batches from eviction until their replay completes (0 = off).");
+
+// Replays that must complete after a chunk's last touch before it is
+// evictable again. 0 releases it as soon as the covering replay completes; 1,
+// the default, also gives the replayed warps the following batch to use what
+// was mapped for them, which is the window the issued-only test leaks.
+static unsigned uvm_perf_evict_protect_lag = 1;
+module_param(uvm_perf_evict_protect_lag, uint, S_IRUGO);
+
+// The scan budget while batch protection is on. A batch names up to a few
+// hundred blocks, all of them protected, and under the first-residency orders
+// old and heavily used blocks sit at the head, so the stock 32 would fall back
+// to a protected head on most picks.
+static unsigned uvm_perf_evict_protect_scan = 512;
+module_param(uvm_perf_evict_protect_scan, uint, S_IRUGO);
+
+bool uvm_pmm_gpu_protect_batch(void)
+{
+    return uvm_perf_evict_protect_batch != 0;
+}
+
 #define UVM_PERF_EVICT_SCAN_LIMIT_DEFAULT 32
 
 // How many candidates the victim walk may examine before giving up and taking
@@ -2182,9 +2216,28 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
 static bool root_chunk_replay_pending(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
-    NvU64 now = (NvU64)atomic64_read(&gpu->parent->fault_buffer.replayable.replay_epoch);
+    NvU64 now;
+    NvU64 touch = root_chunk_from_chunk(pmm, chunk)->touch_epoch;
 
-    return root_chunk_from_chunk(pmm, chunk)->touch_epoch >= now;
+    // Batch protection (patch 01): until the covering replay has COMPLETED,
+    // and uvm_perf_evict_protect_lag replays after it. A chunk never touched
+    // (0) is never protected. Same tolerance for stale reads as below.
+    if (uvm_perf_evict_protect_batch) {
+        now = (NvU64)atomic64_read(&gpu->parent->fault_buffer.replayable.replay_done_epoch);
+
+        return touch != 0 && touch + uvm_perf_evict_protect_lag >= now;
+    }
+
+    now = (NvU64)atomic64_read(&gpu->parent->fault_buffer.replayable.replay_epoch);
+
+    return touch >= now;
+}
+
+// Either form of the skip is on: the replay-pending one (token e) or batch
+// protection (patch 01), which is the same test with a later release point.
+static bool evict_skip_pending(void)
+{
+    return uvm_perf_evict_skip_pending_replay || uvm_perf_evict_protect_batch;
 }
 
 // The victim walk. Returns the first candidate whose replay has been issued,
@@ -2195,11 +2248,14 @@ static bool root_chunk_replay_pending(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
 // last one instead would quietly change stock victim selection whenever the
 // scan came up empty, which is exactly the case where this wants to change
 // nothing.
-static uvm_gpu_chunk_t *get_first_evictable_chunk(uvm_pmm_gpu_t *pmm)
+static uvm_gpu_chunk_t *get_first_evictable_chunk(uvm_pmm_gpu_t *pmm, bool head_fallback)
 {
     uvm_pmm_alloc_list_t alloc_list;
     uvm_gpu_chunk_t *head = NULL;
     unsigned examined = 0;
+    const unsigned scan_limit = uvm_perf_evict_protect_batch ?
+                                max(uvm_perf_evict_scan_limit, uvm_perf_evict_protect_scan) :
+                                uvm_perf_evict_scan_limit;
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
 
@@ -2212,8 +2268,15 @@ static uvm_gpu_chunk_t *get_first_evictable_chunk(uvm_pmm_gpu_t *pmm)
             if (!head)
                 head = chunk;
 
-            if (examined++ >= uvm_perf_evict_scan_limit) {
-                // The budget ran out: the head, protected or not (patch 00).
+            if (examined++ >= scan_limit) {
+                // The budget ran out: the head, protected or not (patch 00),
+                // unless the caller would rather have nothing (patch 01: the
+                // reserve thread must not pre-evict a protected chunk).
+                if (!head_fallback) {
+                    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_protect_proactive_none);
+                    return NULL;
+                }
+
                 uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_evict_pick_pending_fallback);
                 return head;
             }
@@ -2221,6 +2284,12 @@ static uvm_gpu_chunk_t *get_first_evictable_chunk(uvm_pmm_gpu_t *pmm)
             if (!root_chunk_replay_pending(pmm, chunk))
                 return chunk;
         }
+    }
+
+    // Every candidate is protected and the lists ran out first.
+    if (head && !head_fallback) {
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_protect_proactive_none);
+        return NULL;
     }
 
     return head;
@@ -2327,7 +2396,7 @@ static uvm_gpu_chunk_t *get_sharing_degree_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chu
         // a chunk touched by the batch being serviced is not a candidate for
         // either policy. ARIADNE's victim scans skip the current batch's
         // blocks in every configuration (batch_blocks, last_access_time).
-        if (uvm_perf_evict_skip_pending_replay && root_chunk_replay_pending(pmm, chunk))
+        if (evict_skip_pending() && root_chunk_replay_pending(pmm, chunk))
             continue;
 
         if (!*fifo)
@@ -2534,8 +2603,8 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict_from(uvm_pmm_gpu_t *pmm, e
         else if (uvm_perf_evict_victim_order == 4) {
             chunk = pick_by_policy_switch(pmm, policy);
         }
-        else if (uvm_perf_evict_skip_pending_replay)
-            chunk = get_first_evictable_chunk(pmm);
+        else if (evict_skip_pending())
+            chunk = get_first_evictable_chunk(pmm, !(uvm_perf_evict_protect_batch && pick != EVICT_PICK_DEMAND));
         else
             chunk = get_first_allocated_chunk(pmm);
     }
