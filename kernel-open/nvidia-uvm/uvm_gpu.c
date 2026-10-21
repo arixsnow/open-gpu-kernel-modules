@@ -1524,6 +1524,8 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_scan_conc));
         UVM_SEQ_OR_DBG_PRINT(s, "sum_scan_quota            %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.sum_scan_quota));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_dyn_claims              %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_dyn_claims));
     }
 
     uvm_up_read(&g_uvm_global.pm.lock);

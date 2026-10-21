@@ -2101,6 +2101,10 @@ typedef struct
     atomic64_t n_scan_windows;
     atomic64_t sum_scan_conc;
     atomic64_t sum_scan_quota;
+
+    // Dynamic span scheduling (patch 06), stats level 2: claims taken.
+    // claims / num_batches is the claims per batch.
+    atomic64_t n_dyn_claims;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every

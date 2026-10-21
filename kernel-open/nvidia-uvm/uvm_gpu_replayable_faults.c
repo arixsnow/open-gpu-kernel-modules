@@ -196,6 +196,24 @@ module_param(uvm_perf_fault_service_adapt_narrow_every, uint, S_IRUGO);
 static unsigned uvm_perf_fault_service_min_faults = UVM_PERF_FAULT_SERVICE_MIN_FAULTS_DEFAULT;
 module_param(uvm_perf_fault_service_min_faults, uint, S_IRUGO);
 
+// Dynamic span scheduling (patch 06). The static partition gives each worker
+// one contiguous range sized by fault-entry count, but a span's cost is its
+// copies, not its entries: at prefetch threshold 1 one span is one whole 2 MB
+// block copy, and the batch ends when the slowest worker does, while the
+// others wait at the join. With this on, workers claim spans from a shared
+// cursor instead, uvm_perf_fault_service_dynamic_claims claims per worker per
+// batch on average, each claim a run of adjacent spans, so one claim is still
+// one service_fault_batch_range call and the va_space/mmap lock churn stays a
+// small multiple of the static scheme's (one call per span measured 4.30M
+// va_space acquisitions against stock's 16.8K, commit 2e7431e2). 0 is off.
+static unsigned uvm_perf_fault_service_dynamic = 0;
+module_param(uvm_perf_fault_service_dynamic, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_fault_service_dynamic,
+                 "Workers claim spans from a shared cursor instead of a static partition (0 = off).");
+
+static unsigned uvm_perf_fault_service_dynamic_claims = 4;
+module_param(uvm_perf_fault_service_dynamic_claims, uint, S_IRUGO);
+
 // Pipelined batch servicing: under UVM_PERF_FAULT_REPLAY_POLICY_BATCH_FLUSH
 // (the default), do not synchronously wait for the flush's replay to complete
 // before fetching the next batch. The replay push already acquires the batch
@@ -3418,6 +3436,40 @@ static void fault_service_check_partition(const uvm_fault_service_worker_t *work
 // and mmap locks once for the whole range.
 static void fault_service_worker_run(uvm_fault_service_worker_t *worker)
 {
+    // Dynamic scheduling (patch 06): claim runs of adjacent spans until none
+    // are left. The static range is ignored; the cursor covers every span
+    // exactly once, whichever worker claims it.
+    if (uvm_perf_fault_service_dynamic) {
+        uvm_replayable_fault_buffer_t *replayable_faults = &worker->parent_gpu->fault_buffer.replayable;
+        const uvm_fault_service_span_t *spans = replayable_faults->service_pool.spans;
+        const NvU32 num_spans = replayable_faults->service_pool.num_spans;
+        const NvU32 grain = replayable_faults->service_pool.span_grain;
+
+        while (worker->status == NV_OK) {
+            const NvU32 first = (NvU32)atomic_add_return(grain, &replayable_faults->service_pool.span_cursor) - grain;
+            NvU32 last;
+
+            if (first >= num_spans)
+                break;
+
+            last = min(first + grain, num_spans) - 1;
+
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_dyn_claims);
+
+            worker->status = service_fault_batch_range(worker->parent_gpu,
+                                                       FAULT_SERVICE_MODE_REGULAR,
+                                                       worker->batch_context,
+                                                       &worker->block_service_context,
+                                                       &worker->ats_context,
+                                                       &worker->ats_invalidate,
+                                                       &worker->tracker,
+                                                       spans[first].begin,
+                                                       spans[last].end);
+        }
+
+        return;
+    }
+
     if (worker->range_begin == worker->range_end)
         return;
 
@@ -3553,6 +3605,16 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
     fault_service_check_partition(replayable_faults->service_pool.workers,
                                   num_workers + 1,
                                   batch_context->num_coalesced_faults);
+
+    // Dynamic scheduling (patch 06): published before any worker is kicked.
+    if (uvm_perf_fault_service_dynamic) {
+        const NvU32 claims = max(uvm_perf_fault_service_dynamic_claims, 1u) * (num_workers + 1);
+
+        replayable_faults->service_pool.num_spans = num_spans;
+        replayable_faults->service_pool.span_grain = max(num_spans / claims, 1u);
+        atomic_set(&replayable_faults->service_pool.span_cursor, 0);
+        smp_wmb();
+    }
 
     // outstanding must account for every worker before the first one is
     // queued: a worker can run to completion and decrement it while this loop

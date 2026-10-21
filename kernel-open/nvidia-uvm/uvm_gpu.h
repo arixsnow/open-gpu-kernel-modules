@@ -759,6 +759,15 @@ typedef struct
 
             // Dispatcher joins here, waiting for outstanding == 0
             wait_queue_head_t done_wq;
+
+            // Dynamic span scheduling (patch 06,
+            // uvm_perf_fault_service_dynamic): the next unclaimed span, the
+            // span count and how many adjacent spans one claim takes. Written
+            // by the dispatcher before workers are kicked; the cursor is the
+            // only thing workers modify.
+            atomic_t span_cursor;
+            NvU32 num_spans;
+            NvU32 span_grain;
         } service_pool;
     } replayable;
 
