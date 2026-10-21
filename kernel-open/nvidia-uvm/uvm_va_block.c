@@ -68,6 +68,55 @@ static int uvm_fault_force_sysmem __read_mostly = 0;
 module_param(uvm_fault_force_sysmem, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(uvm_fault_force_sysmem, "Force (1) using sysmem storage for pages that faulted. Default: 0.");
 
+// Automatic read duplication (patch 02). Eviction copies back every page
+// resident on the GPU (uvm_va_block_evict_chunks makes them resident on the
+// CPU), including pages the GPU only ever read, whose bytes the CPU still
+// has: reads migrate rather than duplicate unless the application set
+// ReadMostly. A read-duplicated page instead leaves with no copy, because the
+// eviction's copy set already excludes pages valid on the CPU, and CPU chunks
+// are never freed when a page moves to the GPU, so keeping the CPU copy costs
+// no host memory. NVIDIA's own TODO, Bug 1877578, asks for exactly this
+// ("investigate automatic read-duplicate policies").
+//
+//   0  off (stock).
+//   1  learned: a GPU read fault is serviced as a read duplicate while the
+//      GPU is evicting (uvm_perf_auto_rdup_pressure) when the block's last
+//      residency on this GPU faulted only for reads, or when its allocation
+//      is read-mostly by residency count, unless GPU writes have broken more
+//      than uvm_perf_auto_rdup_break_permille of the allocation's duplicates.
+//   2  forced: every GPU read fault under pressure (the oracle, the in-driver
+//      equivalent of ReadMostly on every allocation).
+//   3  as 1, plus dirty tracking: the pages prefetched with a call are read
+//      duplicates even when the call itself wrote, so an eviction copies back
+//      only the pages written since they arrived (each such write faults
+//      once, to break its duplicate). Off for an allocation whose break ratio
+//      passes uvm_perf_auto_rdup_break_permille.
+//   4  as 2, plus dirty tracking for every call (the oracle of 3).
+//
+// Only allocations with no read-duplication advice (UNSET), only replayable
+// faults, and for faulted pages only reads: write faults keep the stock
+// decision, so preferred location and accessed-by advice are untouched.
+// Prefetched pages are not accesses, which is what lets 3 and 4 duplicate
+// them whatever the faulted pages were. A GPU write to a duplicate breaks it
+// through the stock path (the page is mapped read-only).
+static unsigned uvm_perf_auto_rdup = 0;
+module_param(uvm_perf_auto_rdup, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_auto_rdup,
+                 "Automatic read duplication under memory pressure: 0 off, 1 learned, 2 forced (oracle), 3 learned + dirty tracking, 4 forced + dirty tracking.");
+
+static unsigned uvm_perf_auto_rdup_pressure = 1;
+module_param(uvm_perf_auto_rdup_pressure, uint, S_IRUGO);
+
+static unsigned uvm_perf_auto_rdup_break_permille = 50;
+module_param(uvm_perf_auto_rdup_break_permille, uint, S_IRUGO);
+
+// An allocation is read-mostly once this many of its residencies closed and
+// at most one in ten had a write.
+#define UVM_AUTO_RDUP_RANGE_MIN_RES 8
+
+// A break ratio is trusted only over this many duplicated pages.
+#define UVM_AUTO_RDUP_RANGE_MIN_PAGES 512
+
 // B1 (batched pre-unmap). Replayable-fault servicing revokes CPU mappings
 // with one unmap_mapping_range call per contiguous page run of the unmap
 // mask, and each call pays an i_mmap walk plus a TLB shootdown. Measured on
@@ -3030,6 +3079,7 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
 
         uvm_page_mask_zero(&gpu_state->util.dfault);
         gpu_state->util.dwrite = false;
+        gpu_state->util.rdup_broken = false;
         gpu_state->util.populate_seq = seq;
         if (gpu_state->evict_stamp) {
             const NvU64 distance = seq >= gpu_state->evict_stamp ? seq - gpu_state->evict_stamp : 0;
@@ -3593,7 +3643,7 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
 
 bool uvm_va_block_util_tracking(void)
 {
-    return uvm_lock_probes_enabled();
+    return uvm_lock_probes_enabled() || uvm_perf_auto_rdup != 0;
 }
 
 // See the sharing struct in uvm_va_block.h. ARIADNE keeps the distinct count
@@ -11628,6 +11678,112 @@ static bool can_read_duplicate(uvm_va_block_t *va_block,
     return false;
 }
 
+// Modes of uvm_perf_auto_rdup (patch 02): 2 and 4 force, 3 and 4 track dirty
+// pages through duplicated prefetches.
+static bool auto_rdup_forced(void)
+{
+    return uvm_perf_auto_rdup == 2 || uvm_perf_auto_rdup == 4;
+}
+
+static bool auto_rdup_dirty_tracking(void)
+{
+    return uvm_perf_auto_rdup == 3 || uvm_perf_auto_rdup == 4;
+}
+
+// What every automatic duplicate requires (patch 02): a known mode, a GPU, a
+// managed block, no read-duplication advice, and memory pressure.
+static bool auto_rdup_eligible(uvm_va_block_t *va_block,
+                               uvm_processor_id_t processor_id,
+                               const uvm_va_policy_t *policy)
+{
+    if (uvm_perf_auto_rdup == 0 || uvm_perf_auto_rdup > 4)
+        return false;
+
+    if (!UVM_ID_IS_GPU(processor_id) || uvm_va_block_is_hmm(va_block))
+        return false;
+
+    if (policy->read_duplication != UVM_READ_DUPLICATION_UNSET)
+        return false;
+
+    // As the ReadMostly advice path refuses it: an integrated GPU has no
+    // vidmem to hold a duplicate. Fault path, VA space lock held.
+    if (uvm_va_space_has_integrated_gpu(uvm_va_block_get_va_space(va_block)))
+        return false;
+
+    return !uvm_perf_auto_rdup_pressure || uvm_pmm_gpu_under_pressure(&uvm_gpu_get(processor_id)->pmm);
+}
+
+// GPU writes have broken more than uvm_perf_auto_rdup_break_permille of the
+// allocation's automatic duplicates (patch 02).
+static bool auto_rdup_range_broken(uvm_va_range_managed_t *managed_range)
+{
+    const NvU64 pages = (NvU64)atomic64_read(&managed_range->util.rdup_pages);
+    const NvU64 breaks = (NvU64)atomic64_read(&managed_range->util.rdup_breaks);
+
+    if (pages < UVM_AUTO_RDUP_RANGE_MIN_PAGES || breaks * 1000 <= pages * uvm_perf_auto_rdup_break_permille)
+        return false;
+
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_range_disabled);
+    return true;
+}
+
+// Should a GPU read fault on this block be serviced as a read duplicate under
+// uvm_perf_auto_rdup (patch 02)? The caller has checked the access is a read
+// and the page is not thrashing-pinned.
+static bool block_auto_read_dup(uvm_va_block_t *va_block,
+                                uvm_processor_id_t processor_id,
+                                const uvm_va_policy_t *policy)
+{
+    uvm_va_range_managed_t *managed_range;
+    uvm_va_block_gpu_state_t *gpu_state;
+    NvU64 ro;
+    NvU64 rw;
+
+    if (!auto_rdup_eligible(va_block, processor_id, policy))
+        return false;
+
+    if (auto_rdup_forced())
+        return true;
+
+    managed_range = va_block->managed_range;
+
+    if (auto_rdup_range_broken(managed_range))
+        return false;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, processor_id);
+    if (gpu_state && gpu_state->util.rdup_broken)
+        return false;
+
+    if (gpu_state && gpu_state->util.last_ro)
+        return true;
+
+    ro = (NvU64)atomic64_read(&managed_range->util.res_ro);
+    rw = (NvU64)atomic64_read(&managed_range->util.res_rw);
+
+    return ro >= UVM_AUTO_RDUP_RANGE_MIN_RES && rw * 10 <= ro;
+}
+
+// Dirty tracking (uvm_perf_auto_rdup 3 and 4, patch 02): should the pages
+// prefetched with a call that also wrote be read duplicates? Duplicated, the
+// ones the GPU never writes leave at eviction with no copy, and each one it
+// does write faults once to break its duplicate, so an eviction copies back
+// only what was written during the residency rather than every page the
+// prefetch brought. Learned (3): off for an allocation whose GPU writes break
+// too many of its duplicates, where the extra write faults would cost more
+// than the copies they save.
+static bool block_auto_dup_prefetch(uvm_va_block_t *va_block,
+                                    uvm_processor_id_t processor_id,
+                                    const uvm_va_policy_t *policy)
+{
+    if (!auto_rdup_dirty_tracking() || !auto_rdup_eligible(va_block, processor_id, policy))
+        return false;
+
+    if (uvm_perf_auto_rdup == 4)
+        return true;
+
+    return !auto_rdup_range_broken(va_block->managed_range);
+}
+
 // TODO: Bug 1827400: If the faulting processor has support for native
 //       atomics to the current location and the faults on the page were
 //       triggered by atomic accesses only, we keep the current residency.
@@ -11698,6 +11854,38 @@ static uvm_processor_id_t block_select_processor_residency(uvm_va_block_t *va_bl
     }
 
     may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
+
+    // Automatic read duplication (patch 02): reads only, so every write keeps
+    // the stock decision below.
+    if (!may_read_duplicate &&
+        operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS &&
+        thrashing_hint->type != UVM_PERF_THRASHING_HINT_TYPE_PIN &&
+        uvm_fault_access_type_mask_highest(access_type_mask) <= UVM_FAULT_ACCESS_TYPE_READ &&
+        block_auto_read_dup(va_block, processor_id, policy)) {
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_auto_fault_pages);
+        *read_duplicate = true;
+        return processor_id;
+    }
+
+    // A GPU write to a page duplicated under automatic read duplication: the
+    // stock path below breaks the duplicate. Remember it for this block and
+    // charge it to the allocation (patch 02). A retried call can count one
+    // break twice, which only makes the disable rule a little more eager.
+    if (uvm_perf_auto_rdup &&
+        may_read_duplicate &&
+        UVM_ID_IS_GPU(processor_id) &&
+        !uvm_va_block_is_hmm(va_block) &&
+        policy->read_duplication == UVM_READ_DUPLICATION_UNSET &&
+        uvm_fault_access_type_mask_highest(access_type_mask) >= UVM_FAULT_ACCESS_TYPE_WRITE &&
+        uvm_page_mask_test(&va_block->read_duplicated_pages, page_index)) {
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, processor_id);
+
+        if (gpu_state)
+            gpu_state->util.rdup_broken = true;
+
+        atomic64_inc(&va_block->managed_range->util.rdup_breaks);
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_break_gpu);
+    }
 
     // Read/prefetch faults on a VA range with read duplication enabled
     // always create a copy of the page on the faulting processor's memory.
@@ -11983,12 +12171,41 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
         if (UVM_ID_IS_VALID(service_context->prefetch_hint.residency)) {
             const uvm_page_mask_t *prefetch_pages_mask = &service_context->prefetch_hint.prefetch_pages_mask;
 
+            // Prefetched pages follow automatic read duplication (patch 02) when
+            // this call faulted only for reads; otherwise they would move and
+            // need copying back at eviction while the faulted pages did not.
+            // Under dirty tracking (modes 3 and 4) they are duplicates whatever
+            // the faulted pages were.
+            const bool auto_dup = service_context->operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS &&
+                                  ((service_context->read_duplicate_count > 0 &&
+                                    !service_context->util_dfault_write &&
+                                    block_auto_read_dup(va_block, new_residency, policy)) ||
+                                   block_auto_dup_prefetch(va_block, new_residency, policy));
+
+            // The prefetch mask also holds pages already resident on the
+            // destination. Those stay as they are: entering duplication would
+            // only revoke the GPU's own write access to them
+            // (block_prep_read_duplicate_mapping) and, for a dirty page, cost a
+            // write fault to get it back.
+            const uvm_page_mask_t *auto_dup_resident = (auto_dup && va_block->gpus[uvm_id_gpu_index(new_residency)]) ?
+                                                       uvm_va_block_resident_mask_get(va_block,
+                                                                                      new_residency,
+                                                                                      NUMA_NO_NODE) :
+                                                       NULL;
+
             for_each_va_block_page_in_mask(page_index, prefetch_pages_mask, va_block) {
+                const bool page_auto_dup = auto_dup &&
+                                           !(auto_dup_resident && uvm_page_mask_test(auto_dup_resident, page_index));
+
                 UVM_ASSERT(!uvm_page_mask_test(new_residency_mask, page_index));
 
                 service_context->access_type[page_index] = UVM_FAULT_ACCESS_TYPE_PREFETCH;
 
-                if (uvm_va_policy_is_read_duplicate(policy) ||
+                if (page_auto_dup)
+                    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_auto_prefetch_pages);
+
+                if (page_auto_dup ||
+                    uvm_va_policy_is_read_duplicate(policy) ||
                     (policy->read_duplication != UVM_READ_DUPLICATION_DISABLED &&
                      uvm_page_mask_test(&va_block->read_duplicated_pages, page_index))) {
                     if (service_context->read_duplicate_count++ == 0)
@@ -12055,6 +12272,16 @@ NV_STATUS uvm_va_block_service_copy(uvm_processor_id_t processor_id,
         uvm_page_mask_and(caller_page_mask,
                           new_residency_mask,
                           &service_context->read_duplicate_mask)) {
+        // The pages the break ratio of automatic read duplication divides by
+        // (patch 02), once per call. Under UNSET policy the only duplicates a
+        // GPU fault creates are the automatic ones and re-reads of pages that
+        // already were, which also count as duplicates kept.
+        if (uvm_perf_auto_rdup &&
+            UVM_ID_IS_GPU(new_residency) &&
+            !uvm_va_block_is_hmm(va_block) &&
+            va_block->managed_range->policy.read_duplication == UVM_READ_DUPLICATION_UNSET)
+            atomic64_add(uvm_page_mask_weight(caller_page_mask), &va_block->managed_range->util.rdup_pages);
+
         status = uvm_va_block_make_resident_read_duplicate(va_block,
                                                            block_retry,
                                                            service_context->block_context,
@@ -12888,6 +13115,14 @@ static NV_STATUS block_cpu_fault_locked(uvm_va_block_t *va_block,
     if (skip_cpu_fault_with_valid_permissions(va_block, page_index, fault_access_type))
         return NV_OK;
 
+    // A CPU write ends a read duplicate by unmapping the GPU copy, with no
+    // copy since the CPU holds the data: cheaper than the stock migration back,
+    // so it is reported and does not count against the allocation (patch 02).
+    if (uvm_perf_auto_rdup &&
+        fault_access_type >= UVM_FAULT_ACCESS_TYPE_WRITE &&
+        uvm_page_mask_test(&va_block->read_duplicated_pages, page_index))
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_break_cpu);
+
     thrashing_hint = uvm_perf_thrashing_get_hint(va_block, service_context->block_context, fault_addr, UVM_ID_CPU);
     // Throttling is implemented by sleeping in the fault handler on the CPU
     if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_THROTTLE) {
@@ -13401,10 +13636,22 @@ static void block_util_harvest(uvm_va_block_t *va_block,
 
     gpu_state->util.open = false;
 
+    n4 = uvm_page_mask_weight(&gpu_state->util.dfault);
+
+    // What the next residency of this block learns from this one (patch 02),
+    // whatever the stats level. A residency with no demand fault (all
+    // prefetched) says nothing about writes and leaves the record alone.
+    if (n4 > 0) {
+        const bool ro = !gpu_state->util.dwrite && !gpu_state->util.rdup_broken;
+
+        gpu_state->util.last_ro = ro;
+        if (uvm_perf_auto_rdup)
+            atomic64_inc(ro ? &va_block->managed_range->util.res_ro : &va_block->managed_range->util.res_rw);
+    }
+
     if (!uvm_lock_probes_enabled())
         return;
 
-    n4 = uvm_page_mask_weight(&gpu_state->util.dfault);
     for (first = 0; first < num_pages; first += pages_per_big) {
         uvm_va_block_region_t big = uvm_va_block_region(first, min_t(uvm_page_index_t, first + pages_per_big, num_pages));
 

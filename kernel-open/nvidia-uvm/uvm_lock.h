@@ -2041,6 +2041,19 @@ typedef struct
     atomic64_t n_protect_stamped;
     atomic64_t n_protect_busy;
     atomic64_t n_protect_proactive_none;
+
+    // Automatic read duplication (patch 02), stats level 2. fault_pages and
+    // prefetch_pages are pages serviced as automatic read duplicates;
+    // break_gpu GPU writes that broke one (the cost: one extra fault and the
+    // migration that would have happened anyway), break_cpu CPU writes that
+    // ended one (cheaper than stock: no copy); range_disabled decisions refused
+    // because an allocation's break ratio was over the threshold. Their effect
+    // shows in n_evict_pages_clean and n_pages_d2h_evict (patch 00).
+    atomic64_t n_rdup_auto_fault_pages;
+    atomic64_t n_rdup_auto_prefetch_pages;
+    atomic64_t n_rdup_break_gpu;
+    atomic64_t n_rdup_break_cpu;
+    atomic64_t n_rdup_range_disabled;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every

@@ -277,6 +277,25 @@ struct uvm_va_range_managed_struct
     bool inject_split_error;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
+
+    // Utility statistics of this allocation, read by the placement mechanisms
+    // (patches 02 and later). Atomics: the servicing workers, the eviction path
+    // and the reserve thread update them for different blocks of the range
+    // with no lock in common, and the eviction path holds no VA space lock.
+    // Zeroed with the range (nv_kmem_cache_zalloc); after a split the new
+    // half starts from zero, which only delays its learning.
+    struct
+    {
+        // Closed residencies whose demand faults were all reads, and those
+        // with a write (uvm_perf_auto_rdup).
+        atomic64_t res_ro;
+        atomic64_t res_rw;
+
+        // Pages read-duplicated under uvm_perf_auto_rdup, and GPU writes that
+        // broke such a duplicate. Their ratio disables the range.
+        atomic64_t rdup_pages;
+        atomic64_t rdup_breaks;
+    } util;
 };
 
 // Subclass of va_range state for va_range.type == UVM_VA_RANGE_TYPE_EXTERNAL

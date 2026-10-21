@@ -267,6 +267,12 @@ typedef struct
         NvU32 last_distance;
         bool open;
         bool dwrite;
+
+        // Automatic read duplication (patch 02): the previous residency's
+        // demand faults were all reads, and a GPU write broke a duplicate in
+        // this residency.
+        bool last_ro;
+        bool rdup_broken;
     } util;
 } uvm_va_block_gpu_state_t;
 

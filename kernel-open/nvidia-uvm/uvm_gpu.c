@@ -1454,6 +1454,16 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_protect_busy));
         UVM_SEQ_OR_DBG_PRINT(s, "n_protect_proactive_none  %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_protect_proactive_none));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_auto_fault_pages   %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_auto_fault_pages));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_auto_prefetch_pages %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_auto_prefetch_pages));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_break_gpu          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_break_gpu));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_break_cpu          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_break_cpu));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_range_disabled     %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_range_disabled));
     }
 
     uvm_up_read(&g_uvm_global.pm.lock);

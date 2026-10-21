@@ -493,6 +493,11 @@ typedef struct uvm_pmm_gpu_struct
         // refault minus the count stamped into it at its eviction.
         atomic64_t evict_seq;
 
+        // NV_GETTIME() of the latest data-bearing eviction on this GPU, kept
+        // whether or not tracking is on: the memory-pressure signal of the
+        // placement mechanisms (uvm_pmm_gpu_under_pressure).
+        atomic64_t last_evict_ns;
+
         // Refaults at a distance below the reserve target, the ones a reserve
         // of that size would have caused. The refault gate reads it.
         atomic64_t near;
@@ -559,6 +564,11 @@ bool uvm_pmm_gpu_refault_tracking(void);
 
 // Batch-scoped eviction protection (uvm_perf_evict_protect_batch, patch 01).
 bool uvm_pmm_gpu_protect_batch(void);
+
+// True while this GPU is evicting user memory: a data-bearing eviction in the
+// last second. Lock-free; the placement mechanisms use it to stay inert while
+// everything fits.
+bool uvm_pmm_gpu_under_pressure(uvm_pmm_gpu_t *pmm);
 
 // A block that was evicted from this GPU is getting GPU memory again. stamp,
 // proactive and policy are what its eviction recorded in

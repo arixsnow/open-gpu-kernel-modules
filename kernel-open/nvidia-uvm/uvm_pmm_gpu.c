@@ -249,6 +249,15 @@ bool uvm_pmm_gpu_protect_batch(void)
     return uvm_perf_evict_protect_batch != 0;
 }
 
+#define UVM_PMM_PRESSURE_WINDOW_NS (1000ULL * 1000 * 1000)
+
+bool uvm_pmm_gpu_under_pressure(uvm_pmm_gpu_t *pmm)
+{
+    const NvU64 last = (NvU64)atomic64_read(&pmm->refault.last_evict_ns);
+
+    return last != 0 && NV_GETTIME() - last < UVM_PMM_PRESSURE_WINDOW_NS;
+}
+
 #define UVM_PERF_EVICT_SCAN_LIMIT_DEFAULT 32
 
 // How many candidates the victim walk may examine before giving up and taking
@@ -1988,6 +1997,9 @@ static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm,
         // re-lock the PMM mutex. This is ok as we don't rely on any PMM state
         // that can change across the calls. In particular, the walk to pick the
         // next VA block to evict above is always started from the root chunk.
+        // The pressure signal (patch 02), once per block evicted from.
+        atomic64_set(&pmm->refault.last_evict_ns, NV_GETTIME());
+
         if (!evict_seq && uvm_pmm_gpu_refault_tracking()) {
             evict_seq = atomic64_inc_return(&pmm->refault.evict_seq);
 
