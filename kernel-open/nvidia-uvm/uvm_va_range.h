@@ -295,6 +295,20 @@ struct uvm_va_range_managed_struct
         // broke such a duplicate. Their ratio disables the range.
         atomic64_t rdup_pages;
         atomic64_t rdup_breaks;
+
+        // Adaptive migration granularity (uvm_perf_gran_policy, patch 03).
+        // gran_mode is the mode followers use under pressure, a
+        // uvm_perf_prefetch_gran_t, STOCK until the leaders have spoken.
+        // Model (policy 1): EWMAs, x16 fixed point, of n4 and n64 over the
+        // DEMAND leaders' closed residencies, and how many there were. Duel
+        // (policy 2): per leader group, summed measured cost (faults x F +
+        // pages in + pages out) and residencies, halved at each decision.
+        atomic_t gran_mode;
+        atomic64_t gran_lead_res;
+        atomic64_t gran_n4_fx;
+        atomic64_t gran_n64_fx;
+        atomic64_t gran_cost[3];
+        atomic64_t gran_res[3];
     } util;
 };
 

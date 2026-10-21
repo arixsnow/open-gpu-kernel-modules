@@ -117,6 +117,57 @@ module_param(uvm_perf_auto_rdup_break_permille, uint, S_IRUGO);
 // A break ratio is trusted only over this many duplicated pages.
 #define UVM_AUTO_RDUP_RANGE_MIN_PAGES 512
 
+// Adaptive migration granularity (patch 03). Every VA block takes a whole
+// 2 MB chunk at its first fault, but the threshold tree decides how much of it
+// to fill, and no single threshold suits every allocation: prefetch threshold
+// 1 against 51 is 1.25x geomean on the 38 stable cells and 46-174x on
+// ATAX/MVT@150, but 4-5x slower on sparse random cells (w7 >= 115%, CAGRA),
+// where the 64 KB big-page fill already moves 61-82 KB per one-byte write.
+// This chooses, per servicing call and per allocation, among DEMAND (faulted
+// pages only), STOCK (the tree) and FULL (the whole block).
+//
+//   0  off (stock).
+//   1  model: a few leader blocks per allocation (1 in 2^leader_shift, by a
+//      hash of the block index) always run DEMAND under pressure, so their
+//      residencies show n4, the pages actually touched, and n64, the 64 KB
+//      big pages touched. Followers take the mode of least modelled cost per
+//      residency, in 4 KB page-copy units, F the cost of one fault:
+//        DEMAND n4 (F + 2), STOCK n64 (F + 32), FULL F + 1024
+//      (each page in once and written back once). Switches need a 20% gain.
+//   2  duel: three leader groups run DEMAND, STOCK and FULL, each residency's
+//      measured cost (faults x F + pages in + pages out) is summed per group,
+//      and followers take the cheapest every uvm_perf_gran_window leader
+//      residencies. No model; costs as measured, including the write-back
+//      automatic read duplication avoids.
+//   3, 4, 5  force DEMAND, STOCK, FULL everywhere (oracles; 4 is the control).
+//
+// Only replayable faults migrating to a GPU. Without memory pressure the
+// learned modes use STOCK, or FULL with uvm_perf_gran_inmem_full: pf1 is
+// 1.4-1.6x faster in memory on this suite, but NVIDIA's 51 also serves
+// sharing patterns this suite does not have, so that is opt-in.
+static unsigned uvm_perf_gran_policy = 0;
+module_param(uvm_perf_gran_policy, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_gran_policy,
+                 "Migration granularity: 0 off, 1 model, 2 duel, 3 demand, 4 stock, 5 full block.");
+
+static unsigned uvm_perf_gran_leader_shift = 6;
+module_param(uvm_perf_gran_leader_shift, uint, S_IRUGO);
+
+// F, the cost of one fault in 4 KB page copies. 48 is the w7@110 pool's
+// measured 9.7 us per serviced fault over ~0.2 us per page each way.
+static unsigned uvm_perf_gran_fault_cost = 48;
+module_param(uvm_perf_gran_fault_cost, uint, S_IRUGO);
+
+static unsigned uvm_perf_gran_window = 64;
+module_param(uvm_perf_gran_window, uint, S_IRUGO);
+
+static unsigned uvm_perf_gran_inmem_full = 0;
+module_param(uvm_perf_gran_inmem_full, uint, S_IRUGO);
+
+// The model needs this many leader residencies before it moves off STOCK, and
+// the duel this many per group.
+#define UVM_GRAN_MIN_SAMPLES 8
+
 // B1 (batched pre-unmap). Replayable-fault servicing revokes CPU mappings
 // with one unmap_mapping_range call per contiguous page run of the unmap
 // mask, and each call pays an i_mmap walk plus a TLB shootdown. Measured on
@@ -3080,6 +3131,7 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
         uvm_page_mask_zero(&gpu_state->util.dfault);
         gpu_state->util.dwrite = false;
         gpu_state->util.rdup_broken = false;
+        gpu_state->util.pages_in = 0;
         gpu_state->util.populate_seq = seq;
         if (gpu_state->evict_stamp) {
             const NvU64 distance = seq >= gpu_state->evict_stamp ? seq - gpu_state->evict_stamp : 0;
@@ -3643,7 +3695,10 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
 
 bool uvm_va_block_util_tracking(void)
 {
-    return uvm_lock_probes_enabled() || uvm_perf_auto_rdup != 0;
+    return uvm_lock_probes_enabled() ||
+           uvm_perf_auto_rdup != 0 ||
+           uvm_perf_gran_policy == 1 ||
+           uvm_perf_gran_policy == 2;
 }
 
 // See the sharing struct in uvm_va_block.h. ARIADNE keeps the distinct count
@@ -5003,6 +5058,16 @@ out:
             uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_svc_copy_pages_16up);
 
         uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_svc_copy_pages, moved);
+    }
+
+    // Pages in for the open residency's measured cost (patch 03).
+    if (UVM_ID_IS_GPU(dst_id) &&
+        block_context->make_resident.cause != UVM_MAKE_RESIDENT_CAUSE_EVICTION &&
+        uvm_va_block_util_tracking()) {
+        uvm_va_block_gpu_state_t *dst_gpu_state = uvm_va_block_gpu_state_get(block, dst_id);
+
+        if (dst_gpu_state && dst_gpu_state->util.open)
+            dst_gpu_state->util.pages_in += uvm_page_mask_weight(migrated_pages);
     }
 
     // Every cause (patch 00). Eviction write-back is the one stock never
@@ -11662,6 +11727,175 @@ NV_STATUS uvm_va_block_add_mappings(uvm_va_block_t *va_block,
     return status;
 }
 
+// The leader group of this block under the learned granularity policies, or
+// -1 for a follower (patch 03). A multiplicative hash of the block's index in
+// its allocation, so a strided access pattern cannot line up with the leaders;
+// block 0 always hashes to slot 0, so a small allocation still has a leader.
+static int block_gran_leader(uvm_va_block_t *va_block)
+{
+    const NvU32 slots = 1u << min(uvm_perf_gran_leader_shift, 16u);
+    const NvU64 index = uvm_va_range_block_index(va_block->managed_range, va_block->start);
+    const NvU32 slot = (NvU32)((index * 0x9E3779B97F4A7C15ULL) >> 32) & (slots - 1);
+
+    if (uvm_perf_gran_policy == 1)
+        return slot == 0 ? UVM_PERF_PREFETCH_GRAN_DEMAND : -1;
+
+    if (uvm_perf_gran_policy == 2) {
+        if (slot == 0)
+            return UVM_PERF_PREFETCH_GRAN_DEMAND;
+        if (slot == 1)
+            return UVM_PERF_PREFETCH_GRAN_STOCK;
+        if (slot == 2)
+            return UVM_PERF_PREFETCH_GRAN_FULL;
+    }
+
+    return -1;
+}
+
+// The granularity of one servicing call (patch 03).
+static uvm_perf_prefetch_gran_t block_gran_mode(uvm_va_block_t *va_block,
+                                                uvm_processor_id_t new_residency,
+                                                const uvm_service_block_context_t *service_context)
+{
+    int leader;
+
+    if (!uvm_perf_gran_policy ||
+        service_context->operation != UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS ||
+        !UVM_ID_IS_GPU(new_residency) ||
+        uvm_va_block_is_hmm(va_block))
+        return UVM_PERF_PREFETCH_GRAN_STOCK;
+
+    if (uvm_perf_gran_policy == 3)
+        return UVM_PERF_PREFETCH_GRAN_DEMAND;
+    if (uvm_perf_gran_policy == 4)
+        return UVM_PERF_PREFETCH_GRAN_STOCK;
+    if (uvm_perf_gran_policy == 5)
+        return UVM_PERF_PREFETCH_GRAN_FULL;
+    if (uvm_perf_gran_policy > 5)
+        return UVM_PERF_PREFETCH_GRAN_STOCK;
+
+    if (!uvm_pmm_gpu_under_pressure(&uvm_gpu_get(new_residency)->pmm))
+        return uvm_perf_gran_inmem_full ? UVM_PERF_PREFETCH_GRAN_FULL : UVM_PERF_PREFETCH_GRAN_STOCK;
+
+    leader = block_gran_leader(va_block);
+    if (leader >= 0) {
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_gran_leader_svc[leader]);
+        return (uvm_perf_prefetch_gran_t)leader;
+    }
+
+    leader = atomic_read(&va_block->managed_range->util.gran_mode);
+    if (leader < 0 || leader >= UVM_PERF_PREFETCH_GRAN_COUNT)
+        leader = UVM_PERF_PREFETCH_GRAN_STOCK;
+
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_gran_svc[leader]);
+
+    return (uvm_perf_prefetch_gran_t)leader;
+}
+
+// Move the allocation's follower mode to best if it costs at least 20% less
+// than the current one (patch 03).
+static void gran_switch_to(uvm_va_range_managed_t *managed_range, const NvU64 cost[UVM_PERF_PREFETCH_GRAN_COUNT])
+{
+    int cur = atomic_read(&managed_range->util.gran_mode);
+    int best = UVM_PERF_PREFETCH_GRAN_STOCK;
+    int g;
+
+    if (cur < 0 || cur >= UVM_PERF_PREFETCH_GRAN_COUNT)
+        cur = UVM_PERF_PREFETCH_GRAN_STOCK;
+
+    for (g = 0; g < UVM_PERF_PREFETCH_GRAN_COUNT; g++) {
+        if (cost[g] < cost[best])
+            best = g;
+    }
+
+    if (best != cur && cost[best] * 5 < cost[cur] * 4) {
+        atomic_set(&managed_range->util.gran_mode, best);
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_gran_switch);
+    }
+}
+
+// x16 fixed-point EWMA with weight 1/8. A plain read-modify-write: concurrent
+// harvests of two leaders can lose one sample, which an estimate tolerates.
+static NvU64 gran_ewma(atomic64_t *fx, NvU64 sample, bool first)
+{
+    const NvU64 old = (NvU64)atomic64_read(fx);
+    const NvU64 next = first ? sample * 16 : old - old / 8 + (sample * 16) / 8;
+
+    atomic64_set(fx, next);
+
+    return next;
+}
+
+// Learn from a leader's closed residency (patch 03). Eviction path, block
+// lock held, no VA space lock: only range atomics are touched.
+static void block_gran_learn(uvm_va_block_t *va_block,
+                             uvm_va_block_gpu_state_t *gpu_state,
+                             NvU32 n4,
+                             NvU32 n64,
+                             NvU32 pages_out)
+{
+    uvm_va_range_managed_t *managed_range = va_block->managed_range;
+    const NvU64 f = uvm_perf_gran_fault_cost;
+    const int leader = block_gran_leader(va_block);
+    NvU64 cost[UVM_PERF_PREFETCH_GRAN_COUNT];
+
+    if (leader < 0)
+        return;
+
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_gran_lead_res);
+
+    if (uvm_perf_gran_policy == 1) {
+        const NvU64 lead = (NvU64)atomic64_inc_return(&managed_range->util.gran_lead_res);
+        const NvU64 n4_fx = gran_ewma(&managed_range->util.gran_n4_fx, n4, lead == 1);
+        const NvU64 n64_fx = gran_ewma(&managed_range->util.gran_n64_fx, n64, lead == 1);
+
+        if (lead < UVM_GRAN_MIN_SAMPLES)
+            return;
+
+        // x16, like the estimates.
+        cost[UVM_PERF_PREFETCH_GRAN_DEMAND] = n4_fx * (f + 2);
+        cost[UVM_PERF_PREFETCH_GRAN_STOCK] = n64_fx * (f + 32);
+        cost[UVM_PERF_PREFETCH_GRAN_FULL] = (f + 1024) * 16;
+        gran_switch_to(managed_range, cost);
+        return;
+    }
+
+    // Duel: this residency's measured cost, charged to its group.
+    atomic64_add(f * n4 + gpu_state->util.pages_in + pages_out, &managed_range->util.gran_cost[leader]);
+    atomic64_inc(&managed_range->util.gran_res[leader]);
+
+    {
+        NvU64 res[UVM_PERF_PREFETCH_GRAN_COUNT];
+        NvU64 total = 0;
+        int g;
+
+        for (g = 0; g < UVM_PERF_PREFETCH_GRAN_COUNT; g++) {
+            res[g] = (NvU64)atomic64_read(&managed_range->util.gran_res[g]);
+            total += res[g];
+        }
+
+        if (total < max(uvm_perf_gran_window, 3u * UVM_GRAN_MIN_SAMPLES))
+            return;
+
+        for (g = 0; g < UVM_PERF_PREFETCH_GRAN_COUNT; g++) {
+            if (res[g] < UVM_GRAN_MIN_SAMPLES)
+                return;
+        }
+
+        // Mean cost per residency, x16 so small means keep their order.
+        for (g = 0; g < UVM_PERF_PREFETCH_GRAN_COUNT; g++)
+            cost[g] = (NvU64)atomic64_read(&managed_range->util.gran_cost[g]) * 16 / res[g];
+
+        gran_switch_to(managed_range, cost);
+
+        // Age the evidence so a phase change can win the duel again.
+        for (g = 0; g < UVM_PERF_PREFETCH_GRAN_COUNT; g++) {
+            atomic64_set(&managed_range->util.gran_cost[g], atomic64_read(&managed_range->util.gran_cost[g]) / 2);
+            atomic64_set(&managed_range->util.gran_res[g], atomic64_read(&managed_range->util.gran_res[g]) / 2);
+        }
+    }
+}
+
 static bool can_read_duplicate(uvm_va_block_t *va_block,
                                uvm_page_index_t page_index,
                                const uvm_va_policy_t *policy,
@@ -12157,12 +12391,14 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
         new_residency_mask = &service_context->per_processor_masks[uvm_id_value(new_residency)].new_residency;
 
         // Update prefetch tracking structure with the pages that will migrate
-        // due to faults
+        // due to faults. The granularity is the stock tree unless patch 03's
+        // policy picks another for this block.
         uvm_perf_prefetch_get_hint_va_block(va_block,
                                             service_context->block_context,
                                             new_residency,
                                             new_residency_mask,
                                             service_context->region,
+                                            block_gran_mode(va_block, new_residency, service_context),
                                             &service_context->prefetch_bitmap_tree,
                                             &service_context->prefetch_hint);
 
@@ -13649,15 +13885,19 @@ static void block_util_harvest(uvm_va_block_t *va_block,
             atomic64_inc(ro ? &va_block->managed_range->util.res_ro : &va_block->managed_range->util.res_rw);
     }
 
-    if (!uvm_lock_probes_enabled())
-        return;
-
     for (first = 0; first < num_pages; first += pages_per_big) {
         uvm_va_block_region_t big = uvm_va_block_region(first, min_t(uvm_page_index_t, first + pages_per_big, num_pages));
 
         if (!uvm_page_mask_region_empty(&gpu_state->util.dfault, big))
             n64++;
     }
+
+    // Granularity learning (patch 03), whatever the stats level.
+    if (uvm_perf_gran_policy == 1 || uvm_perf_gran_policy == 2)
+        block_gran_learn(va_block, gpu_state, n4, n64, resident >= clean ? resident - clean : 0);
+
+    if (!uvm_lock_probes_enabled())
+        return;
 
     uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_res_closed);
     uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_n4[

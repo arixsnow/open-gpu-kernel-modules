@@ -367,6 +367,7 @@ static NvU32 uvm_perf_prefetch_prenotify_fault_migrations(uvm_va_block_t *va_blo
                                                           uvm_processor_id_t new_residency,
                                                           const uvm_page_mask_t *faulted_pages,
                                                           uvm_va_block_region_t faulted_region,
+                                                          uvm_perf_prefetch_gran_t gran,
                                                           uvm_page_mask_t *prefetch_pages,
                                                           uvm_perf_prefetch_bitmap_tree_t *bitmap_tree)
 {
@@ -396,12 +397,25 @@ static NvU32 uvm_perf_prefetch_prenotify_fault_migrations(uvm_va_block_t *va_blo
     if (UVM_ID_IS_CPU(new_residency) || va_block->gpus[uvm_id_gpu_index(new_residency)] != NULL)
         resident_mask = uvm_va_block_resident_mask_get(va_block, new_residency, NUMA_NO_NODE);
 
+    // Patch 03: a granularity chosen by the caller replaces the threshold tree.
+    // DEMAND leaves prefetch_pages empty, so only the faulted pages migrate and
+    // the 64 KB big-page fill below never runs. FULL takes the whole region,
+    // as the first-touch branch does, wherever stock would prefetch at all
+    // (never out of a preferred location, should_apply_prefetch_logic). Both
+    // keep the faulted, CPU-mapped and thrashing exclusions that follow.
+    if (gran == UVM_PERF_PREFETCH_GRAN_DEMAND) {
+        // Faulted pages only: nothing to prefetch.
+    }
+    else if (gran == UVM_PERF_PREFETCH_GRAN_FULL) {
+        if (should_apply_prefetch_logic(policy, new_residency, va_block, va_block_context, faulted_pages))
+            uvm_page_mask_region_fill(prefetch_pages, max_prefetch_region);
+    }
     // - If this is a first-touch fault and the destination processor is the
     //   preferred location, populate the whole max_prefetch_region.
     // - Do not prefetch pages out of the preferred location (policy location
     //   is valid and does not match the new residency), unless confidential
     //   computing is enabled.
-    if (uvm_processor_mask_empty(&va_block->resident) &&
+    else if (uvm_processor_mask_empty(&va_block->resident) &&
         uvm_id_equal(new_residency, policy->preferred_location)) {
         uvm_page_mask_region_fill(prefetch_pages, max_prefetch_region);
     }
@@ -490,6 +504,7 @@ void uvm_perf_prefetch_get_hint_va_block(uvm_va_block_t *va_block,
                                          uvm_processor_id_t new_residency,
                                          const uvm_page_mask_t *faulted_pages,
                                          uvm_va_block_region_t faulted_region,
+                                         uvm_perf_prefetch_gran_t gran,
                                          uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
                                          uvm_perf_prefetch_hint_t *out_hint)
 {
@@ -512,6 +527,7 @@ void uvm_perf_prefetch_get_hint_va_block(uvm_va_block_t *va_block,
                                                                           new_residency,
                                                                           faulted_pages,
                                                                           faulted_region,
+                                                                          gran,
                                                                           prefetch_pages,
                                                                           bitmap_tree);
 

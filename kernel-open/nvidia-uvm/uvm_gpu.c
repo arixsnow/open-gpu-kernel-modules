@@ -1464,6 +1464,22 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_break_cpu));
         UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_range_disabled     %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_range_disabled));
+        {
+            static const char *gran[3] = { "stock", "demand", "full" };
+
+            for (i = 0; i < 3; i++) {
+                UVM_SEQ_OR_DBG_PRINT(s, "n_gran_svc_%-6s         %llu\n",
+                                     gran[i],
+                                     uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gran_svc[i]));
+                UVM_SEQ_OR_DBG_PRINT(s, "n_gran_leader_svc_%-6s  %llu\n",
+                                     gran[i],
+                                     uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gran_leader_svc[i]));
+            }
+        }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_gran_lead_res           %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gran_lead_res));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_gran_switch             %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gran_switch));
     }
 
     uvm_up_read(&g_uvm_global.pm.lock);

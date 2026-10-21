@@ -2054,6 +2054,16 @@ typedef struct
     atomic64_t n_rdup_break_gpu;
     atomic64_t n_rdup_break_cpu;
     atomic64_t n_rdup_range_disabled;
+
+    // Adaptive migration granularity (patch 03), indexed by
+    // uvm_perf_prefetch_gran_t (0 STOCK, 1 DEMAND, 2 FULL). svc counts
+    // follower servicing calls by the mode they used and leader_svc the
+    // leaders' (stats level 2); lead_res leader residencies learnt from and
+    // switch follower-mode changes (ungated).
+    atomic64_t n_gran_svc[3];
+    atomic64_t n_gran_leader_svc[3];
+    atomic64_t n_gran_lead_res;
+    atomic64_t n_gran_switch;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every

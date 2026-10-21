@@ -35,6 +35,19 @@ typedef struct
     uvm_processor_id_t residency;
 } uvm_perf_prefetch_hint_t;
 
+// Migration granularity of one servicing call (patch 03,
+// uvm_perf_gran_policy in uvm_va_block.c). STOCK is the threshold tree with
+// its 64 KB big-page fill, DEMAND migrates the faulted pages only, FULL the
+// whole block. The exclusions (faulted, CPU-mapped for a CPU destination,
+// thrashing) apply to all three.
+typedef enum
+{
+    UVM_PERF_PREFETCH_GRAN_STOCK = 0,
+    UVM_PERF_PREFETCH_GRAN_DEMAND,
+    UVM_PERF_PREFETCH_GRAN_FULL,
+    UVM_PERF_PREFETCH_GRAN_COUNT
+} uvm_perf_prefetch_gran_t;
+
 // Encapsulates a counter tree built on top of a page mask bitmap in which each
 // leaf represents a page in the block. It contains leaf_count and level_count
 // so that it can use some macros for perf trees.
@@ -94,6 +107,7 @@ void uvm_perf_prefetch_get_hint_va_block(uvm_va_block_t *va_block,
                                          uvm_processor_id_t new_residency,
                                          const uvm_page_mask_t *faulted_pages,
                                          uvm_va_block_region_t faulted_region,
+                                         uvm_perf_prefetch_gran_t gran,
                                          uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
                                          uvm_perf_prefetch_hint_t *out_hint);
 

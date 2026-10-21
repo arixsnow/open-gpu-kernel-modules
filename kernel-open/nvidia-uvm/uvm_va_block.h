@@ -273,6 +273,10 @@ typedef struct
         // this residency.
         bool last_ro;
         bool rdup_broken;
+
+        // Pages copied to this GPU in the residency, any cause but eviction
+        // (patch 03: the pages-in term of the duel's measured cost).
+        NvU32 pages_in;
     } util;
 } uvm_va_block_gpu_state_t;
 
