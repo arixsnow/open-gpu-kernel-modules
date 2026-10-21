@@ -309,6 +309,13 @@ struct uvm_va_range_managed_struct
         atomic64_t gran_n64_fx;
         atomic64_t gran_cost[3];
         atomic64_t gran_res[3];
+
+        // Own remote mapping (patch 04): closed residencies that qualified for
+        // remote service, and all closed residencies, under pressure. Their
+        // ratio is the allocation-wide hint that lets a block with no history
+        // of its own go remote on its first refault.
+        atomic64_t rmt_q;
+        atomic64_t rmt_n;
     } util;
 };
 

@@ -681,9 +681,12 @@ static bool bip_place_head(uvm_pmm_gpu_t *pmm, uvm_va_block_t *va_block)
 
 bool uvm_pmm_gpu_refault_tracking(void)
 {
-    // Orders 4 and 6 are judged by refaults, so they need the stamps.
+    // Orders 4 and 6 are judged by refaults, so they need the stamps, and so
+    // is own remote mapping's entry rule (patch 04: refaults >=
+    // uvm_perf_remote_min_refaults).
     return uvm_perf_evict_refault_track || uvm_perf_evict_proactive_refault ||
-           uvm_perf_evict_victim_order == 4 || uvm_perf_evict_victim_order == 6;
+           uvm_perf_evict_victim_order == 4 || uvm_perf_evict_victim_order == 6 ||
+           uvm_va_block_rmt_policy() != 0;
 }
 
 // Helper type for refcounting cache
@@ -4214,6 +4217,150 @@ static void proactive_evict_stop(uvm_pmm_gpu_t *pmm)
     pmm->proactive_evict.thread = NULL;
 }
 
+// ----------------------------------------------------------------------------
+// Own remote mapping's probe timer (patch 04)
+// ----------------------------------------------------------------------------
+//
+// A deliberately small piece. All placement logic lives in uvm_va_block.c; the
+// timer only remembers which blocks to look at when, and at the deadline hands
+// each to g_uvm_global.global_q (block_rmt_work there), the queue
+// uvm_va_space_destroy flushes after killing blocks. That is what makes it safe
+// for the work item to take the VA space lock, the argument
+// block_add_eviction_mappings rests on, and why this thread may hold nothing
+// but a block reference: it never needs the VA space at all. ARIADNE's ported
+// Zero-copy walks instead share one va_space block context under the READ lock
+// from two threads (uvm_va_space_block_context() asserts the write lock); none
+// of that here.
+
+typedef struct
+{
+    struct list_head node;
+    uvm_va_block_t *va_block;
+    NvU64 deadline_ns;
+} uvm_rmt_entry_t;
+
+bool uvm_pmm_gpu_rmt_register(uvm_pmm_gpu_t *pmm, uvm_va_block_t *va_block, NvU32 delay_ms)
+{
+    uvm_rmt_entry_t *entry;
+
+    if (!pmm->rmt.thread)
+        return false;
+
+    entry = uvm_kvmalloc(sizeof(*entry));
+    if (!entry) {
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_reg_fail);
+        return false;
+    }
+
+    uvm_va_block_retain(va_block);
+    entry->va_block = va_block;
+    entry->deadline_ns = NV_GETTIME() + (NvU64)delay_ms * 1000 * 1000;
+
+    uvm_spin_lock(&pmm->rmt.lock);
+    list_add_tail(&entry->node, &pmm->rmt.list);
+    pmm->rmt.count++;
+    uvm_spin_unlock(&pmm->rmt.lock);
+
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_registered);
+
+    return true;
+}
+
+// Detach up to the budget of expired entries, then schedule them with no lock
+// held. The entry's reference moves to the work item; if the item is already
+// queued, the block is being looked at anyway and the extra one is dropped.
+static void rmt_tick(uvm_pmm_gpu_t *pmm)
+{
+    LIST_HEAD(expired);
+    uvm_rmt_entry_t *entry, *next;
+    const NvU64 now = NV_GETTIME();
+    NvU32 budget = uvm_va_block_rmt_budget();
+
+    uvm_spin_lock(&pmm->rmt.lock);
+    list_for_each_entry_safe(entry, next, &pmm->rmt.list, node) {
+        if (budget == 0)
+            break;
+
+        if (entry->deadline_ns > now)
+            continue;
+
+        list_move_tail(&entry->node, &expired);
+        pmm->rmt.count--;
+        budget--;
+    }
+    uvm_spin_unlock(&pmm->rmt.lock);
+
+    list_for_each_entry_safe(entry, next, &expired, node) {
+        list_del(&entry->node);
+
+        if (!nv_kthread_q_schedule_q_item(&g_uvm_global.global_q, &entry->va_block->rmt_q_item))
+            uvm_va_block_release(entry->va_block);
+
+        uvm_kvfree(entry);
+    }
+}
+
+static int rmt_thread(void *arg)
+{
+    uvm_pmm_gpu_t *pmm = (uvm_pmm_gpu_t *)arg;
+
+    while (!kthread_should_stop()) {
+        msleep_interruptible(max(uvm_va_block_rmt_tick_ms(), 1u));
+
+        if (kthread_should_stop())
+            break;
+
+        UVM_ENTRY_VOID(rmt_tick(pmm));
+    }
+
+    return 0;
+}
+
+static NV_STATUS rmt_start(uvm_pmm_gpu_t *pmm)
+{
+    const NvU32 policy = uvm_va_block_rmt_policy();
+
+    // Policies 1-3 re-evaluate remote blocks; 0 is off and 9, the oracle,
+    // never brings a block back, so neither needs the timer.
+    if (policy < 1 || policy > 3)
+        return NV_OK;
+
+    pmm->rmt.thread = kthread_run(rmt_thread, pmm, "uvm_rmt_%s", uvm_gpu_name(uvm_pmm_to_gpu(pmm)));
+    if (IS_ERR(pmm->rmt.thread)) {
+        NV_STATUS status = errno_to_nv_status(PTR_ERR(pmm->rmt.thread));
+
+        pmm->rmt.thread = NULL;
+        return status;
+    }
+
+    return NV_OK;
+}
+
+// Stop the timer and drop every block it still holds. Work items already on
+// global_q keep their own references and find this GPU unregistered from the
+// VA space, so they touch nothing of it.
+static void rmt_stop(uvm_pmm_gpu_t *pmm)
+{
+    uvm_rmt_entry_t *entry, *next;
+    LIST_HEAD(left);
+
+    if (pmm->rmt.thread) {
+        kthread_stop(pmm->rmt.thread);
+        pmm->rmt.thread = NULL;
+    }
+
+    uvm_spin_lock(&pmm->rmt.lock);
+    list_splice_init(&pmm->rmt.list, &left);
+    pmm->rmt.count = 0;
+    uvm_spin_unlock(&pmm->rmt.lock);
+
+    list_for_each_entry_safe(entry, next, &left, node) {
+        list_del(&entry->node);
+        uvm_va_block_release(entry->va_block);
+        uvm_kvfree(entry);
+    }
+}
+
 struct list_head *find_free_list_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     return find_free_list(pmm,
@@ -4756,6 +4903,8 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     uvm_mutex_init(&pmm->lock, UVM_LOCK_ORDER_PMM);
     uvm_init_rwsem(&pmm->pma_lock, UVM_LOCK_ORDER_PMM_PMA);
     uvm_spin_lock_init(&pmm->list_lock, UVM_LOCK_ORDER_LEAF);
+    uvm_spin_lock_init(&pmm->rmt.lock, UVM_LOCK_ORDER_LEAF);
+    INIT_LIST_HEAD(&pmm->rmt.list);
 
     // BEFORE pmm->initialized, and this ordering is load-bearing. Every failure
     // below jumps to cleanup, which calls uvm_pmm_gpu_deinit, which runs only
@@ -4879,6 +5028,11 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     if (status != NV_OK)
         goto cleanup;
 
+    // Same reasoning: last (patch 04).
+    status = rmt_start(pmm);
+    if (status != NV_OK)
+        goto cleanup;
+
     return NV_OK;
 cleanup:
     uvm_pmm_gpu_deinit(pmm);
@@ -4919,6 +5073,7 @@ void uvm_pmm_gpu_deinit(uvm_pmm_gpu_t *pmm)
     // would be racing the teardown for the same lists. kthread_stop blocks until
     // it has left.
     proactive_evict_stop(pmm);
+    rmt_stop(pmm);
 
     nv_kthread_q_flush(&gpu->parent->lazy_free_q);
     UVM_ASSERT(list_empty(&pmm->root_chunks.va_block_lazy_free));

@@ -483,6 +483,21 @@ typedef struct uvm_pmm_gpu_struct
         bool harm_ok;
     } proactive_evict;
 
+    // Own remote mapping's probe timer (patch 04, uvm_perf_remote_policy in
+    // uvm_va_block.c). Blocks served remotely are registered here with a
+    // deadline; the thread hands expired ones to g_uvm_global.global_q, where
+    // their remote mappings are probed or expired. The thread itself takes no
+    // VA space or block lock, only this leaf spinlock, so it needs no
+    // teardown handshake: each entry holds a block reference, and a dead
+    // block is simply released.
+    struct
+    {
+        struct task_struct *thread;
+        uvm_spinlock_t lock;
+        struct list_head list;
+        NvU32 count;
+    } rmt;
+
     // Refault tracking, on with uvm_perf_evict_refault_track or the refault
     // gate. Unlike proactive_evict this runs without the thread, so that a
     // plain pool arm measures its own refault distances too.
@@ -569,6 +584,12 @@ bool uvm_pmm_gpu_protect_batch(void);
 // last second. Lock-free; the placement mechanisms use it to stay inert while
 // everything fits.
 bool uvm_pmm_gpu_under_pressure(uvm_pmm_gpu_t *pmm);
+
+// Register a block for a probe or expiry after delay_ms (patch 04). Takes its
+// own block reference. Returns false, registering nothing, when the timer is
+// not running or the entry cannot be allocated. Callable with the block lock
+// held; may sleep.
+bool uvm_pmm_gpu_rmt_register(uvm_pmm_gpu_t *pmm, uvm_va_block_t *va_block, NvU32 delay_ms);
 
 // A block that was evicted from this GPU is getting GPU memory again. stamp,
 // proactive and policy are what its eviction recorded in

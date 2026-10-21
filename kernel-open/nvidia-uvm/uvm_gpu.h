@@ -180,6 +180,14 @@ struct uvm_service_block_context_struct
     unsigned util_dfault_count;
     bool util_dfault_write;
 
+    // Own remote mapping (patch 04): this call serves some of its pages by
+    // mapping the CPU copy remotely. rmt_sig holds the 64 KB regions served,
+    // rmt_pages their count. Reset per call by service_fault_batch_block_locked.
+    bool rmt_serving;
+    uvm_processor_id_t rmt_gpu_id;
+    NvU32 rmt_sig;
+    NvU32 rmt_pages;
+
     //
     // Fields used by the CPU fault handling routine
     //

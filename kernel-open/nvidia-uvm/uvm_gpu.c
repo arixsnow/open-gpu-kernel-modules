@@ -1480,6 +1480,32 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gran_lead_res));
         UVM_SEQ_OR_DBG_PRINT(s, "n_gran_switch             %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_gran_switch));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_enter               %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_enter));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_enter_hint          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_enter_hint));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_fault_pages         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_fault_pages));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_mapahead_pages      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_mapahead_pages));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_unmap_pages         %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_unmap_pages));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_expire              %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_expire));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_probe               %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_probe));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_promote             %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_promote));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_cold                %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_cold));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_reremote            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_reremote));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_registered          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_registered));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_reg_fail            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_reg_fail));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rmt_evict_map           %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rmt_evict_map));
     }
 
     uvm_up_read(&g_uvm_global.pm.lock);

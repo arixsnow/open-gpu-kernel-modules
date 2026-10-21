@@ -2064,6 +2064,27 @@ typedef struct
     atomic64_t n_gran_leader_svc[3];
     atomic64_t n_gran_lead_res;
     atomic64_t n_gran_switch;
+
+    // Own remote mapping (patch 04), ungated. enter: blocks sent REMOTE at
+    // eviction; enter_hint: on their allocation's hint at first refault;
+    // fault_pages: pages served from host memory; mapahead_pages: pages mapped
+    // ahead with them; unmap_pages: remote mappings removed by expiry or probe;
+    // expire (policy 1), probe, promote, cold, reremote: the state machine's
+    // transitions; registered and reg_fail: timer arms; evict_map: blocks
+    // mapped remotely at eviction (policy 3).
+    atomic64_t n_rmt_enter;
+    atomic64_t n_rmt_enter_hint;
+    atomic64_t n_rmt_fault_pages;
+    atomic64_t n_rmt_mapahead_pages;
+    atomic64_t n_rmt_unmap_pages;
+    atomic64_t n_rmt_expire;
+    atomic64_t n_rmt_probe;
+    atomic64_t n_rmt_promote;
+    atomic64_t n_rmt_cold;
+    atomic64_t n_rmt_reremote;
+    atomic64_t n_rmt_registered;
+    atomic64_t n_rmt_reg_fail;
+    atomic64_t n_rmt_evict_map;
 } uvm_lock_contention_stats_t;
 
 // The address base. Every call site names a field of THIS object, and every

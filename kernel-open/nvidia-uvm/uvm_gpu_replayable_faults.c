@@ -1859,6 +1859,10 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
     block_context->read_duplicate_count = 0;
     block_context->util_dfault_count = 0;
     block_context->util_dfault_write = false;
+    block_context->rmt_serving = false;
+    block_context->rmt_gpu_id = gpu->id;
+    block_context->rmt_sig = 0;
+    block_context->rmt_pages = 0;
 
     // The first entry is guaranteed to fall within this block
     UVM_ASSERT(first_fault_entry->va_space == va_space);
@@ -2111,6 +2115,16 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
             uvm_page_mask_set(&block_context->read_duplicate_mask, page_index);
         }
 
+        // Own remote mapping (patch 04): this page is served from host memory.
+        // The 64 KB region is what a probe window counts.
+        if (UVM_ID_IS_CPU(new_residency) && uvm_va_block_rmt_active(va_block, gpu->id)) {
+            const NvU32 pages_per_big = max_t(NvU32, UVM_BIG_PAGE_SIZE / PAGE_SIZE, 1);
+
+            block_context->rmt_serving = true;
+            block_context->rmt_sig |= 1u << min_t(NvU32, page_index / pages_per_big, 31);
+            block_context->rmt_pages++;
+        }
+
         // Residency record (patch 00): a demand fault this GPU will service
         // locally. Prefetch-type faults are the hardware prefetcher's guesses,
         // not accesses, and do not count.
@@ -2148,6 +2162,9 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
     if (page_fault_count > 0) {
         block_context->region = uvm_va_block_region(first_page_index, last_page_index + 1);
         status = uvm_va_block_service_locked(gpu, va_block, va_block_retry, block_context);
+
+        if (status == NV_OK && block_context->rmt_serving)
+            uvm_va_block_rmt_note_served(va_block, gpu, block_context->rmt_sig, block_context->rmt_pages);
 
         // Fold this call's demand faults into the open residency. After the
         // call, not before: a retried call reaches here again with the same

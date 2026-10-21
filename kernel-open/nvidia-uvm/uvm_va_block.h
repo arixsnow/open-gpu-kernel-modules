@@ -53,6 +53,18 @@
 // ring. Called with the block lock held. Defined in uvm_va_block.c.
 void uvm_va_block_note_fault_utlb(uvm_va_block_t *va_block, NvU8 utlb_id);
 
+// Own remote mapping (patch 04). Defined in uvm_va_block.c.
+NvU32 uvm_va_block_rmt_policy(void);
+NvU32 uvm_va_block_rmt_tick_ms(void);
+NvU32 uvm_va_block_rmt_budget(void);
+
+// Whether this GPU's faults on the block are being served remotely. Block lock.
+bool uvm_va_block_rmt_active(uvm_va_block_t *va_block, uvm_processor_id_t gpu_id);
+
+// After a servicing call that served pages of the block remotely: sig holds
+// the 64 KB regions touched, pages how many. Block lock.
+void uvm_va_block_rmt_note_served(uvm_va_block_t *va_block, uvm_gpu_t *gpu, NvU32 sig, NvU32 pages);
+
 // True while per-residency records (uvm_va_block_gpu_state_t::util) are kept:
 // at stats level 2, and whenever a mechanism that reads them is enabled.
 // Defined in uvm_va_block.c.
@@ -277,6 +289,19 @@ typedef struct
         // Pages copied to this GPU in the residency, any cause but eviction
         // (patch 03: the pages-in term of the duel's measured cost).
         NvU32 pages_in;
+
+        // Own remote mapping (patch 04, uvm_perf_remote_policy). rmt_state is
+        // a uvm_rmt_state_t (uvm_va_block.c). rmt_queued: the probe timer
+        // holds a reference to this block for this GPU. probe_sig: the 64 KB
+        // regions of the block that faulted during a probe window. rmt_epoch_ms:
+        // how long the block stays remote before the next probe.
+        // evicted_once: the block has lost this GPU's memory at least once.
+        // Not part of a residency: these persist across them.
+        NvU8 rmt_state;
+        bool rmt_queued;
+        bool evicted_once;
+        NvU32 probe_sig;
+        NvU32 rmt_epoch_ms;
     } util;
 } uvm_va_block_gpu_state_t;
 
@@ -554,6 +579,11 @@ struct uvm_va_block_struct
 
     // A queue item for establishing eviction mappings in a deferred way
     nv_kthread_q_item_t eviction_mappings_q_item;
+
+    // Own remote mapping (patch 04): the deferred probe or expiry of this
+    // block's remote mappings, run on g_uvm_global.global_q like the item
+    // above and for the same reason (uvm_va_space_destroy flushes that queue).
+    nv_kthread_q_item_t rmt_q_item;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
 

@@ -168,6 +168,94 @@ module_param(uvm_perf_gran_inmem_full, uint, S_IRUGO);
 // the duel this many per group.
 #define UVM_GRAN_MIN_SAMPLES 8
 
+// Own remote mapping (patch 04). A block whose GPU residencies are short and
+// barely used (it is evicted after touching a few pages, then comes back) is
+// cheaper to leave in host memory and reach over PCIe: no chunk to allocate,
+// so no other block to evict, and no copy either way. NVIDIA's access-counter
+// mode gets its 37x on deep w7 and 128-860x on CAGRA this way, by mapping
+// evicted pages remotely, and loses 0.46x on bfs because it does so for data
+// that is reused. This decides per block from fault-observable history only
+// (no access counters) and re-checks with sampled faults.
+//
+// A block enters REMOTE when its residency on this GPU closes (eviction) with
+// at most uvm_perf_remote_max_faults pages demand-faulted and at least
+// uvm_perf_remote_min_refaults refaults behind it, under pressure; or, on its
+// first refault, when most of its allocation's closed residencies qualified.
+// While REMOTE, a fault on it while it holds no GPU memory is serviced with
+// the CPU as residency: the stock finish step then maps this GPU to the host
+// pages, with no copy, and the block's other host-resident pages are mapped
+// in the same call (map-ahead) so one fault opens the whole block.
+//
+//   0  off.
+//   1  timed: after uvm_perf_remote_epoch_ms the remote mappings are removed
+//      and the block migrates normally again.
+//   2  probed: at the epoch the mappings are removed and faults are watched
+//      for uvm_perf_remote_probe_ms without map-ahead; at least
+//      uvm_perf_remote_promote 64 KB regions faulting promotes the block back
+//      to migration, none leaves it remote and idle, anything between keeps
+//      it remote with the epoch doubled up to uvm_perf_remote_epoch_max_ms.
+//   3  as 2, and evicted pages of a block entering REMOTE are mapped remotely
+//      at eviction (the deferred eviction mappings, gated by this policy
+//      instead of by access counters).
+//   9  oracle: every block goes remote after its first eviction and never
+//      comes back.
+//
+// Reads and writes, not atomics; only blocks with no preferred location, no
+// accessed-by and read duplication not forced. A GPU that cannot map host
+// memory is never sent there.
+static unsigned uvm_perf_remote_policy = 0;
+module_param(uvm_perf_remote_policy, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_remote_policy,
+                 "Own remote mapping of low-utility blocks: 0 off, 1 timed, 2 probed, 3 probed + map on eviction, 9 oracle.");
+
+static unsigned uvm_perf_remote_max_faults = 4;
+module_param(uvm_perf_remote_max_faults, uint, S_IRUGO);
+static unsigned uvm_perf_remote_min_refaults = 2;
+module_param(uvm_perf_remote_min_refaults, uint, S_IRUGO);
+static unsigned uvm_perf_remote_epoch_ms = 100;
+module_param(uvm_perf_remote_epoch_ms, uint, S_IRUGO);
+static unsigned uvm_perf_remote_epoch_max_ms = 3200;
+module_param(uvm_perf_remote_epoch_max_ms, uint, S_IRUGO);
+static unsigned uvm_perf_remote_probe_ms = 20;
+module_param(uvm_perf_remote_probe_ms, uint, S_IRUGO);
+static unsigned uvm_perf_remote_promote = 8;
+module_param(uvm_perf_remote_promote, uint, S_IRUGO);
+static unsigned uvm_perf_remote_budget = 32;
+module_param(uvm_perf_remote_budget, uint, S_IRUGO);
+static unsigned uvm_perf_remote_tick_ms = 10;
+module_param(uvm_perf_remote_tick_ms, uint, S_IRUGO);
+
+// An allocation hints remote once this many residencies closed under the
+// policy and at least half qualified.
+#define UVM_RMT_RANGE_MIN_RES 16
+
+typedef enum
+{
+    UVM_RMT_NONE = 0,
+    UVM_RMT_REMOTE,
+    UVM_RMT_PROBE,
+} uvm_rmt_state_t;
+
+NvU32 uvm_va_block_rmt_policy(void)
+{
+    return uvm_perf_remote_policy;
+}
+
+NvU32 uvm_va_block_rmt_tick_ms(void)
+{
+    return uvm_perf_remote_tick_ms;
+}
+
+NvU32 uvm_va_block_rmt_budget(void)
+{
+    return uvm_perf_remote_budget;
+}
+
+static bool rmt_policy_valid(void)
+{
+    return (uvm_perf_remote_policy >= 1 && uvm_perf_remote_policy <= 3) || uvm_perf_remote_policy == 9;
+}
+
 // B1 (batched pre-unmap). Replayable-fault servicing revokes CPU mappings
 // with one unmap_mapping_range call per contiguous page run of the unmap
 // mask, and each call pays an i_mmap walk plus a TLB shootdown. Measured on
@@ -213,6 +301,7 @@ MODULE_PARM_DESC(uvm_exp_gpu_cache_sysmem,
                  "This is an experimental parameter that may cause correctness issues if used.");
 
 static void block_add_eviction_mappings_entry(void *args);
+static void block_rmt_work_entry(void *args);
 static void block_unmap_cpu(uvm_va_block_t *block,
                             uvm_va_block_context_t *block_context,
                             uvm_va_block_region_t region,
@@ -1498,6 +1587,7 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
     block->prefetch_info.last_migration_proc_id = UVM_ID_INVALID;
 
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
+    nv_kthread_q_item_init(&block->rmt_q_item, block_rmt_work_entry, block);
 
     *out_block = block;
     return NV_OK;
@@ -3698,7 +3788,8 @@ bool uvm_va_block_util_tracking(void)
     return uvm_lock_probes_enabled() ||
            uvm_perf_auto_rdup != 0 ||
            uvm_perf_gran_policy == 1 ||
-           uvm_perf_gran_policy == 2;
+           uvm_perf_gran_policy == 2 ||
+           rmt_policy_valid();
 }
 
 // See the sharing struct in uvm_va_block.h. ARIADNE keeps the distinct count
@@ -11727,6 +11818,258 @@ NV_STATUS uvm_va_block_add_mappings(uvm_va_block_t *va_block,
     return status;
 }
 
+bool uvm_va_block_rmt_active(uvm_va_block_t *va_block, uvm_processor_id_t gpu_id)
+{
+    uvm_va_block_gpu_state_t *gpu_state;
+
+    if (!rmt_policy_valid() || uvm_va_block_is_hmm(va_block))
+        return false;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+
+    return gpu_state && gpu_state->util.rmt_state != UVM_RMT_NONE;
+}
+
+// Should this GPU fault be served from host memory (patch 04)? May move the
+// block into REMOTE on the allocation hint or under the oracle. Block lock.
+static bool block_rmt_wants(uvm_va_block_t *va_block, uvm_processor_id_t gpu_id)
+{
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_va_range_managed_t *managed_range;
+    NvU64 q;
+    NvU64 n;
+
+    if (!rmt_policy_valid() || !UVM_ID_IS_GPU(gpu_id) || uvm_va_block_is_hmm(va_block))
+        return false;
+
+    // Only full 2 MB blocks, the unit eviction works in, and only while the
+    // block holds no memory on this GPU: a block that has its chunk is filled
+    // as usual.
+    if (uvm_va_block_size(va_block) != UVM_CHUNK_SIZE_MAX)
+        return false;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+    if (!gpu_state || gpu_state->chunks[0])
+        return false;
+
+    if (gpu_state->util.rmt_state != UVM_RMT_NONE)
+        return true;
+
+    if (!gpu_state->util.evicted_once)
+        return false;
+
+    if (uvm_perf_remote_policy == 9) {
+        gpu_state->util.rmt_state = UVM_RMT_REMOTE;
+        return true;
+    }
+
+    managed_range = va_block->managed_range;
+    q = (NvU64)atomic64_read(&managed_range->util.rmt_q);
+    n = (NvU64)atomic64_read(&managed_range->util.rmt_n);
+    if (n >= UVM_RMT_RANGE_MIN_RES && q * 2 >= n) {
+        gpu_state->util.rmt_state = UVM_RMT_REMOTE;
+        gpu_state->util.rmt_epoch_ms = uvm_perf_remote_epoch_ms;
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_enter_hint);
+        return true;
+    }
+
+    return false;
+}
+
+void uvm_va_block_rmt_note_served(uvm_va_block_t *va_block, uvm_gpu_t *gpu, NvU32 sig, NvU32 pages)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!gpu_state)
+        return;
+
+    uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_rmt_fault_pages, pages);
+
+    if (gpu_state->util.rmt_state == UVM_RMT_PROBE) {
+        gpu_state->util.probe_sig |= sig;
+        return;
+    }
+
+    // First remote service in this epoch: arm the timer (policies 1-3).
+    if (gpu_state->util.rmt_state == UVM_RMT_REMOTE && !gpu_state->util.rmt_queued) {
+        if (gpu_state->util.rmt_epoch_ms == 0)
+            gpu_state->util.rmt_epoch_ms = uvm_perf_remote_epoch_ms;
+
+        if (uvm_pmm_gpu_rmt_register(&gpu->pmm, va_block, gpu_state->util.rmt_epoch_ms))
+            gpu_state->util.rmt_queued = true;
+    }
+}
+
+// One attempt of block_rmt_unmap_remote. The mask is recomputed each time:
+// a retry has dropped the block lock in between.
+static NV_STATUS block_rmt_unmap_remote_once(uvm_va_block_t *va_block,
+                                             uvm_va_block_context_t *block_context,
+                                             uvm_gpu_t *gpu,
+                                             uvm_va_block_gpu_state_t *gpu_state)
+{
+    uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+    const uvm_page_mask_t *resident = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+    NV_STATUS status = NV_OK;
+    NV_STATUS tracker_status;
+    NvU32 pages;
+
+    if (!uvm_page_mask_andnot(&block_context->caller_page_mask,
+                              &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
+                              resident))
+        return NV_OK;
+
+    pages = uvm_page_mask_weight(&block_context->caller_page_mask);
+
+    status = uvm_va_block_unmap(va_block,
+                                block_context,
+                                gpu->id,
+                                uvm_va_block_region_from_block(va_block),
+                                &block_context->caller_page_mask,
+                                &local_tracker);
+
+    tracker_status = uvm_tracker_add_tracker_safe(&va_block->tracker, &local_tracker);
+    if (status == NV_OK)
+        status = tracker_status;
+
+    uvm_tracker_deinit(&local_tracker);
+
+    if (status == NV_OK)
+        uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_rmt_unmap_pages, pages);
+
+    return status;
+}
+
+// Remove this GPU's mappings of host-resident pages of the block, so the next
+// access faults (patch 04). Block lock and VA space read lock held, so the
+// block cannot die while a retry drops its lock. Unmap may split PTEs and
+// then needs a retry, as in the thrashing unpin path.
+static NV_STATUS block_rmt_unmap_remote(uvm_va_block_t *va_block,
+                                        uvm_va_block_context_t *block_context,
+                                        uvm_gpu_t *gpu,
+                                        uvm_va_block_gpu_state_t *gpu_state)
+{
+    return UVM_VA_BLOCK_RETRY_LOCKED(va_block, NULL,
+                                     block_rmt_unmap_remote_once(va_block, block_context, gpu, gpu_state));
+}
+
+// One GPU's expiry or probe step (patch 04). Block lock held.
+static void block_rmt_step_locked(uvm_va_block_t *va_block, uvm_va_block_context_t *block_context, uvm_gpu_t *gpu)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    NvU32 regions;
+
+    if (!gpu_state || !gpu_state->util.rmt_queued)
+        return;
+
+    if (gpu_state->util.rmt_state == UVM_RMT_REMOTE) {
+        if (block_rmt_unmap_remote(va_block, block_context, gpu, gpu_state) != NV_OK)
+            goto requeue;
+
+        if (uvm_perf_remote_policy == 1) {
+            // Back to migration until its next eviction decides again; without
+            // clearing evicted_once the allocation hint would send it straight
+            // back at the next fault.
+            gpu_state->util.rmt_state = UVM_RMT_NONE;
+            gpu_state->util.evicted_once = false;
+            gpu_state->util.rmt_queued = false;
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_expire);
+            return;
+        }
+
+        gpu_state->util.rmt_state = UVM_RMT_PROBE;
+        gpu_state->util.probe_sig = 0;
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_probe);
+        gpu_state->util.rmt_queued = uvm_pmm_gpu_rmt_register(&gpu->pmm, va_block, uvm_perf_remote_probe_ms);
+        return;
+    }
+
+    if (gpu_state->util.rmt_state != UVM_RMT_PROBE) {
+        gpu_state->util.rmt_queued = false;
+        return;
+    }
+
+    regions = hweight32(gpu_state->util.probe_sig);
+    if (regions >= uvm_perf_remote_promote) {
+        // Reused within the window: back to migration. The pages touched in
+        // the window were mapped remotely; they must fault again to migrate.
+        if (block_rmt_unmap_remote(va_block, block_context, gpu, gpu_state) != NV_OK)
+            goto requeue;
+
+        gpu_state->util.rmt_state = UVM_RMT_NONE;
+        gpu_state->util.rmt_epoch_ms = 0;
+        gpu_state->util.evicted_once = false;
+        gpu_state->util.rmt_queued = false;
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_promote);
+        return;
+    }
+
+    gpu_state->util.rmt_state = UVM_RMT_REMOTE;
+    if (regions == 0) {
+        // Idle: stays remote with nothing armed. Its next fault re-maps the
+        // block ahead and arms the timer again.
+        gpu_state->util.rmt_queued = false;
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_cold);
+        return;
+    }
+
+    gpu_state->util.rmt_epoch_ms = min(max(gpu_state->util.rmt_epoch_ms, uvm_perf_remote_epoch_ms) * 2,
+                                       max(uvm_perf_remote_epoch_max_ms, uvm_perf_remote_epoch_ms));
+    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_reremote);
+    gpu_state->util.rmt_queued = uvm_pmm_gpu_rmt_register(&gpu->pmm, va_block, gpu_state->util.rmt_epoch_ms);
+    return;
+
+requeue:
+    gpu_state->util.rmt_queued = uvm_pmm_gpu_rmt_register(&gpu->pmm, va_block, uvm_perf_remote_tick_ms);
+}
+
+// The deferred probe or expiry of a block's remote mappings (patch 04), on
+// g_uvm_global.global_q. The VA space is alive while the block is not dead,
+// because uvm_va_space_destroy kills its blocks and then flushes this queue,
+// which waits for this function: block_add_eviction_mappings' argument. The
+// work item owns the block reference the timer passed it.
+static void block_rmt_work(void *args)
+{
+    uvm_va_block_t *va_block = (uvm_va_block_t *)args;
+    uvm_va_space_t *va_space;
+    uvm_va_block_context_t *block_context;
+    uvm_gpu_id_t id;
+
+    uvm_mutex_lock(&va_block->lock);
+    va_space = uvm_va_block_get_va_space_maybe_dead(va_block);
+    uvm_mutex_unlock(&va_block->lock);
+
+    if (!va_space)
+        goto done;
+
+    // Private, never the VA space's shared block context.
+    block_context = uvm_va_block_context_alloc(NULL);
+    if (!block_context)
+        goto done;
+
+    uvm_va_space_down_read(va_space);
+
+    if (!uvm_va_block_is_dead(va_block)) {
+        for_each_gpu_id_in_mask(id, &va_space->registered_gpus) {
+            uvm_mutex_lock(&va_block->lock);
+            block_rmt_step_locked(va_block, block_context, uvm_gpu_get(id));
+            uvm_mutex_unlock(&va_block->lock);
+        }
+    }
+
+    uvm_va_space_up_read(va_space);
+    uvm_va_block_context_free(block_context);
+
+done:
+    uvm_va_block_release(va_block);
+}
+
+static void block_rmt_work_entry(void *args)
+{
+    UVM_ENTRY_VOID(block_rmt_work(args));
+}
+
 // The leader group of this block under the learned granularity policies, or
 // -1 for a follower (patch 03). A multiplicative hash of the block's index in
 // its allocation, so a strided access pattern cannot line up with the leaders;
@@ -11985,7 +12328,7 @@ static bool block_auto_read_dup(uvm_va_block_t *va_block,
         return false;
 
     gpu_state = uvm_va_block_gpu_state_get(va_block, processor_id);
-    if (gpu_state && gpu_state->util.rdup_broken)
+    if (gpu_state && (gpu_state->util.rdup_broken || gpu_state->util.rmt_state != UVM_RMT_NONE))
         return false;
 
     if (gpu_state && gpu_state->util.last_ro)
@@ -12083,6 +12426,22 @@ static uvm_processor_id_t block_select_processor_residency(uvm_va_block_t *va_bl
     if (is_uvm_fault_force_sysmem_set() ||
         !hmm_migratable ||
         uvm_hmm_must_use_sysmem(va_block, va_block_context->hmm.vma)) {
+        *read_duplicate = false;
+        return UVM_ID_CPU;
+    }
+
+    // Own remote mapping (patch 04): serve the fault from host memory. The
+    // stock finish step maps this GPU to the CPU-resident pages with no copy.
+    if (uvm_perf_remote_policy &&
+        operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS &&
+        UVM_ID_IS_GPU(processor_id) &&
+        thrashing_hint->type != UVM_PERF_THRASHING_HINT_TYPE_PIN &&
+        uvm_fault_access_type_mask_highest(access_type_mask) < UVM_FAULT_ACCESS_TYPE_ATOMIC_WEAK &&
+        UVM_ID_IS_INVALID(policy->preferred_location) &&
+        uvm_processor_mask_empty(&policy->accessed_by) &&
+        policy->read_duplication != UVM_READ_DUPLICATION_ENABLED &&
+        uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], processor_id) &&
+        block_rmt_wants(va_block, processor_id)) {
         *read_duplicate = false;
         return UVM_ID_CPU;
     }
@@ -12389,6 +12748,39 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
 
         new_residency = uvm_processor_mask_find_first_id(&service_context->resident_processors);
         new_residency_mask = &service_context->per_processor_masks[uvm_id_value(new_residency)].new_residency;
+
+        // Served from host memory (patch 04): no prefetching, which with a CPU
+        // destination could pull GPU-resident pages back. While REMOTE, map
+        // the block's other host-resident pages in the same call instead
+        // (only PTE writes), so one fault opens the whole block; while
+        // probing, map only what faults, so the window sees the accesses.
+        // rmt_serving is reset by every caller of uvm_va_block_service_locked;
+        // the policy test keeps the default path free of it regardless.
+        if (rmt_policy_valid() && service_context->rmt_serving && UVM_ID_IS_CPU(new_residency)) {
+            uvm_va_block_gpu_state_t *rmt_gpu_state = uvm_va_block_gpu_state_get(va_block, service_context->rmt_gpu_id);
+            uvm_page_mask_t *ahead = &service_context->prefetch_hint.prefetch_pages_mask;
+
+            service_context->prefetch_hint.residency = UVM_ID_INVALID;
+
+            if (rmt_gpu_state && rmt_gpu_state->util.rmt_state == UVM_RMT_REMOTE) {
+                uvm_page_mask_andnot(ahead,
+                                     uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE),
+                                     &rmt_gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]);
+
+                if (uvm_page_mask_andnot(ahead, ahead, new_residency_mask)) {
+                    uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_rmt_mapahead_pages, uvm_page_mask_weight(ahead));
+
+                    for_each_va_block_page_in_mask(page_index, ahead, va_block)
+                        service_context->access_type[page_index] = UVM_FAULT_ACCESS_TYPE_PREFETCH;
+
+                    uvm_page_mask_or(new_residency_mask, new_residency_mask, ahead);
+                    service_context->region = uvm_va_block_region_from_mask(va_block, new_residency_mask);
+                    service_context->prefetch_hint.residency = UVM_ID_CPU;
+                }
+            }
+
+            return;
+        }
 
         // Update prefetch tracking structure with the pages that will migrate
         // due to faults. The granularity is the stock tree unless patch 03's
@@ -13371,6 +13763,7 @@ static NV_STATUS block_cpu_fault_locked(uvm_va_block_t *va_block,
     service_context->thrashing_pin_count = 0;
     service_context->util_dfault_count = 0;
     service_context->util_dfault_write = false;
+    service_context->rmt_serving = false;
     service_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
 
     if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_PIN) {
@@ -13793,8 +14186,9 @@ static void block_add_eviction_mappings(void *args)
                 break;
         }
 
-        if (status == NV_OK && uvm_va_space_map_remote_on_eviction(va_space)) {
+        if (status == NV_OK && (uvm_va_space_map_remote_on_eviction(va_space) || uvm_perf_remote_policy == 3)) {
             uvm_processor_mask_t *map_processors = &block_context->map_processors_eviction;
+            const bool ac_maps = uvm_va_space_map_remote_on_eviction(va_space);
 
             // Exclude the processors that have been already mapped due to
             // AccessedBy
@@ -13806,11 +14200,17 @@ static void block_add_eviction_mappings(void *args)
                 uvm_gpu_t *gpu = uvm_gpu_get(id);
                 uvm_va_block_gpu_state_t *gpu_state;
 
-                if (!gpu->parent->access_counters_supported)
-                    continue;
-
                 gpu_state = uvm_va_block_gpu_state_get(va_block, id);
                 UVM_ASSERT(gpu_state);
+
+                // Access-counter mode maps every evicted block; our policy only
+                // the ones it sent REMOTE (patch 04), and arms their timer.
+                if (!(ac_maps && gpu->parent->access_counters_supported)) {
+                    if (uvm_perf_remote_policy != 3 || gpu_state->util.rmt_state != UVM_RMT_REMOTE)
+                        continue;
+
+                    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_evict_map);
+                }
 
                 // TODO: Bug 2096389: uvm_va_block_add_mappings does not add
                 // remote mappings to read-duplicated pages. Add support for it
@@ -13824,6 +14224,21 @@ static void block_add_eviction_mappings(void *args)
                                                                            UvmEventMapRemoteCauseEviction));
                 if (status != NV_OK)
                     break;
+
+                // A block mapped remotely here will not fault again, so its
+                // probe timer is armed now rather than at its next fault.
+                if (uvm_perf_remote_policy == 3) {
+                    uvm_mutex_lock(&va_block->lock);
+                    if (gpu_state->util.rmt_state == UVM_RMT_REMOTE && !gpu_state->util.rmt_queued) {
+                        if (gpu_state->util.rmt_epoch_ms == 0)
+                            gpu_state->util.rmt_epoch_ms = uvm_perf_remote_epoch_ms;
+
+                        gpu_state->util.rmt_queued = uvm_pmm_gpu_rmt_register(&gpu->pmm,
+                                                                              va_block,
+                                                                              gpu_state->util.rmt_epoch_ms);
+                    }
+                    uvm_mutex_unlock(&va_block->lock);
+                }
             }
         }
 
@@ -13895,6 +14310,29 @@ static void block_util_harvest(uvm_va_block_t *va_block,
     // Granularity learning (patch 03), whatever the stats level.
     if (uvm_perf_gran_policy == 1 || uvm_perf_gran_policy == 2)
         block_gran_learn(va_block, gpu_state, n4, n64, resident >= clean ? resident - clean : 0);
+
+    // Own remote mapping's entry rule (patch 04): a residency that touched
+    // almost nothing, of a block that keeps coming back, under pressure.
+    if (rmt_policy_valid()) {
+        gpu_state->util.evicted_once = true;
+
+        if (uvm_perf_remote_policy != 9 &&
+            uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX &&
+            uvm_pmm_gpu_under_pressure(&gpu->pmm)) {
+            const bool qualifies = n4 <= uvm_perf_remote_max_faults &&
+                                   gpu_state->util.refaults >= uvm_perf_remote_min_refaults;
+
+            atomic64_inc(&va_block->managed_range->util.rmt_n);
+            if (qualifies) {
+                atomic64_inc(&va_block->managed_range->util.rmt_q);
+                if (gpu_state->util.rmt_state == UVM_RMT_NONE) {
+                    gpu_state->util.rmt_state = UVM_RMT_REMOTE;
+                    gpu_state->util.rmt_epoch_ms = uvm_perf_remote_epoch_ms;
+                    uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_enter);
+                }
+            }
+        }
+    }
 
     if (!uvm_lock_probes_enabled())
         return;
@@ -14142,7 +14580,11 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     // without holding the VA space lock. However, this is fine as
     // block_add_eviction_mappings() reexamines the value with the VA space
     // lock being held.
-    if (accessed_by_set || (gpu->parent->access_counters_supported && uvm_va_space_map_remote_on_eviction(va_space))) {
+    // Policy 3 of own remote mapping (patch 04) also schedules them, for a
+    // block the residency harvest above just sent REMOTE.
+    if (accessed_by_set ||
+        (gpu->parent->access_counters_supported && uvm_va_space_map_remote_on_eviction(va_space)) ||
+        (uvm_perf_remote_policy == 3 && gpu_state->util.rmt_state == UVM_RMT_REMOTE)) {
         // Always retain the VA block first so that it's safe for the deferred
         // callback to release it immediately after it runs.
         uvm_va_block_retain(va_block);
