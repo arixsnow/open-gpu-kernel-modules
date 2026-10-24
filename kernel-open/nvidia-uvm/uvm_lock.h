@@ -2055,6 +2055,19 @@ typedef struct
     atomic64_t n_rdup_break_cpu;
     atomic64_t n_rdup_range_disabled;
 
+    // Why automatic read duplication said no (diagnostic), stats level 2,
+    // counted only with uvm_perf_auto_rdup set. Indexed by uvm_rdup_refuse_t
+    // (uvm_va_block.c): 0 mode out of range, 1 not a GPU or HMM block,
+    // 2 policy DISABLED, 3 policy ENABLED, 4 integrated GPU, 5 no memory
+    // pressure, 6 block's duplicates broken, 7 block mapped remotely,
+    // 8 allocation not read-mostly, 9 page already duplicable, 10 not a read,
+    // 11 thrashing pin. 0-5 are counted for fault and prefetch decisions
+    // alike, 6-11 for fault decisions only. rdup_calls counts the read faults
+    // that reached the decision, so calls minus refusals 0-8 minus
+    // n_rdup_range_disabled is n_rdup_auto_fault_pages under mode 1 or 3.
+    atomic64_t n_rdup_calls;
+    atomic64_t n_rdup_refuse[12];
+
     // Adaptive migration granularity (patch 03), indexed by
     // uvm_perf_prefetch_gran_t (0 STOCK, 1 DEMAND, 2 FULL). svc counts
     // follower servicing calls by the mode they used and leader_svc the

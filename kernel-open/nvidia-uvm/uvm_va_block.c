@@ -12267,27 +12267,64 @@ static bool auto_rdup_dirty_tracking(void)
     return uvm_perf_auto_rdup == 3 || uvm_perf_auto_rdup == 4;
 }
 
+// Reasons automatic read duplication refuses a page, indexing n_rdup_refuse
+// (diagnostic only, uvm_lock.h).
+typedef enum
+{
+    UVM_RDUP_REFUSE_MODE,
+    UVM_RDUP_REFUSE_NOT_GPU,
+    UVM_RDUP_REFUSE_DISABLED,
+    UVM_RDUP_REFUSE_ENABLED,
+    UVM_RDUP_REFUSE_INTEGRATED,
+    UVM_RDUP_REFUSE_PRESSURE,
+    UVM_RDUP_REFUSE_BLOCK_BROKEN,
+    UVM_RDUP_REFUSE_BLOCK_REMOTE,
+    UVM_RDUP_REFUSE_NOT_RO,
+    UVM_RDUP_REFUSE_ALREADY_DUP,
+    UVM_RDUP_REFUSE_NOT_READ,
+    UVM_RDUP_REFUSE_PIN,
+    UVM_RDUP_REFUSE_COUNT
+} uvm_rdup_refuse_t;
+
+// Count a refusal and return false, so each refusing test stays one line.
+static bool auto_rdup_refuse(uvm_rdup_refuse_t reason)
+{
+    BUILD_BUG_ON(UVM_RDUP_REFUSE_COUNT != ARRAY_SIZE(g_uvm_lock_contention_stats.n_rdup_refuse));
+
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_refuse[reason]);
+    return false;
+}
+
 // What every automatic duplicate requires (patch 02): a known mode, a GPU, a
 // managed block, no read-duplication advice, and memory pressure.
 static bool auto_rdup_eligible(uvm_va_block_t *va_block,
                                uvm_processor_id_t processor_id,
                                const uvm_va_policy_t *policy)
 {
-    if (uvm_perf_auto_rdup == 0 || uvm_perf_auto_rdup > 4)
+    if (uvm_perf_auto_rdup == 0)
         return false;
+
+    if (uvm_perf_auto_rdup > 4)
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_MODE);
 
     if (!UVM_ID_IS_GPU(processor_id) || uvm_va_block_is_hmm(va_block))
-        return false;
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_NOT_GPU);
+
+    if (policy->read_duplication == UVM_READ_DUPLICATION_DISABLED)
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_DISABLED);
 
     if (policy->read_duplication != UVM_READ_DUPLICATION_UNSET)
-        return false;
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_ENABLED);
 
     // As the ReadMostly advice path refuses it: an integrated GPU has no
     // vidmem to hold a duplicate. Fault path, VA space lock held.
     if (uvm_va_space_has_integrated_gpu(uvm_va_block_get_va_space(va_block)))
-        return false;
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_INTEGRATED);
 
-    return !uvm_perf_auto_rdup_pressure || uvm_pmm_gpu_under_pressure(&uvm_gpu_get(processor_id)->pmm);
+    if (uvm_perf_auto_rdup_pressure && !uvm_pmm_gpu_under_pressure(&uvm_gpu_get(processor_id)->pmm))
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_PRESSURE);
+
+    return true;
 }
 
 // GPU writes have broken more than uvm_perf_auto_rdup_break_permille of the
@@ -12316,6 +12353,11 @@ static bool block_auto_read_dup(uvm_va_block_t *va_block,
     NvU64 ro;
     NvU64 rw;
 
+    if (uvm_perf_auto_rdup == 0)
+        return false;
+
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_calls);
+
     if (!auto_rdup_eligible(va_block, processor_id, policy))
         return false;
 
@@ -12328,8 +12370,11 @@ static bool block_auto_read_dup(uvm_va_block_t *va_block,
         return false;
 
     gpu_state = uvm_va_block_gpu_state_get(va_block, processor_id);
-    if (gpu_state && (gpu_state->util.rdup_broken || gpu_state->util.rmt_state != UVM_RMT_NONE))
-        return false;
+    if (gpu_state && gpu_state->util.rdup_broken)
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_BLOCK_BROKEN);
+
+    if (gpu_state && gpu_state->util.rmt_state != UVM_RMT_NONE)
+        return auto_rdup_refuse(UVM_RDUP_REFUSE_BLOCK_REMOTE);
 
     if (gpu_state && gpu_state->util.last_ro)
         return true;
@@ -12337,7 +12382,10 @@ static bool block_auto_read_dup(uvm_va_block_t *va_block,
     ro = (NvU64)atomic64_read(&managed_range->util.res_ro);
     rw = (NvU64)atomic64_read(&managed_range->util.res_rw);
 
-    return ro >= UVM_AUTO_RDUP_RANGE_MIN_RES && rw * 10 <= ro;
+    if (ro >= UVM_AUTO_RDUP_RANGE_MIN_RES && rw * 10 <= ro)
+        return true;
+
+    return auto_rdup_refuse(UVM_RDUP_REFUSE_NOT_RO);
 }
 
 // Dirty tracking (uvm_perf_auto_rdup 3 and 4, patch 02): should the pages
@@ -12447,6 +12495,17 @@ static uvm_processor_id_t block_select_processor_residency(uvm_va_block_t *va_bl
     }
 
     may_read_duplicate = can_read_duplicate(va_block, page_index, policy, thrashing_hint);
+
+    // Diagnostic (patch 02): the replayable faults the automatic decision
+    // below never sees, by the first of its tests that keeps them out.
+    if (uvm_perf_auto_rdup && operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS) {
+        if (may_read_duplicate)
+            auto_rdup_refuse(UVM_RDUP_REFUSE_ALREADY_DUP);
+        else if (thrashing_hint->type == UVM_PERF_THRASHING_HINT_TYPE_PIN)
+            auto_rdup_refuse(UVM_RDUP_REFUSE_PIN);
+        else if (uvm_fault_access_type_mask_highest(access_type_mask) > UVM_FAULT_ACCESS_TYPE_READ)
+            auto_rdup_refuse(UVM_RDUP_REFUSE_NOT_READ);
+    }
 
     // Automatic read duplication (patch 02): reads only, so every write keeps
     // the stock decision below.

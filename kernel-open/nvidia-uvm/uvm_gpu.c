@@ -1464,6 +1464,21 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_break_cpu));
         UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_range_disabled     %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_range_disabled));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_calls              %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_calls));
+        {
+            static const char *refuse[12] = { "mode", "not_gpu", "disabled", "enabled", "integrated", "pressure",
+                                              "block_broken", "block_remote", "not_ro", "already_dup", "not_read",
+                                              "pin" };
+
+            BUILD_BUG_ON(ARRAY_SIZE(refuse) != ARRAY_SIZE(g_uvm_lock_contention_stats.n_rdup_refuse));
+
+            for (i = 0; i < ARRAY_SIZE(refuse); i++) {
+                UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_refuse_%-12s %llu\n",
+                                     refuse[i],
+                                     uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_refuse[i]));
+            }
+        }
         {
             static const char *gran[3] = { "stock", "demand", "full" };
 
