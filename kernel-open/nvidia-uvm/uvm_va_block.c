@@ -3222,6 +3222,7 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
         gpu_state->util.dwrite = false;
         gpu_state->util.rdup_broken = false;
         gpu_state->util.pages_in = 0;
+        gpu_state->util.ac_open = false;
         gpu_state->util.populate_seq = seq;
         if (gpu_state->evict_stamp) {
             const NvU64 distance = seq >= gpu_state->evict_stamp ? seq - gpu_state->evict_stamp : 0;
@@ -5180,6 +5181,11 @@ out:
 
             uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_pages_h2d_prefetch, prefetched);
             uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_pages_h2d_demand, moved - prefetched);
+
+            // Of those, the ones an access-counter notification moved
+            // (diagnostic, notes/53 §5 P-a).
+            if (block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_ACCESS_COUNTER)
+                uvm_lock_stat_add(&g_uvm_lock_contention_stats.n_ac_pages_h2d, moved);
         }
         else if (moved) {
             if (block_context->make_resident.cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION)
@@ -14270,6 +14276,11 @@ static void block_add_eviction_mappings(void *args)
 
                     uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_rmt_evict_map);
                 }
+                else {
+                    // Access-counter mode re-renting an evicted block
+                    // (diagnostic, notes/53 §5 P-a).
+                    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_evict_map);
+                }
 
                 // TODO: Bug 2096389: uvm_va_block_add_mappings does not add
                 // remote mappings to read-duplicated pages. Add support for it
@@ -14340,11 +14351,14 @@ static void block_util_harvest(uvm_va_block_t *va_block,
     uvm_page_index_t first;
     NvU32 n4;
     NvU32 n64 = 0;
+    bool ac_open;
 
     if (!gpu_state->util.open)
         return;
 
     gpu_state->util.open = false;
+    ac_open = gpu_state->util.ac_open;
+    gpu_state->util.ac_open = false;
 
     n4 = uvm_page_mask_weight(&gpu_state->util.dfault);
 
@@ -14414,7 +14428,18 @@ static void block_util_harvest(uvm_va_block_t *va_block,
 
         uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_util_life[
             uvm_lock_stat_log2_bucket(life, ARRAY_SIZE(g_uvm_lock_contention_stats.n_util_life))]);
+
+        // The same, for residencies an access-counter migration opened: a
+        // short life says the block went back and forth between remote and
+        // resident (diagnostic, notes/53 §5 P-a).
+        if (ac_open) {
+            uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_ac_life[
+                uvm_lock_stat_log2_bucket(life, ARRAY_SIZE(g_uvm_lock_contention_stats.n_ac_life))]);
+        }
     }
+
+    if (ac_open)
+        uvm_lock_stat_inc(&g_uvm_lock_contention_stats.n_ac_res_closed);
 
     uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_util_n4, n4);
     uvm_lock_stat_add(&g_uvm_lock_contention_stats.sum_util_n64, n64);

@@ -1479,6 +1479,36 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                                      uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_refuse[i]));
             }
         }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_batches              %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_batches));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_notifications        %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_notifications));
+        UVM_SEQ_OR_DBG_PRINT(s, "ns_ac_service             %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.ns_ac_service));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_blocks               %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_blocks));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_pages_req            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_pages_req));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_pages_stale          %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_pages_stale));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_pages_throttled      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_pages_throttled));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_pages_h2d            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_pages_h2d));
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_ac_counter_val); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_ac_counter_val_b%-7u %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_counter_val[i]));
+        }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_evict_map            %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_evict_map));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_res_closed           %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_res_closed));
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_ac_life); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_ac_life_b%-14u %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_life[i]));
+        }
         {
             static const char *gran[3] = { "stock", "demand", "full" };
 

@@ -2068,6 +2068,39 @@ typedef struct
     atomic64_t n_rdup_calls;
     atomic64_t n_rdup_refuse[12];
 
+    // Access-counter servicing (diagnostic), stats level 2: the input a
+    // migrate-or-remote policy would read (notes/53 §5 P-a). None changes a
+    // decision.
+    //   batches, notifications  fetched by uvm_service_access_counters
+    //   ns_service              time spent servicing them
+    //   blocks                  managed VA blocks a batch serviced
+    //   pages_req               pages the notifications named in a block
+    //   pages_stale             of those, already resident on the GPU
+    //   pages_throttled         of those, skipped as throttling
+    //   pages_h2d               pages copied to the GPU with the
+    //                           access-counter cause
+    //   counter_val             log2 histogram of the notification's counter
+    //                           value, accesses since the region was last
+    //                           cleared (16 bits, so buckets 0..16)
+    //   evict_map               evicted blocks access-counter mode mapped
+    //                           back remotely, one per block and GPU
+    //   res_closed, life        residencies an access-counter migration
+    //                           opened, and their length in root-chunk
+    //                           evictions (log2, as n_util_life)
+    // A retried block service counts its pages twice, which is rare.
+    atomic64_t n_ac_batches;
+    atomic64_t n_ac_notifications;
+    atomic64_t ns_ac_service;
+    atomic64_t n_ac_blocks;
+    atomic64_t n_ac_pages_req;
+    atomic64_t n_ac_pages_stale;
+    atomic64_t n_ac_pages_throttled;
+    atomic64_t n_ac_pages_h2d;
+    atomic64_t n_ac_counter_val[17];
+    atomic64_t n_ac_evict_map;
+    atomic64_t n_ac_res_closed;
+    atomic64_t n_ac_life[12];
+
     // Adaptive migration granularity (patch 03), indexed by
     // uvm_perf_prefetch_gran_t (0 STOCK, 1 DEMAND, 2 FULL). svc counts
     // follower servicing calls by the mode they used and leader_svc the

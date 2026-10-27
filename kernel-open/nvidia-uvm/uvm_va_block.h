@@ -290,6 +290,10 @@ typedef struct
         // (patch 03: the pages-in term of the duel's measured cost).
         NvU32 pages_in;
 
+        // An access-counter migration opened this residency (diagnostic,
+        // n_ac_res_closed). Cleared when a residency opens and when it closes.
+        bool ac_open;
+
         // Own remote mapping (patch 04, uvm_perf_remote_policy). rmt_state is
         // a uvm_rmt_state_t (uvm_va_block.c). rmt_queued: the probe timer
         // holds a reference to this block for this GPU. probe_sig: the 64 KB

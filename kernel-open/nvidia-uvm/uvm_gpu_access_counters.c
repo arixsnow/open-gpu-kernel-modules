@@ -1169,6 +1169,18 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
 
     // If the page is already resident on the accessing processor, the
     // notification for this page is stale. Skip it.
+    if (uvm_lock_probes_enabled()) {
+        const NvU32 named = uvm_page_mask_weight(accessed_pages);
+
+        uvm_lock_probe_add(&g_uvm_lock_contention_stats.n_ac_pages_req, named);
+        if (residency_mask) {
+            uvm_page_mask_t fresh;
+
+            uvm_page_mask_andnot(&fresh, accessed_pages, residency_mask);
+            uvm_lock_probe_add(&g_uvm_lock_contention_stats.n_ac_pages_stale, named - uvm_page_mask_weight(&fresh));
+        }
+    }
+
     if (residency_mask)
         uvm_page_mask_andnot(accessed_pages, accessed_pages, residency_mask);
 
@@ -1183,6 +1195,7 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
         if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_THROTTLE) {
             // If the page is throttling, ignore the access counter
             // notification
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_pages_throttled);
             continue;
         }
         else if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_PIN) {
@@ -1302,6 +1315,9 @@ static NV_STATUS service_notification_va_block_helper(struct mm_struct *mm,
     uvm_va_block_retry_t va_block_retry;
     uvm_page_mask_t *accessed_pages = &batch_context->accessed_pages;
     uvm_service_block_context_t *service_context = &batch_context->block_service_context;
+    uvm_va_block_gpu_state_t *gpu_state;
+    bool was_open;
+    NV_STATUS status;
 
     if (uvm_page_mask_empty(accessed_pages))
         return NV_OK;
@@ -1311,13 +1327,26 @@ static NV_STATUS service_notification_va_block_helper(struct mm_struct *mm,
     service_context->operation = UVM_SERVICE_OPERATION_ACCESS_COUNTERS;
     service_context->num_retries = 0;
 
-    return UVM_VA_BLOCK_RETRY_LOCKED(va_block,
-                                     &va_block_retry,
-                                     service_va_block_locked(gpu,
-                                                             va_block,
-                                                             &va_block_retry,
-                                                             service_context,
-                                                             accessed_pages));
+    // Whether this service opens the GPU's residency record (patch 00), so the
+    // record can say an access-counter migration started it (diagnostic,
+    // n_ac_res_closed). Taken around the retry loop, under the block lock it
+    // returns with, so a retry that opened the record still counts.
+    gpu_state = gpu ? uvm_va_block_gpu_state_get(va_block, gpu->id) : NULL;
+    was_open = gpu_state && gpu_state->util.open;
+
+    status = UVM_VA_BLOCK_RETRY_LOCKED(va_block,
+                                       &va_block_retry,
+                                       service_va_block_locked(gpu,
+                                                               va_block,
+                                                               &va_block_retry,
+                                                               service_context,
+                                                               accessed_pages));
+
+    gpu_state = gpu ? uvm_va_block_gpu_state_get(va_block, gpu->id) : NULL;
+    if (gpu_state && !was_open && gpu_state->util.open)
+        gpu_state->util.ac_open = true;
+
+    return status;
 }
 
 static void expand_notification_block(uvm_gpu_va_space_t *gpu_va_space,
@@ -1425,6 +1454,10 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
         if (current_entry->va_space != va_space || current_entry->gpu != gpu || address > va_block->end)
             break;
 
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_counter_val[
+            uvm_lock_stat_log2_bucket(current_entry->counter_value,
+                                      ARRAY_SIZE(g_uvm_lock_contention_stats.n_ac_counter_val))]);
+
         expand_notification_block(gpu_va_space,
                                   va_block,
                                   access_counters,
@@ -1440,6 +1473,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
 
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
+    uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_blocks);
     status = service_notification_va_block_helper(mm, va_block, gpu, batch_context);
 
     uvm_mutex_unlock(&va_block->lock);
@@ -1770,8 +1804,14 @@ void uvm_service_access_counters(uvm_access_counter_buffer_t *access_counters)
 
         ++batch_context->batch_id;
 
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_batches);
+        uvm_lock_probe_add(&g_uvm_lock_contention_stats.n_ac_notifications, batch_context->num_cached_notifications);
+
         if (batch_context->num_notifications) {
+            const NvU64 t0 = uvm_lock_probe_begin();
+
             status = service_notifications(access_counters);
+            uvm_lock_probe_end(t0, &g_uvm_lock_contention_stats.ns_ac_service, NULL);
             if (status != NV_OK)
                 break;
         }
