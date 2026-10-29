@@ -796,6 +796,39 @@ static bool read_duplication_is_split_needed(const uvm_va_policy_t *policy, void
     return policy->read_duplication != new_policy;
 }
 
+// Keep UNSET for automatic read duplication (patch 02). The CUDA driver
+// disables read duplication on managed allocations the application never
+// advised: on CAGRA, which advises nothing, every one of the 7.3M automatic
+// duplication checks found the policy DISABLED (n_rdup_refuse_disabled,
+// notes/53 §5c), so uvm_perf_auto_rdup never acts. CUDA defines that state as
+// the opt-out from heuristic duplication (cuMemAdvise, UNSET_READ_MOSTLY "also
+// prevents the Unified Memory driver from attempting heuristic
+// read-duplication on the memory range"). With this set, a disable on a span
+// whose managed ranges are all still UNSET leaves them UNSET: there is nothing
+// to collapse, and UNSET is the state whose coherence handles pages
+// read-duplicated by performance heuristics (block_region_might_read_duplicate
+// in uvm_va_block.c). A span with an ENABLED range is disabled as stock does.
+// Without uvm_perf_auto_rdup the two states behave alike, as no page outside an
+// ENABLED range is ever read-duplicated.
+static unsigned uvm_perf_auto_rdup_unset = 0;
+module_param(uvm_perf_auto_rdup_unset, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_auto_rdup_unset,
+                 "On a read-duplication disable, leave never-advised managed ranges UNSET so uvm_perf_auto_rdup can act: 0 off (stock), 1 on.");
+
+// Is every managed range in [base, last_address] still UNSET? The caller has
+// checked that managed ranges cover the span, and holds the VA space lock.
+static bool read_duplication_span_unset(uvm_va_space_t *va_space, NvU64 base, NvU64 last_address)
+{
+    uvm_va_range_managed_t *managed_range;
+
+    uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address) {
+        if (managed_range->policy.read_duplication != UVM_READ_DUPLICATION_UNSET)
+            return false;
+    }
+
+    return true;
+}
+
 static NV_STATUS read_duplication_set(uvm_va_space_t *va_space, NvU64 base, NvU64 length, bool enable)
 {
     struct mm_struct *mm;
@@ -824,6 +857,20 @@ static NV_STATUS read_duplication_set(uvm_va_space_t *va_space, NvU64 base, NvU6
     if (uvm_va_space_has_integrated_gpu(va_space)) {
         status = NV_OK;
         goto done;
+    }
+
+    // Who disables, and over how much (patch 02); see uvm_perf_auto_rdup_unset
+    if (!enable) {
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_disable_calls);
+        uvm_lock_probe_add(&g_uvm_lock_contention_stats.n_rdup_disable_pages, length >> PAGE_SHIFT);
+
+        if (uvm_perf_auto_rdup_unset &&
+            type == UVM_API_RANGE_TYPE_MANAGED &&
+            read_duplication_span_unset(va_space, base, last_address)) {
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_rdup_disable_kept);
+            status = NV_OK;
+            goto done;
+        }
     }
 
     // Note that we never set the policy back to UNSET

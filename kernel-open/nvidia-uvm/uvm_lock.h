@@ -2101,6 +2101,14 @@ typedef struct
     atomic64_t n_ac_res_closed;
     atomic64_t n_ac_life[12];
 
+    // With uvm_perf_access_counter_4k 1 or 2 (or on 64K pages), notifications
+    // reach their block (diagnostic, notes/53 §5b). block_notif: the blocks
+    // seen so far, each in the log2 bucket of its notification count, so the
+    // per-block distribution of the rent; notif_unmanaged: notifications for
+    // a freed or HMM range, which reach no block.
+    atomic64_t n_ac_block_notif[17];
+    atomic64_t n_ac_notif_unmanaged;
+
     // Adaptive migration granularity (patch 03), indexed by
     // uvm_perf_prefetch_gran_t (0 STOCK, 1 DEMAND, 2 FULL). svc counts
     // follower servicing calls by the mode they used and leader_svc the

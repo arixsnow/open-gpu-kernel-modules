@@ -1509,6 +1509,13 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                                  i,
                                  uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_life[i]));
         }
+        for (i = 0; i < ARRAY_SIZE(g_uvm_lock_contention_stats.n_ac_block_notif); i++) {
+            UVM_SEQ_OR_DBG_PRINT(s, "n_ac_block_notif_b%-7u %llu\n",
+                                 i,
+                                 uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_block_notif[i]));
+        }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_ac_notif_unmanaged      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_notif_unmanaged));
         {
             static const char *gran[3] = { "stock", "demand", "full" };
 

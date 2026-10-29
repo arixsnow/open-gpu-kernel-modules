@@ -68,6 +68,17 @@ typedef struct
 // Enable/disable access-counter-guided migrations
 static int uvm_perf_access_counter_migration_enable = -1;
 
+// Access-counter servicing on 4 KB pages (notes/53 §5b). 610 discards every
+// virtual notification when PAGE_SIZE is 4K (Bug 4299018, the early return in
+// service_notifications), uncleared, so on x86 access-counter mode never
+// migrates and is remote mapping on eviction alone. 0 keeps that. 1 runs the
+// normal path up to the block and migrates nothing: it counts notifications
+// per block and clears them as the normal path does, so placement is
+// unchanged and only the notification volume differs. 2 runs the normal path,
+// NVIDIA's access-counter migration as designed for 64 KB pages. Any other
+// value is 0. Systems with 64 KB pages always run the normal path.
+static unsigned uvm_perf_access_counter_4k = 0;
+
 // Number of entries that are fetched from the GPU access counter notification
 // buffer and serviced in batch
 static unsigned uvm_perf_access_counter_batch_count = UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_DEFAULT;
@@ -85,6 +96,22 @@ module_param(uvm_perf_access_counter_threshold, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_threshold,
                  "Number of remote accesses on a region required to trigger a notification."
                  "Valid values: [1, 65535]");
+module_param(uvm_perf_access_counter_4k, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_4k,
+                 "Access counters on 4K-page systems: 0 discard notifications (stock), "
+                 "1 count per block without migrating, 2 migrate as on 64K-page systems.");
+
+// On a 4K-page system, whether notifications are discarded before reaching a
+// block (stock), and whether they reach it only to be counted (mode 1).
+static bool ac_4k_discard(void)
+{
+    return PAGE_SIZE == UVM_PAGE_SIZE_4K && (uvm_perf_access_counter_4k == 0 || uvm_perf_access_counter_4k > 2);
+}
+
+static bool ac_4k_count_only(void)
+{
+    return PAGE_SIZE == UVM_PAGE_SIZE_4K && uvm_perf_access_counter_4k == 1;
+}
 
 static void access_counter_buffer_flush_locked(uvm_access_counter_buffer_t *access_counters,
                                                uvm_gpu_buffer_flush_mode_t flush_mode);
@@ -1418,6 +1445,43 @@ static void expand_notification_block(uvm_gpu_va_space_t *gpu_va_space,
     }
 }
 
+// Notifications per block and GPU (diagnostic, n_ac_block_notif, notes/53
+// §5b). The histogram holds each block once, in the log2 bucket of its count
+// so far, which makes it the per-block rent distribution: how concentrated the
+// remote accesses are. A block that dies keeps its last bucket. Block lock
+// held.
+static void ac_note_block_notifications(uvm_va_block_t *va_block, uvm_gpu_t *gpu, NvU32 count)
+{
+    const NvU32 buckets = ARRAY_SIZE(g_uvm_lock_contention_stats.n_ac_block_notif);
+    uvm_va_block_gpu_state_t *gpu_state;
+    NvU32 old_count;
+    NvU32 new_count;
+    NvU32 old_bucket;
+    NvU32 new_bucket;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!uvm_lock_probes_enabled() || !gpu)
+        return;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (!gpu_state)
+        return;
+
+    old_count = gpu_state->util.ac_notif;
+    new_count = old_count > NV_U32_MAX - count ? NV_U32_MAX : old_count + count;
+    gpu_state->util.ac_notif = new_count;
+
+    old_bucket = uvm_lock_stat_log2_bucket(old_count, buckets);
+    new_bucket = uvm_lock_stat_log2_bucket(new_count, buckets);
+    if (old_bucket == new_bucket)
+        return;
+
+    if (old_count)
+        atomic64_dec(uvm_lock_stat_local(&g_uvm_lock_contention_stats.n_ac_block_notif[old_bucket]));
+    atomic64_inc(uvm_lock_stat_local(&g_uvm_lock_contention_stats.n_ac_block_notif[new_bucket]));
+}
+
 static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space,
                                                 struct mm_struct *mm,
                                                 uvm_access_counter_buffer_t *access_counters,
@@ -1474,7 +1538,11 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
     uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_blocks);
-    status = service_notification_va_block_helper(mm, va_block, gpu, batch_context);
+    ac_note_block_notifications(va_block, gpu, *out_index - index);
+
+    // uvm_perf_access_counter_4k 1 counts and clears without migrating.
+    if (!ac_4k_count_only())
+        status = service_notification_va_block_helper(mm, va_block, gpu, batch_context);
 
     uvm_mutex_unlock(&va_block->lock);
 
@@ -1634,6 +1702,7 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *gpu_va_space,
                                                     out_index);
         }
         else {
+            uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_notif_unmanaged);
             status = notify_tools_and_process_flags(va_space,
                                                     gpu_va_space->gpu,
                                                     access_counters,
@@ -1684,6 +1753,7 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *gpu_va_space,
 
         // Clobber status to continue processing the rest of the notifications
         // in the batch.
+        uvm_lock_probe_count(&g_uvm_lock_contention_stats.n_ac_notif_unmanaged);
         status = notify_tools_and_process_flags(va_space,
                                                 gpu_va_space->gpu,
                                                 access_counters,
@@ -1713,7 +1783,8 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
 
     // TODO: Bug 4299018 : Add support for virtual access counter migrations on
     //                     4K page sizes.
-    if (PAGE_SIZE == UVM_PAGE_SIZE_4K) {
+    // uvm_perf_access_counter_4k 1 and 2 take the path below instead.
+    if (ac_4k_discard()) {
         return notify_tools_broadcast_and_process_flags(access_counters,
                                                         batch_context->notifications,
                                                         batch_context->num_notifications,

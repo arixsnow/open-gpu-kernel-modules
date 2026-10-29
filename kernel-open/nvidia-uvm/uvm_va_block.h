@@ -306,6 +306,10 @@ typedef struct
         bool evicted_once;
         NvU32 probe_sig;
         NvU32 rmt_epoch_ms;
+
+        // Access-counter notifications this block has drawn on this GPU
+        // (diagnostic, n_ac_block_notif). Persists across residencies.
+        NvU32 ac_notif;
     } util;
 } uvm_va_block_gpu_state_t;
 
