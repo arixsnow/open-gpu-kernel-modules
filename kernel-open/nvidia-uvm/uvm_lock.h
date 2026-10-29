@@ -2068,6 +2068,15 @@ typedef struct
     atomic64_t n_rdup_calls;
     atomic64_t n_rdup_refuse[12];
 
+    // Read-duplication disables (UVM_DISABLE_READ_DUPLICATION, which CUDA
+    // issues on unadvised allocations; notes/53 §5c), counted in
+    // read_duplication_set whatever uvm_perf_auto_rdup_unset says: calls,
+    // pages spanned, and calls left UNSET because the param is set and every
+    // managed range in the span was still UNSET.
+    atomic64_t n_rdup_disable_calls;
+    atomic64_t n_rdup_disable_pages;
+    atomic64_t n_rdup_disable_kept;
+
     // Access-counter servicing (diagnostic), stats level 2: the input a
     // migrate-or-remote policy would read (notes/53 §5 P-a). None changes a
     // decision.

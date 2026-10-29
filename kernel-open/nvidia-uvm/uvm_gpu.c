@@ -1479,6 +1479,12 @@ static int nv_procfs_read_lock_stats(struct seq_file *s, void *v)
                                      uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_refuse[i]));
             }
         }
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_disable_calls      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_disable_calls));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_disable_pages      %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_disable_pages));
+        UVM_SEQ_OR_DBG_PRINT(s, "n_rdup_disable_kept       %llu\n",
+                             uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_rdup_disable_kept));
         UVM_SEQ_OR_DBG_PRINT(s, "n_ac_batches              %llu\n",
                              uvm_lock_stat_sum(&g_uvm_lock_contention_stats.n_ac_batches));
         UVM_SEQ_OR_DBG_PRINT(s, "n_ac_notifications        %llu\n",
